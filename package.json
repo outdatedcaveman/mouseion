@@ -13,9 +13,11 @@
     "ftl-to-json": "node ./js-build/ftl-to-json.mjs",
     "localize-ftl": "node ./js-build/localize-ftl.mjs",
     "clean-build": "node ./js-build/clean.js && node ./js-build/build.js",
-    "clean-start": "node ./js-build/clean.js && node ./js-build/build.js && node ./js-build/watch.js"
+    "clean-start": "node ./js-build/clean.js && node ./js-build/build.js && node ./js-build/watch.js",
+    "test": "mocha --recursive test/tests",
+    "lint": "eslint ."
   },
-  "license": "",
+  "license": "AGPL-3.0",
   "dependencies": {
     "@citeproc-rs/wasm": "^0.2.0",
     "ace-builds": "^1.4.12",
