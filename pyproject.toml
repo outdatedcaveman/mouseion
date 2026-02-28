@@ -26,6 +26,12 @@ dependencies = [
     "diskcache>=5.6",
     # Async support
     "anyio>=4.0",
+    # PDF metadata extraction (soft dependency, gracefully absent)
+    "pypdf>=4.0",
+    # TOML config file support
+    "tomlkit>=0.12",
+    # .env file support
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

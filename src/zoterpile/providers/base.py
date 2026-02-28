@@ -79,28 +79,54 @@ class BaseProvider(ABC):
         url: str,
         params: Optional[dict] = None,
         headers: Optional[dict] = None,
+        max_retries: int = 3,
     ) -> Optional[httpx.Response]:
         """
-        Rate-limited GET with concurrency cap.
-        Returns None on 404 / 410.  Raises on other errors.
+        Rate-limited GET with concurrency cap and exponential-backoff retry.
+
+        * 404 / 410 → return None immediately (resource doesn't exist)
+        * 429 / 503 / 502 / 500 → retry with backoff up to max_retries
+        * Network errors → retry with backoff
+        * Other 4xx → return None
         """
         async with self._semaphore:
-            # Enforce minimum interval between requests
-            if self._min_interval > 0:
-                elapsed = time.monotonic() - self._last_request_time
-                if elapsed < self._min_interval:
-                    await asyncio.sleep(self._min_interval - elapsed)
-            try:
-                resp = await client.get(url, params=params, headers=headers or {})
-                self._last_request_time = time.monotonic()
-                if resp.status_code in (404, 410):
-                    return None
-                resp.raise_for_status()
-                return resp
-            except httpx.HTTPStatusError:
-                return None
-            except httpx.RequestError:
-                return None
+            for attempt in range(max_retries + 1):
+                # Enforce minimum interval between requests
+                if self._min_interval > 0:
+                    elapsed = time.monotonic() - self._last_request_time
+                    if elapsed < self._min_interval:
+                        await asyncio.sleep(self._min_interval - elapsed)
+                try:
+                    resp = await client.get(url, params=params, headers=headers or {})
+                    self._last_request_time = time.monotonic()
+
+                    if resp.status_code in (404, 410):
+                        return None  # permanent miss
+
+                    if resp.status_code == 429:
+                        # Respect Retry-After header if present
+                        retry_after = float(resp.headers.get("Retry-After", 2 ** attempt))
+                        await asyncio.sleep(min(retry_after, 60))
+                        continue
+
+                    if resp.status_code in (500, 502, 503, 504) and attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+
+                    resp.raise_for_status()
+                    return resp
+
+                except httpx.HTTPStatusError:
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        return None
+                except httpx.RequestError:
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        return None
+        return None
 
     # -----------------------------------------------------------------------
     # Abstract interface
