@@ -687,5 +687,25 @@ def gui():
     run()
 
 
+# ---------------------------------------------------------------------------
+# web
+# ---------------------------------------------------------------------------
+
+@main.command("web")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind host")
+@click.option("--port", default=7274,        show_default=True, help="Bind port")
+def web(host: str, port: int):
+    """Launch the browser-based web UI."""
+    try:
+        from .web import run as web_run
+    except ImportError as e:
+        console.print(
+            f"[red]Error:[/red] Flask is required for the web UI.\n"
+            f"Install it with:  pip install flask\n({e})"
+        )
+        raise SystemExit(1)
+    web_run(host=host, port=port)
+
+
 if __name__ == "__main__":
     main()
