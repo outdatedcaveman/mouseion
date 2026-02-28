@@ -669,5 +669,23 @@ def clear_cache():
     console.print("[green]✓[/green] Cache cleared.")
 
 
+# ---------------------------------------------------------------------------
+# gui
+# ---------------------------------------------------------------------------
+
+@main.command("gui")
+def gui():
+    """Launch the interactive terminal UI (TUI)."""
+    try:
+        from .tui import run
+    except ImportError:
+        console.print(
+            "[red]Error:[/red] Textual is required for the GUI.\n"
+            "Install it with:  pip install textual"
+        )
+        raise SystemExit(1)
+    run()
+
+
 if __name__ == "__main__":
     main()

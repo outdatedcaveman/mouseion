@@ -32,6 +32,8 @@ dependencies = [
     "tomlkit>=0.12",
     # .env file support
     "python-dotenv>=1.0",
+    # Terminal UI
+    "textual>=0.50",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +45,8 @@ dev = [
 ]
 
 [project.scripts]
-zoterpile = "zoterpile.cli:main"
+zoterpile     = "zoterpile.cli:main"
+zoterpile-gui = "zoterpile.tui:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zoterpile"]
