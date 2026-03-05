@@ -229,6 +229,60 @@ class ZoteroIntegration(BaseIntegration):
 
         return all_keys
 
+    async def push_or_update(
+        self,
+        pairs: List[tuple],
+    ) -> List[str]:
+        """
+        Idempotent upsert: POST new items, PATCH existing ones.
+
+        ``pairs`` is a list of ``(existing_key_or_none, ref)`` tuples.
+        Returns a list of Zotero item keys in the same order.
+        """
+        if not await self.is_configured():
+            raise RuntimeError("Zotero not configured — set api_key and user_id")
+
+        results: List[str] = [""] * len(pairs)
+
+        # Separate new refs (no existing key) from refs to update.
+        new_indices  = [i for i, (k, _) in enumerate(pairs) if not k]
+        upd_indices  = [i for i, (k, _) in enumerate(pairs) if k]
+
+        # POST new items in batches of 50 (Zotero API limit).
+        BATCH = 50
+        for batch_start in range(0, len(new_indices), BATCH):
+            batch_idxs = new_indices[batch_start : batch_start + BATCH]
+            items = []
+            for i in batch_idxs:
+                item = _ref_to_zotero_item(pairs[i][1])
+                if self._collection:
+                    item["collections"] = [self._collection]
+                items.append(item)
+
+            resp = await self._client.post(
+                f"{self._lib_url()}/items", json=items
+            )
+            if resp.status_code not in (200, 201):
+                continue
+            success = resp.json().get("success", {})
+            for local_idx_str, key in success.items():
+                global_i = batch_idxs[int(local_idx_str)]
+                results[global_i] = key
+
+        # PATCH existing items individually (Zotero has no bulk PATCH).
+        for i in upd_indices:
+            key, ref = pairs[i]
+            item = _ref_to_zotero_item(ref)
+            try:
+                resp = await self._client.patch(
+                    f"{self._lib_url()}/items/{key}", json=item
+                )
+                results[i] = key if resp.status_code in (200, 204) else ""
+            except Exception:
+                results[i] = ""
+
+        return results
+
     async def get_collections(self) -> List[Dict[str, Any]]:
         """Return the user's Zotero collections (for collection selection)."""
         if not await self.is_configured():

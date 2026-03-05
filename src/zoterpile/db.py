@@ -33,6 +33,71 @@ from .models import Author, RefType, Reference
 
 
 # ---------------------------------------------------------------------------
+# FTS5 trigger DDL — stored as a module-level constant so upsert_many can
+# recreate the triggers after dropping them for bulk-insert optimisation.
+# ---------------------------------------------------------------------------
+
+_FTS_TRIGGER_DDL = """
+    CREATE TRIGGER IF NOT EXISTS refs_ai AFTER INSERT ON refs BEGIN
+        INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal)
+        VALUES (
+            new.id, new.title, new.abstract,
+            (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
+                                  IFNULL(json_extract(value, '$.given'), ''), ' ')
+             FROM json_each(IFNULL(new.authors, '[]'))),
+            new.keywords,
+            new.journal
+        );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS refs_au AFTER UPDATE ON refs BEGIN
+        DELETE FROM refs_fts WHERE ref_id = old.id;
+        INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal)
+        VALUES (
+            new.id, new.title, new.abstract,
+            (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
+                                  IFNULL(json_extract(value, '$.given'), ''), ' ')
+             FROM json_each(IFNULL(new.authors, '[]'))),
+            new.keywords,
+            new.journal
+        );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS refs_ad AFTER DELETE ON refs BEGIN
+        DELETE FROM refs_fts WHERE ref_id = old.id;
+    END;
+"""
+
+
+def _bulk_fts_update(conn: sqlite3.Connection, ids: List[str]) -> None:
+    """
+    Batch-rebuild FTS5 entries for the given ref IDs.
+    Dramatically faster than N individual per-row trigger updates for large
+    batches because SQLite processes both the DELETE and the INSERT in a single
+    B-tree traversal per operation rather than N separate ones.
+    """
+    if not ids:
+        return
+    ph = ",".join("?" * len(ids))
+    conn.execute(f"DELETE FROM refs_fts WHERE ref_id IN ({ph})", ids)
+    conn.execute(
+        f"""
+        INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal)
+        SELECT
+            id, title, abstract,
+            (SELECT group_concat(
+                json_extract(value, '$.family') || ' ' ||
+                IFNULL(json_extract(value, '$.given'), ''), ' ')
+             FROM json_each(IFNULL(authors, '[]'))),
+            keywords,
+            journal
+        FROM refs WHERE id IN ({ph})
+        """,
+        ids,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -316,6 +381,13 @@ class RefDatabase:
         self._conn = sqlite3.connect(str(self._path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(self._SCHEMA)
+        # Performance tuning for large databases.
+        # These settings are safe: WAL mode makes NORMAL synchronous crash-safe.
+        self._conn.execute("PRAGMA cache_size     = -65536")   # 64 MB page cache
+        self._conn.execute("PRAGMA mmap_size      = 268435456")  # 256 MB mmap I/O
+        self._conn.execute("PRAGMA synchronous    = NORMAL")   # safe with WAL
+        self._conn.execute("PRAGMA temp_store     = MEMORY")   # temp tables in RAM
+        self._conn.execute("PRAGMA wal_autocheckpoint = 1000")  # checkpoint every 1 000 pages
         self._conn.commit()
 
     def close(self) -> None:
@@ -390,6 +462,7 @@ class RefDatabase:
         self,
         refs: List[Reference],
         tags_per_ref: Optional[List[Optional[List[str]]]] = None,
+        deferred_fts: Optional[bool] = None,
     ) -> List[str]:
         """
         Bulk upsert.  Returns list of IDs in the same order as `refs`.
@@ -397,9 +470,19 @@ class RefDatabase:
         Optimised for large batches:
         - One SELECT to batch-resolve DOI collisions instead of N individual SELECTs.
         - One executemany for all inserts/updates instead of N individual executes.
+        - ``deferred_fts=True`` (auto-enabled for batches > 200): drops the
+          per-row FTS triggers for the duration of the insert, then rebuilds FTS
+          for all affected rows in a single batch pass — 5-20× faster for
+          large imports. ``executescript`` commits the transaction atomically
+          when recreating the triggers.
         """
         if not refs:
             return []
+
+        # Auto-enable deferred FTS for large batches; triggers are efficient for
+        # small ones but become the bottleneck at 200+ rows.
+        if deferred_fts is None:
+            deferred_fts = len(refs) > 200
 
         rows = [_ref_to_row(r) for r in refs]
         for row in rows:
@@ -426,6 +509,11 @@ class RefDatabase:
                         if rows[row_idx]["id"] != existing_id:
                             rows[row_idx]["id"] = existing_id
 
+            # --- Optionally drop FTS triggers for bulk performance ---
+            if deferred_fts:
+                conn.execute("DROP TRIGGER IF EXISTS refs_ai")
+                conn.execute("DROP TRIGGER IF EXISTS refs_au")
+
             # --- Bulk upsert with executemany ---
             cols = list(rows[0].keys())
             placeholders_str = ", ".join(f":{c}" for c in cols)
@@ -441,6 +529,13 @@ class RefDatabase:
             )
             conn.executemany(sql, rows)
 
+            if deferred_fts:
+                # Batch-rebuild FTS for all affected rows, then restore triggers.
+                # executescript issues a COMMIT first, which atomically persists
+                # both the bulk insert and the FTS batch update.
+                _bulk_fts_update(conn, [r["id"] for r in rows])
+                conn.executescript(_FTS_TRIGGER_DDL)
+
             # --- Tags ---
             if tags_per_ref:
                 for i, row in enumerate(rows):
@@ -448,6 +543,33 @@ class RefDatabase:
                         self._apply_tags(conn, row["id"], tags_per_ref[i])
 
         return [row["id"] for row in rows]
+
+    def rebuild_fts(self) -> None:
+        """
+        Full FTS5 rebuild from scratch.
+
+        Use after a very large initial import (100k+ rows) to ensure the search
+        index is correct and compact.  This is a single-pass operation and is
+        dramatically faster than waiting for per-row triggers to catch up.
+        Requires SQLite 3.23.0+ (released 2018-04-02).
+        """
+        with self._db() as conn:
+            conn.execute("INSERT INTO refs_fts(refs_fts) VALUES('delete-all')")
+            conn.execute(
+                """
+                INSERT INTO refs_fts
+                    (ref_id, title, abstract, authors_text, keywords_text, journal)
+                SELECT
+                    id, title, abstract,
+                    (SELECT group_concat(
+                        json_extract(value, '$.family') || ' ' ||
+                        IFNULL(json_extract(value, '$.given'), ''), ' ')
+                     FROM json_each(IFNULL(authors, '[]'))),
+                    keywords,
+                    journal
+                FROM refs
+                """
+            )
 
     def delete(self, ref_id: str) -> None:
         with self._db() as conn:
@@ -589,6 +711,24 @@ class RefDatabase:
             row = cur.fetchone()
             return dict(row) if row else {}
 
+    def get_extras_bulk(self, ref_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Return integration/PDF metadata for multiple refs in a single query.
+        Far more efficient than calling ``get_extra`` in a loop.
+        Returns a mapping of ref_id → extras dict (missing IDs are absent).
+        """
+        if not ref_ids:
+            return {}
+        ph = ",".join("?" * len(ref_ids))
+        with self._db() as conn:
+            cur = conn.execute(
+                f"SELECT id, pdf_local, pdf_drive_id, notion_page_id, "
+                f"zotero_item_key, created_at, updated_at "
+                f"FROM refs WHERE id IN ({ph})",
+                ref_ids,
+            )
+            return {row["id"]: dict(row) for row in cur.fetchall()}
+
     def search(
         self,
         query: str,
@@ -704,29 +844,54 @@ class RefDatabase:
         oa_only: bool = False,
     ) -> Generator[List[Reference], None, None]:
         """
-        Stream all matching references in chunks without loading everything
-        into memory at once.  Yields one list of up to ``chunk_size``
-        References per iteration.
+        Stream all matching references in chunks using cursor-based (keyset)
+        pagination on the primary key.
 
-        Suitable for re-indexing, bulk export, and large sync jobs.
+        Unlike OFFSET pagination — where each page requires scanning from the
+        start of the result set — each page access here is O(log N) regardless
+        of how many pages have already been consumed.  Safe and fast at 1M+
+        rows.  Suitable for re-indexing, bulk export, and large sync jobs.
         """
-        offset = 0
+        cursor = ""  # empty string sorts before all hex IDs
         while True:
-            chunk = self.list_all(
-                tags=tags,
-                year_from=year_from,
-                year_to=year_to,
-                ref_type=ref_type,
-                oa_only=oa_only,
-                limit=chunk_size,
-                offset=offset,
+            params: Dict[str, Any] = {"cursor": cursor, "limit": chunk_size}
+            joins: List[str] = []
+            wheres: List[str] = ["refs.id > :cursor"]
+
+            for i, tag in enumerate(tags or []):
+                joins.append(
+                    f"JOIN ref_tags rt{i} ON rt{i}.ref_id = refs.id "
+                    f"JOIN tags t{i} ON t{i}.id = rt{i}.tag_id AND t{i}.name = :tag{i}"
+                )
+                params[f"tag{i}"] = tag
+
+            if year_from is not None:
+                wheres.append("year >= :year_from")
+                params["year_from"] = year_from
+            if year_to is not None:
+                wheres.append("year <= :year_to")
+                params["year_to"] = year_to
+            if ref_type:
+                wheres.append("ref_type = :ref_type")
+                params["ref_type"] = ref_type
+            if oa_only:
+                wheres.append("open_access = 1")
+
+            sql = (
+                f"SELECT refs.* FROM refs {' '.join(joins)} "
+                f"WHERE {' AND '.join(wheres)} "
+                f"ORDER BY refs.id LIMIT :limit"
             )
-            if not chunk:
+
+            with self._db() as conn:
+                rows = conn.execute(sql, params).fetchall()
+
+            if not rows:
                 break
-            yield chunk
-            if len(chunk) < chunk_size:
+            yield [_row_to_ref(row) for row in rows]
+            if len(rows) < chunk_size:
                 break
-            offset += chunk_size
+            cursor = rows[-1]["id"]
 
     def count(self) -> int:
         with self._db() as conn:

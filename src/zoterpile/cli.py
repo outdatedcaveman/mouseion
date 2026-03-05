@@ -622,26 +622,52 @@ async def _push_chunk(
         chunk = [r for r in chunk if not instapaper_oa_only or r.open_access]
         if not chunk:
             return 0, 0
+        try:
+            ext_ids = await intg.push(chunk)
+        except Exception as exc:
+            console.print(f"[red]  {target} error: {exc}[/red]")
+            return 0, len(chunk)
+        return sum(1 for eid in ext_ids if eid), len(chunk)
 
+    # For Zotero and Notion: load existing integration IDs in one query so we
+    # can PATCH existing items instead of creating duplicates on repeated sync.
+    if target in ("zotero", "notion"):
+        rids = [_ref_id(r) for r in chunk]
+        extras = db.get_extras_bulk(rids)
+        pairs = []
+        for ref, rid in zip(chunk, rids):
+            extra = extras.get(rid, {})
+            existing_key = (
+                extra.get("zotero_item_key") if target == "zotero"
+                else extra.get("notion_page_id")
+            ) or None
+            pairs.append((existing_key, ref))
+
+        try:
+            ext_ids = await intg.push_or_update(pairs)
+        except Exception as exc:
+            console.print(f"[red]  {target} error: {exc}[/red]")
+            return 0, len(chunk)
+
+        ok = sum(1 for eid in ext_ids if eid)
+        # Persist only newly-created IDs (updates keep the same ID).
+        for ref, eid, (existing_key, _) in zip(chunk, ext_ids, pairs):
+            if not eid or existing_key:
+                continue
+            rid = _ref_id(ref)
+            if target == "zotero":
+                db.update_integration_ids(rid, zotero_item_key=eid)
+            elif target == "notion":
+                db.update_integration_ids(rid, notion_page_id=eid)
+        return ok, len(chunk)
+
+    # Obsidian and other integrations: no dedup needed (idempotent by file path).
     try:
         ext_ids = await intg.push(chunk)
     except Exception as exc:
         console.print(f"[red]  {target} error: {exc}[/red]")
         return 0, len(chunk)
-
-    ok = sum(1 for eid in ext_ids if eid)
-
-    # Persist integration IDs back to the database
-    for ref, eid in zip(chunk, ext_ids):
-        if not eid:
-            continue
-        rid = _ref_id(ref)
-        if target == "zotero":
-            db.update_integration_ids(rid, zotero_item_key=eid)
-        elif target == "notion":
-            db.update_integration_ids(rid, notion_page_id=eid)
-
-    return ok, len(chunk)
+    return sum(1 for eid in ext_ids if eid), len(chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -654,13 +680,19 @@ async def _push_chunk(
 @click.option("--oa-only", is_flag=True, default=True, show_default=True,
               help="Only attempt refs marked as open access")
 @click.option("--email",           default=None, help="Email for Unpaywall (overrides config)")
-def fetch_pdfs(tags, limit, oa_only, email):
+@click.option("--concurrency", default=5, show_default=True,
+              help="Number of simultaneous download connections")
+def fetch_pdfs(tags, limit, oa_only, email, concurrency):
     """Try to download open-access PDFs for stored references."""
-    from .db import RefDatabase
+    import asyncio as _aio
+    from .db import RefDatabase, _ref_id
     from .pdf_fetch import fetch_pdf
 
     with RefDatabase() as db:
         refs = db.list_all(tags=list(tags) or None, limit=limit)
+        # Load extras in one query to skip already-downloaded refs.
+        rids = [_ref_id(r) for r in refs]
+        extras = db.get_extras_bulk(rids)
 
     if oa_only:
         refs = [r for r in refs if r.open_access]
@@ -669,16 +701,31 @@ def fetch_pdfs(tags, limit, oa_only, email):
         console.print("[yellow]No eligible references.[/yellow]")
         return
 
-    console.print(f"[blue]→[/blue] Fetching PDFs for {len(refs)} reference(s)…")
+    console.print(f"[blue]→[/blue] Fetching PDFs for {len(refs)} reference(s) "
+                  f"(concurrency={concurrency})…")
 
     async def _run():
+        sem = _aio.Semaphore(concurrency)
+
+        async def _one(ref):
+            rid = _ref_id(ref)
+            # Skip if already recorded as downloaded.
+            local = extras.get(rid, {}).get("pdf_local")
+            if local:
+                from pathlib import Path as _P
+                if _P(local).exists():
+                    return None  # already have it
+            async with sem:
+                return await fetch_pdf(ref, email=email)
+
+        tasks = [_one(r) for r in refs]
+        paths = await _aio.gather(*tasks)
+
         ok = 0
-        with RefDatabase() as db:
-            for ref in refs:
-                path = await fetch_pdf(ref, email=email)
+        with RefDatabase() as db2:
+            for ref, path in zip(refs, paths):
                 if path:
-                    from .db import _ref_id
-                    db.update_integration_ids(_ref_id(ref), pdf_local=str(path))
+                    db2.update_integration_ids(_ref_id(ref), pdf_local=str(path))
                     ok += 1
         return ok
 

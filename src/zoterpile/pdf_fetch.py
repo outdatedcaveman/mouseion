@@ -51,6 +51,11 @@ async def fetch_pdf(
     storage.mkdir(parents=True, exist_ok=True)
     _email = email or cfg.openalex_email or cfg.crossref_email
 
+    # Skip if the expected file already exists on disk — idempotent re-runs.
+    expected_path = storage / (_make_filename(ref) + ".pdf")
+    if expected_path.exists() and expected_path.stat().st_size >= 1024:
+        return expected_path
+
     async with httpx.AsyncClient(
         headers={"User-Agent": _USER_AGENT},
         follow_redirects=True,
@@ -108,23 +113,37 @@ async def _download(
     storage: Path,
     ref: Reference,
 ) -> Optional[Path]:
-    """Download a PDF from `url` and save to `storage`. Returns local path or None."""
-    try:
-        resp = await client.get(url, timeout=60)
-        if resp.status_code != 200:
-            return None
-        content_type = resp.headers.get("content-type", "")
-        if "pdf" not in content_type and not url.endswith(".pdf"):
-            # Not a PDF
-            return None
-        if len(resp.content) < 1024:    # suspiciously small
-            return None
+    """
+    Stream-download a PDF from ``url`` and save to ``storage``.
 
-        filename = _make_filename(ref) + ".pdf"
-        path = storage / filename
-        path.write_bytes(resp.content)
+    Uses chunked streaming (64 KB chunks) so large PDFs are never fully
+    buffered in memory.  Returns the local Path on success, None otherwise.
+    Cleans up any partially-written file on failure.
+    """
+    path: Optional[Path] = None
+    try:
+        async with client.stream("GET", url, timeout=120) as resp:
+            if resp.status_code != 200:
+                return None
+            content_type = resp.headers.get("content-type", "")
+            if "pdf" not in content_type.lower() and not url.lower().endswith(".pdf"):
+                return None
+
+            filename = _make_filename(ref) + ".pdf"
+            path = storage / filename
+            bytes_written = 0
+            with path.open("wb") as fh:
+                async for chunk in resp.aiter_bytes(65536):  # 64 KB chunks
+                    fh.write(chunk)
+                    bytes_written += len(chunk)
+
+        if bytes_written < 1024:  # suspiciously small — reject
+            path.unlink(missing_ok=True)
+            return None
         return path
     except Exception:
+        if path is not None:
+            path.unlink(missing_ok=True)
         return None
 
 

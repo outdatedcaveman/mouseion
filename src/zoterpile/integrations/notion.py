@@ -259,7 +259,7 @@ class NotionIntegration(BaseIntegration):
 
     async def update_page(self, page_id: str, ref: Reference) -> bool:
         """Update an existing Notion page with new reference data."""
-        props = _filter_properties(self, _ref_to_notion_properties(ref))
+        props = self._filter_properties(_ref_to_notion_properties(ref))
         try:
             resp = await self._client.patch(
                 f"{_BASE}/pages/{page_id}",
@@ -268,3 +268,30 @@ class NotionIntegration(BaseIntegration):
             return resp.status_code == 200
         except Exception:
             return False
+
+    async def push_or_update(
+        self,
+        pairs: List[tuple],
+    ) -> List[str]:
+        """
+        Idempotent upsert: POST new pages, PATCH existing ones.
+
+        ``pairs`` is a list of ``(existing_page_id_or_none, ref)`` tuples.
+        Returns a list of Notion page IDs in the same order.
+        """
+        if not await self.is_configured():
+            raise RuntimeError("Notion not configured — set api_key and database_id")
+
+        results: List[str] = [""] * len(pairs)
+
+        for i, (page_id, ref) in enumerate(pairs):
+            if page_id:
+                # Update existing page — cheaper than creating a duplicate.
+                success = await self.update_page(page_id, ref)
+                results[i] = page_id if success else ""
+            else:
+                # Create new page.
+                ids = await self.push([ref])
+                results[i] = ids[0] if ids else ""
+
+        return results
