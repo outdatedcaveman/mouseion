@@ -19,8 +19,9 @@ API docs: https://www.zotero.org/support/dev/web_api/v3/write_requests
 
 from __future__ import annotations
 
+import json as _json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -54,6 +55,132 @@ _CREATOR_ROLE = {
     RefType.THESIS:       "author",
     RefType.REPORT:       "author",
 }
+
+
+# Reverse map: Zotero itemType → RefType (for pull/import)
+_ZOTERO_TYPE_REVERSE: Dict[str, RefType] = {
+    ztype: rtype for rtype, ztype in _TYPE_MAP.items()
+}
+
+
+def _zotero_item_to_ref(item: Dict[str, Any]) -> Optional[Reference]:
+    """
+    Convert a Zotero API item dict to a Reference.
+
+    Returns None for attachments, notes, and annotations (non-reference items).
+    Preserves the Zotero item key in ``sources`` so callers can store it.
+    """
+    data = item.get("data", {})
+    item_type = data.get("itemType", "")
+
+    # Skip non-bibliographic item types
+    if item_type in ("attachment", "note", "annotation"):
+        return None
+
+    ref_type = _ZOTERO_TYPE_REVERSE.get(item_type, RefType.UNKNOWN)
+
+    # --- Creators ---
+    authors: List[Author] = []
+    editors: List[Author] = []
+    for creator in data.get("creators", []):
+        a = Author(
+            family=creator.get("lastName") or creator.get("name", ""),
+            given=creator.get("firstName") or "",
+        )
+        if creator.get("creatorType") == "editor":
+            editors.append(a)
+        else:
+            authors.append(a)
+
+    # --- Year from freeform date string ---
+    year: Optional[int] = None
+    date_str = data.get("date", "")
+    if date_str:
+        m = re.search(r"\b(1[5-9]\d{2}|2\d{3})\b", date_str)
+        if m:
+            year = int(m.group(1))
+
+    # --- DOI: strip URL prefix and normalise ---
+    doi_raw = (data.get("DOI") or "").strip()
+    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi_raw) or None
+
+    # --- Supplementary identifiers from 'extra' field ---
+    pmid: Optional[str] = None
+    arxiv_id: Optional[str] = None
+    for line in data.get("extra", "").splitlines():
+        line = line.strip()
+        lc = line.lower()
+        if lc.startswith("pmid:"):
+            pmid = line.split(":", 1)[1].strip() or None
+        elif lc.startswith("arxiv:"):
+            arxiv_id = line.split(":", 1)[1].strip() or None
+
+    # --- Keywords from Zotero tags ---
+    keywords = [t["tag"] for t in data.get("tags", []) if t.get("tag")]
+
+    # --- Journal / container title (field name varies by item type) ---
+    journal = (
+        data.get("publicationTitle")
+        or data.get("bookTitle")
+        or data.get("proceedingsTitle")
+        or data.get("websiteTitle")
+        or data.get("repository")
+        or None
+    )
+    container_title = (
+        data.get("bookTitle")
+        or data.get("proceedingsTitle")
+        or None
+    )
+
+    # --- Publisher / institution ---
+    publisher = (
+        data.get("publisher")
+        or data.get("institution")
+        or data.get("university")
+        or None
+    )
+
+    # --- num_pages: Zotero stores as string "312" ---
+    num_pages: Optional[int] = None
+    np_raw = data.get("numPages", "")
+    if np_raw:
+        try:
+            num_pages = int(np_raw)
+        except ValueError:
+            pass
+
+    ref = Reference(
+        title          = data.get("title") or "",
+        authors        = authors,
+        editors        = editors,
+        year           = year,
+        doi            = doi,
+        pmid           = pmid,
+        arxiv_id       = arxiv_id,
+        isbn           = (data.get("ISBN") or "").strip() or None,
+        issn           = (data.get("ISSN") or "").strip() or None,
+        url            = data.get("url") or None,
+        abstract       = data.get("abstractNote") or None,
+        ref_type       = ref_type,
+        journal        = journal,
+        journal_abbrev = data.get("journalAbbreviation") or None,
+        container_title= container_title,
+        volume         = data.get("volume") or None,
+        issue          = data.get("issue") or None,
+        pages          = data.get("pages") or None,
+        publisher      = publisher,
+        place          = data.get("place") or None,
+        edition        = data.get("edition") or None,
+        series         = data.get("series") or None,
+        event_name     = data.get("conferenceName") or None,
+        num_pages      = num_pages,
+        keywords       = keywords,
+        language       = data.get("language") or None,
+        sources        = {"zotero": 1.0},
+    )
+    ref.normalize()
+    return ref
 
 
 def _ref_to_zotero_item(ref: Reference) -> Dict[str, Any]:
@@ -228,6 +355,132 @@ class ZoteroIntegration(BaseIntegration):
                     all_keys[global_idx] = key
 
         return all_keys
+
+    async def pull(
+        self,
+        since: Optional[int] = None,
+        collection_id: Optional[str] = None,
+    ) -> Tuple[List[Reference], List[str], int]:
+        """
+        Pull items from the Zotero library.
+
+        Args:
+            since: Library version for incremental sync (only items changed
+                   after this version are returned).  Pass ``None`` for a
+                   full pull.
+            collection_id: Restrict to this collection key (overrides the
+                           instance-level collection configured at init time).
+
+        Returns:
+            ``(refs, zotero_keys, library_version)`` — parallel lists of
+            :class:`Reference` objects and their Zotero item keys, plus the
+            current library version to pass as ``since`` on the next call.
+        """
+        if not await self.is_configured():
+            raise RuntimeError("Zotero not configured — set api_key and user_id")
+
+        coll = collection_id or self._collection
+        if coll:
+            base_url = f"{self._lib_url()}/collections/{coll}/items"
+        else:
+            base_url = f"{self._lib_url()}/items"
+
+        params: Dict[str, Any] = {
+            "format": "json",
+            "limit":  100,
+            # Exclude non-bibliographic item types at the API level
+            "itemType": "-attachment -note -annotation",
+        }
+        if since is not None:
+            params["since"] = since
+
+        refs:            List[Reference] = []
+        zotero_keys:     List[str]       = []
+        library_version: int             = 0
+        start = 0
+
+        while True:
+            params["start"] = start
+            resp = await self._client.get(base_url, params=params)
+            if resp.status_code != 200:
+                break
+
+            lv = resp.headers.get("Last-Modified-Version", "0")
+            try:
+                library_version = int(lv)
+            except ValueError:
+                pass
+
+            items = resp.json()
+            if not items:
+                break
+
+            for item in items:
+                ref = _zotero_item_to_ref(item)
+                if ref is not None:
+                    refs.append(ref)
+                    zotero_keys.append(item.get("data", {}).get("key", ""))
+
+            total = int(resp.headers.get("Total-Results", "0"))
+            start += len(items)
+            if start >= total:
+                break
+
+        return refs, zotero_keys, library_version
+
+    async def stream_changes(self):
+        """
+        Async generator — yields ``(topic, library_version)`` tuples whenever
+        the Zotero streaming API reports a change to this library.
+
+        Automatically reconnects with a 5-second back-off on disconnection.
+        Use ``pull(since=library_version)`` on each yielded value to fetch the
+        actual changed items.
+
+        Requires the ``websockets`` package::
+
+            pip install websockets
+
+        Example::
+
+            async for topic, version in intg.stream_changes():
+                refs, keys, new_ver = await intg.pull(since=version)
+                ...
+        """
+        try:
+            import websockets  # noqa: PLC0415
+        except ImportError:
+            raise RuntimeError(
+                "Zotero streaming requires the 'websockets' package.\n"
+                "Install with:  pip install websockets"
+            )
+
+        import asyncio
+
+        topic = f"/{self._lib_type}s/{self._lib_id}/items"
+        subscribe = _json.dumps({
+            "action": "createSubscriptions",
+            "subscriptions": [{"apiKey": self._api_key, "topics": [topic]}],
+        })
+
+        while True:  # outer reconnect loop
+            try:
+                async with websockets.connect(
+                    "wss://stream.zotero.org",
+                    open_timeout=15,
+                    ping_interval=30,
+                    ping_timeout=10,
+                ) as ws:
+                    await ws.send(subscribe)
+                    async for raw in ws:
+                        try:
+                            event = _json.loads(raw)
+                        except Exception:
+                            continue
+                        if event.get("event") == "libraryChanged":
+                            yield topic, int(event.get("version", 0))
+            except Exception:
+                await asyncio.sleep(5)  # brief back-off before reconnecting
 
     async def push_or_update(
         self,

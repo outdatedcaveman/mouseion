@@ -671,6 +671,238 @@ async def _push_chunk(
 
 
 # ---------------------------------------------------------------------------
+# pull-sync  (pull FROM external tools INTO local DB)
+# ---------------------------------------------------------------------------
+
+_PULL_SOURCES = click.Choice(["zotero", "notion"], case_sensitive=False)
+
+
+@main.command("pull-sync")
+@click.argument("source", type=_PULL_SOURCES)
+@click.option("--full", is_flag=True,
+              help="Ignore the stored library version and re-pull everything.")
+@click.option("--enrich/--no-enrich", "do_enrich", default=True, show_default=True,
+              help="Re-enrich pulled refs via OpenAlex/CrossRef after import.")
+@click.option("--collection", "collection_id", default=None,
+              help="Zotero collection key to restrict the pull to.")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be pulled without writing to the DB.")
+def pull_sync(source, full, do_enrich, collection_id, dry_run):
+    """
+    Pull references FROM an external tool INTO the local database.
+
+    SOURCE: zotero | notion
+
+    Zotero pulls use incremental sync by default (only items changed since
+    the last pull).  Pass --full to re-pull the entire library.
+
+    Zotero example:
+      zoterpile pull-sync zotero
+      zoterpile pull-sync zotero --full --collection ABC123XY
+
+    Notion example:
+      zoterpile pull-sync notion
+    """
+    if source == "zotero":
+        _run_pull_zotero(full=full, do_enrich=do_enrich,
+                         collection_id=collection_id, dry_run=dry_run)
+    elif source == "notion":
+        _run_pull_notion(do_enrich=do_enrich, dry_run=dry_run)
+
+
+def _run_pull_zotero(*, full, do_enrich, collection_id, dry_run):
+    from .integrations.zotero import ZoteroIntegration
+    from .db import RefDatabase, _ref_id as _make_id
+    from .tagger import auto_tag, tag_from_keywords
+    from .config import get_config
+    import anyio
+
+    with RefDatabase() as db:
+        stored = db.get_setting("zotero_library_version")
+
+    since: Optional[int] = None if full else (int(stored) if stored else None)
+    label = "full pull" if since is None else f"incremental pull since version {since}"
+    console.print(f"[blue]→[/blue] Zotero {label}…")
+
+    async def _fetch():
+        async with ZoteroIntegration() as intg:
+            if not await intg.is_configured():
+                return None
+            return await intg.pull(since=since, collection_id=collection_id)
+
+    result = anyio.run(_fetch)
+    if result is None:
+        console.print("[red]Zotero not configured — set zotero_api_key and zotero_user_id[/red]")
+        return
+
+    refs, keys, new_version = result
+
+    if not refs:
+        console.print("[yellow]No new or updated items found.[/yellow]")
+        if new_version:
+            with RefDatabase() as db:
+                db.set_setting("zotero_library_version", str(new_version))
+        return
+
+    console.print(f"  Retrieved {len(refs)} item(s) (library version: {new_version}).")
+
+    if dry_run:
+        for ref in refs[:20]:
+            console.print(f"  [dim]· {(ref.title or '(untitled)')[:72]}[/dim]")
+        if len(refs) > 20:
+            console.print(f"  [dim]  … and {len(refs) - 20} more[/dim]")
+        return
+
+    if do_enrich:
+        from .lookup import enrich_batch
+        console.print("  Enriching with CrossRef / OpenAlex…")
+        refs = anyio.run(lambda: enrich_batch(refs))
+
+    cfg = get_config()
+    with RefDatabase() as db:
+        tags_per_ref = [
+            list(set(auto_tag(r, cfg) + tag_from_keywords(r))) for r in refs
+        ]
+        ids = db.upsert_many(refs, tags_per_ref=tags_per_ref)
+        # Persist Zotero item keys for refs that don't have one yet.
+        for ref_id, key in zip(ids, keys):
+            if key and not db.get_extra(ref_id).get("zotero_item_key"):
+                db.update_integration_ids(ref_id, zotero_item_key=key)
+        if new_version:
+            db.set_setting("zotero_library_version", str(new_version))
+
+    console.print(f"[green]✓[/green] Imported/updated {len(ids)} reference(s). "
+                  f"Library version now: {new_version}")
+
+
+def _run_pull_notion(*, do_enrich, dry_run):
+    from .integrations.notion import NotionIntegration
+    from .db import RefDatabase
+    from .tagger import auto_tag, tag_from_keywords
+    from .config import get_config
+    import anyio
+
+    console.print("[blue]→[/blue] Pulling from Notion database…")
+
+    async def _fetch():
+        async with NotionIntegration() as intg:
+            if not await intg.is_configured():
+                return None
+            return await intg.pull()
+
+    pairs = anyio.run(_fetch)
+    if pairs is None:
+        console.print("[red]Notion not configured — set notion_api_key and notion_database_id[/red]")
+        return
+
+    if not pairs:
+        console.print("[yellow]No pages found in Notion database.[/yellow]")
+        return
+
+    page_ids, refs = zip(*pairs)
+    refs = list(refs)
+    console.print(f"  Retrieved {len(refs)} page(s).")
+
+    if dry_run:
+        for ref in refs[:20]:
+            console.print(f"  [dim]· {(ref.title or '(untitled)')[:72]}[/dim]")
+        if len(refs) > 20:
+            console.print(f"  [dim]  … and {len(refs) - 20} more[/dim]")
+        return
+
+    if do_enrich:
+        from .lookup import enrich_batch
+        console.print("  Enriching with CrossRef / OpenAlex…")
+        refs = anyio.run(lambda: enrich_batch(refs))
+
+    cfg = get_config()
+    with RefDatabase() as db:
+        tags_per_ref = [
+            list(set(auto_tag(r, cfg) + tag_from_keywords(r))) for r in refs
+        ]
+        ids = db.upsert_many(refs, tags_per_ref=tags_per_ref)
+        for ref_id, pid in zip(ids, page_ids):
+            if pid and not db.get_extra(ref_id).get("notion_page_id"):
+                db.update_integration_ids(ref_id, notion_page_id=pid)
+
+    console.print(f"[green]✓[/green] Imported/updated {len(ids)} reference(s) from Notion.")
+
+
+# ---------------------------------------------------------------------------
+# stream  (long-running real-time sync via Zotero streaming API)
+# ---------------------------------------------------------------------------
+
+@main.command("stream")
+@click.argument("source", type=click.Choice(["zotero"], case_sensitive=False))
+@click.option("--enrich/--no-enrich", "do_enrich", default=False, show_default=True,
+              help="Re-enrich each incoming ref (slower, more API calls).")
+def stream_cmd(source, do_enrich):
+    """
+    Connect to a streaming API and sync changes in real-time.
+
+    SOURCE: zotero
+
+    Maintains a persistent websocket connection to the Zotero streaming API
+    (wss://stream.zotero.org) and pulls changed items automatically whenever
+    the library is modified.  Press Ctrl+C to stop.
+
+    Requires:  pip install websockets
+    """
+    from .integrations.zotero import ZoteroIntegration
+    from .db import RefDatabase
+    from .tagger import auto_tag, tag_from_keywords
+    from .config import get_config
+
+    console.print("[blue]→[/blue] Connecting to Zotero streaming API…  (Ctrl+C to stop)")
+
+    async def _run():
+        async with ZoteroIntegration() as intg:
+            if not await intg.is_configured():
+                console.print("[red]Zotero not configured[/red]")
+                return
+
+            async for _topic, version in intg.stream_changes():
+                with RefDatabase() as db:
+                    stored = db.get_setting("zotero_library_version")
+                since = int(stored) if stored else None
+                console.print(
+                    f"  [yellow]⚡[/yellow] Library changed → version {version}. "
+                    f"Pulling since {since}…"
+                )
+
+                refs, keys, new_version = await intg.pull(since=since)
+                if not refs:
+                    with RefDatabase() as db:
+                        db.set_setting("zotero_library_version", str(new_version))
+                    continue
+
+                if do_enrich:
+                    from .lookup import enrich_batch
+                    refs = await enrich_batch(refs)
+
+                cfg = get_config()
+                with RefDatabase() as db:
+                    tags_per_ref = [
+                        list(set(auto_tag(r, cfg) + tag_from_keywords(r))) for r in refs
+                    ]
+                    ids = db.upsert_many(refs, tags_per_ref=tags_per_ref)
+                    for ref_id, key in zip(ids, keys):
+                        if key and not db.get_extra(ref_id).get("zotero_item_key"):
+                            db.update_integration_ids(ref_id, zotero_item_key=key)
+                    db.set_setting("zotero_library_version", str(new_version))
+
+                console.print(
+                    f"  [green]✓[/green] Synced {len(refs)} item(s). "
+                    f"Version: {new_version}"
+                )
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("\n[dim]Streaming stopped.[/dim]")
+
+
+# ---------------------------------------------------------------------------
 # fetch-pdfs
 # ---------------------------------------------------------------------------
 

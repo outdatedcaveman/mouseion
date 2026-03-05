@@ -357,6 +357,11 @@ class RefDatabase:
     CREATE TRIGGER IF NOT EXISTS refs_ad AFTER DELETE ON refs BEGIN
         DELETE FROM refs_fts WHERE ref_id = old.id;
     END;
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
     """
 
     def __init__(self, path: Optional[str | Path] = None) -> None:
@@ -930,6 +935,27 @@ class RefDatabase:
                 (threshold, limit),
             )
             return [_row_to_ref(r) for r in cur.fetchall()]
+
+    # -----------------------------------------------------------------------
+    # Persistent key-value settings (sync state, version cursors, etc.)
+    # -----------------------------------------------------------------------
+
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Retrieve a persisted setting value, or ``default`` if absent."""
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Persist a setting value, overwriting any existing value for ``key``."""
+        with self._db() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
 
 
 # ---------------------------------------------------------------------------

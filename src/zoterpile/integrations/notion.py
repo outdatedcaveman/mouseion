@@ -173,6 +173,93 @@ def _ref_to_notion_blocks(ref: Reference) -> List[Dict]:
     return blocks
 
 
+def _notion_page_to_ref(page: Dict[str, Any]) -> Optional[Reference]:
+    """
+    Convert a Notion page dict (from the pages API) to a Reference.
+
+    Expects the database schema described in this module's docstring.
+    Returns ``None`` if the page has no usable title.
+    """
+    from ..models import Author, RefType, Reference
+
+    props = page.get("properties", {})
+
+    def _text(name: str) -> str:
+        prop = props.get(name, {})
+        rt = prop.get("rich_text") or prop.get("title") or []
+        return "".join(t.get("plain_text", "") for t in rt).strip()
+
+    def _number(name: str) -> Optional[int]:
+        v = props.get(name, {}).get("number")
+        return int(v) if v is not None else None
+
+    def _select(name: str) -> Optional[str]:
+        return (props.get(name, {}).get("select") or {}).get("name")
+
+    def _url(name: str) -> Optional[str]:
+        return props.get(name, {}).get("url") or None
+
+    def _checkbox(name: str) -> Optional[bool]:
+        v = props.get(name, {}).get("checkbox")
+        return bool(v) if v is not None else None
+
+    def _multi_select(name: str) -> List[str]:
+        return [o["name"] for o in props.get(name, {}).get("multi_select", []) if o.get("name")]
+
+    title = _text("Title")
+    if not title:
+        return None
+
+    # DOI: strip the https://doi.org/ prefix we wrote during push
+    doi_url = _url("DOI") or ""
+    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi_url).strip() or None
+
+    year_raw = _number("Year")
+
+    type_str = _select("Type") or ""
+    try:
+        ref_type = RefType(type_str)
+    except ValueError:
+        ref_type = RefType.UNKNOWN
+
+    # Authors: stored as "Family, Given; Family, Given; …"
+    authors: List[Author] = []
+    authors_text = _text("Authors")
+    if authors_text:
+        for part in authors_text.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if ", " in part:
+                fam, giv = part.split(", ", 1)
+                authors.append(Author(family=fam.strip(), given=giv.strip()))
+            else:
+                authors.append(Author(family=part))
+
+    ref = Reference(
+        title         = title,
+        authors       = authors,
+        year          = year_raw,
+        doi           = doi,
+        arxiv_id      = _text("arXiv") or None,
+        pmid          = _text("PMID") or None,
+        url           = _url("URL"),
+        oa_url        = _url("PDF URL"),
+        abstract      = _text("Abstract") or None,
+        ref_type      = ref_type,
+        journal       = _text("Journal") or None,
+        volume        = _text("Volume") or None,
+        issue         = _text("Issue") or None,
+        pages         = _text("Pages") or None,
+        keywords      = _multi_select("Keywords"),
+        open_access   = _checkbox("Open Access"),
+        citation_count= _number("Citation Count"),
+        sources       = {"notion": 1.0},
+    )
+    ref.normalize()
+    return ref
+
+
 class NotionIntegration(BaseIntegration):
     """Create / update pages in a Notion database."""
 
@@ -268,6 +355,48 @@ class NotionIntegration(BaseIntegration):
             return resp.status_code == 200
         except Exception:
             return False
+
+    async def pull(self) -> List[tuple]:
+        """
+        Pull all pages from the configured Notion database.
+
+        Returns a list of ``(notion_page_id, Reference)`` tuples.
+        Skips pages with no usable title.  Handles Notion's cursor-based
+        pagination automatically.
+        """
+        if not await self.is_configured():
+            raise RuntimeError("Notion not configured — set api_key and database_id")
+
+        results: List[tuple] = []
+        has_more = True
+        start_cursor: Optional[str] = None
+
+        while has_more:
+            body: Dict[str, Any] = {"page_size": 100}
+            if start_cursor:
+                body["start_cursor"] = start_cursor
+
+            try:
+                resp = await self._client.post(
+                    f"{_BASE}/databases/{self._database_id}/query",
+                    json=body,
+                )
+            except Exception:
+                break
+
+            if resp.status_code != 200:
+                break
+
+            data = resp.json()
+            for page in data.get("results", []):
+                ref = _notion_page_to_ref(page)
+                if ref is not None:
+                    results.append((page["id"], ref))
+
+            has_more     = data.get("has_more", False)
+            start_cursor = data.get("next_cursor")
+
+        return results
 
     async def push_or_update(
         self,

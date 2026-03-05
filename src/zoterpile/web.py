@@ -10,11 +10,13 @@ Opens at http://localhost:7274
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import hmac
 import re
 import threading
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from flask import Flask, Response, abort, jsonify, request
 
@@ -29,6 +31,17 @@ app.json.sort_keys = False
 # In-memory job store for background enrichment
 _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
+
+# Zotero streaming state — managed by the streaming background thread
+_stream_thread: Optional[threading.Thread] = None
+_stream_status: Dict[str, Any] = {
+    "active":           False,
+    "last_event_at":    None,
+    "library_version":  None,
+    "last_synced_count": 0,
+    "error":            None,
+}
+_stream_stop_event = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +214,204 @@ def stats():
         return jsonify({"count": n, "avg_completeness": round(avg, 3)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Streaming API — Zotero real-time sync background thread
+# ---------------------------------------------------------------------------
+
+@app.route("/api/stream/status")
+def stream_status():
+    """Return the current status of the Zotero streaming listener."""
+    return jsonify({
+        "active":            bool(_stream_thread and _stream_thread.is_alive()),
+        "last_event_at":     _stream_status["last_event_at"],
+        "library_version":   _stream_status["library_version"],
+        "last_synced_count": _stream_status["last_synced_count"],
+        "error":             _stream_status["error"],
+    })
+
+
+@app.route("/api/stream/zotero/start", methods=["POST"])
+def start_zotero_stream():
+    """Start the Zotero streaming listener in a background thread."""
+    global _stream_thread
+    if _stream_thread and _stream_thread.is_alive():
+        return jsonify({"ok": True, "message": "Already running"})
+    _stream_stop_event.clear()
+    _stream_thread = threading.Thread(
+        target=_zotero_stream_worker, daemon=True, name="zotero-stream"
+    )
+    _stream_thread.start()
+    return jsonify({"ok": True, "message": "Streaming started"})
+
+
+@app.route("/api/stream/zotero/stop", methods=["POST"])
+def stop_zotero_stream():
+    """Signal the streaming thread to stop."""
+    _stream_stop_event.set()
+    return jsonify({"ok": True, "message": "Stop signal sent"})
+
+
+def _zotero_stream_worker() -> None:
+    """
+    Background thread: connects to the Zotero streaming API (websocket) and
+    pulls changed items into the local database whenever the library changes.
+    Requires the ``websockets`` package.
+    """
+    import datetime
+
+    _stream_status.update({"active": True, "error": None})
+
+    async def _run() -> None:
+        from .integrations.zotero import ZoteroIntegration
+        from .db import RefDatabase
+        from .tagger import auto_tag, tag_from_keywords
+        from .config import get_config
+
+        try:
+            async with ZoteroIntegration() as intg:
+                if not await intg.is_configured():
+                    _stream_status.update({
+                        "active": False,
+                        "error": "Zotero not configured",
+                    })
+                    return
+
+                async for _topic, version in intg.stream_changes():
+                    if _stream_stop_event.is_set():
+                        break
+
+                    _stream_status["last_event_at"] = (
+                        datetime.datetime.utcnow().isoformat() + "Z"
+                    )
+
+                    with RefDatabase() as db:
+                        stored = db.get_setting("zotero_library_version")
+                    since = int(stored) if stored else None
+
+                    refs, keys, new_version = await intg.pull(since=since)
+
+                    if refs:
+                        cfg = get_config()
+                        with RefDatabase() as db:
+                            tags_per_ref = [
+                                list(set(auto_tag(r, cfg) + tag_from_keywords(r)))
+                                for r in refs
+                            ]
+                            ids = db.upsert_many(refs, tags_per_ref=tags_per_ref)
+                            for ref_id, key in zip(ids, keys):
+                                if key and not db.get_extra(ref_id).get("zotero_item_key"):
+                                    db.update_integration_ids(ref_id, zotero_item_key=key)
+                            if new_version:
+                                db.set_setting("zotero_library_version", str(new_version))
+
+                    _stream_status.update({
+                        "library_version":   new_version,
+                        "last_synced_count": len(refs),
+                    })
+
+        except Exception as exc:
+            _stream_status.update({"active": False, "error": str(exc)})
+            raise
+
+    try:
+        asyncio.run(_run())
+    finally:
+        _stream_status["active"] = False
+
+
+# ---------------------------------------------------------------------------
+# Webhooks — receive push notifications from external tools
+# ---------------------------------------------------------------------------
+
+@app.route("/webhooks/notion", methods=["POST"])
+def notion_webhook():
+    """
+    Receive a Notion webhook event.
+
+    Notion posts to this URL when a page in the configured database is created
+    or updated.  We verify the HMAC-SHA256 signature (if a secret is
+    configured), extract the page ID, fetch the updated page, convert it to a
+    Reference, and upsert it into the local database.
+
+    Configure a webhook secret via the ``NOTION_WEBHOOK_SECRET`` environment
+    variable or ``notion_webhook_secret`` in the config file.
+    """
+    # --- Signature verification ---
+    secret = _notion_webhook_secret()
+    if secret:
+        raw_body  = request.get_data()
+        sig_header = request.headers.get("X-Notion-Signature", "")
+        expected  = "sha256=" + hmac.new(
+            secret.encode(), raw_body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(sig_header, expected):
+            abort(403, "Invalid signature")
+
+    payload    = request.json or {}
+    event_type = (payload.get("type") or "").lower()
+
+    # Notion sends page.created, page.updated, page.property_value_updated, etc.
+    if "page" not in event_type:
+        return jsonify({"ok": True, "skipped": True})
+
+    # Extract page ID from various payload shapes Notion may send
+    entity  = payload.get("entity") or {}
+    data    = payload.get("data") or {}
+    page_id = entity.get("id") or data.get("id") or data.get("page_id") or ""
+
+    if page_id:
+        threading.Thread(
+            target=_handle_notion_page_update,
+            args=(page_id,),
+            daemon=True,
+        ).start()
+
+    return jsonify({"ok": True, "page_id": page_id})
+
+
+def _handle_notion_page_update(page_id: str) -> None:
+    """Background: fetch the updated Notion page and upsert into local DB."""
+    async def _run() -> None:
+        from .integrations.notion import NotionIntegration, _notion_page_to_ref
+        from .db import RefDatabase
+
+        try:
+            async with NotionIntegration() as intg:
+                if not await intg.is_configured():
+                    return
+                resp = await intg._client.get(
+                    f"https://api.notion.com/v1/pages/{page_id}"
+                )
+                if resp.status_code != 200:
+                    return
+                ref = _notion_page_to_ref(resp.json())
+                if ref is None:
+                    return
+                with RefDatabase() as db:
+                    ref_id = db.upsert(ref)
+                    if not db.get_extra(ref_id).get("notion_page_id"):
+                        db.update_integration_ids(ref_id, notion_page_id=page_id)
+        except Exception:
+            pass
+
+    try:
+        asyncio.run(_run())
+    except Exception:
+        pass
+
+
+def _notion_webhook_secret() -> Optional[str]:
+    import os
+    try:
+        from .config import get_config
+        cfg = get_config()
+        if hasattr(cfg, "notion_webhook_secret") and cfg.notion_webhook_secret:
+            return cfg.notion_webhook_secret
+    except Exception:
+        pass
+    return os.environ.get("NOTION_WEBHOOK_SECRET") or None
 
 
 # ---------------------------------------------------------------------------
