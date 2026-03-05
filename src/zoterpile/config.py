@@ -96,6 +96,11 @@ class Config:
     instapaper_username: str = ""
     instapaper_password: str = ""
 
+    # --- Semantic index ---
+    semantic_model: str = "all-MiniLM-L6-v2"   # sentence-transformers model name
+    semantic_index_path: str = ""               # empty = default (~/.local/share/zoterpile/semantic)
+    semantic_auto_index: bool = True            # auto-index refs on add/enrich
+
     # --- Auto-tagging ---
     auto_tag_rules: List[AutoTagRule] = field(default_factory=list)
     # Built-in tags always applied based on ref properties
@@ -189,6 +194,11 @@ def _apply_toml(cfg: Config, raw: dict) -> None:
             "tag_by_type": "tag_by_type",
             "tag_open_access": "tag_open_access",
             "tag_by_year": "tag_by_year",
+        },
+        "semantic":     {
+            "model": "semantic_model",
+            "index_path": "semantic_index_path",
+            "auto_index": "semantic_auto_index",
         },
     }
     for section, mapping in simple_sections.items():
@@ -308,6 +318,11 @@ def _render_toml(cfg: Config) -> str:
         f"tag_by_type    = {str(cfg.tag_by_type).lower()}",
         f"tag_open_access = {str(cfg.tag_open_access).lower()}",
         f"tag_by_year    = {str(cfg.tag_by_year).lower()}",
+        "",
+        "[semantic]",
+        f'model       = "{cfg.semantic_model}"   # sentence-transformers model',
+        f'index_path  = "{cfg.semantic_index_path}"  # empty = default location',
+        f"auto_index  = {str(cfg.semantic_auto_index).lower()}  # index on add/enrich",
         "",
         "# Example auto-tag rules:",
         "# [[auto_tag.rules]]",

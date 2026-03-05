@@ -197,6 +197,17 @@ def add(
             f"(avg completeness: {avg:.0%})"
         )
 
+        # --- Semantic index (best-effort) ---
+        from .config import get_config as _get_cfg
+        if _get_cfg().semantic_auto_index:
+            try:
+                from .semantic import get_default_index
+                idx = get_default_index()
+                if idx.is_available():
+                    idx.index_many(list(zip(ids, enriched)))
+            except Exception:
+                pass
+
     # --- Optional output ---
     if fmt:
         _write_output(enriched, fmt, output)
@@ -443,13 +454,24 @@ def enrich(threshold: float, limit: int, concurrency: int):
             for r in enriched if r is not None
         ]
         final = [r for r in enriched if r is not None]
-        db.upsert_many(final, tags_per_ref=tags_per_ref)
+        ids = db.upsert_many(final, tags_per_ref=tags_per_ref)
 
     avg = sum(r.completeness for r in final) / len(final) if final else 0
     console.print(
         f"[green]✓[/green] Re-enriched {len(final)} references — "
         f"avg completeness: {avg:.0%}"
     )
+
+    # --- Semantic index (best-effort) ---
+    from .config import get_config as _get_cfg
+    if _get_cfg().semantic_auto_index and final:
+        try:
+            from .semantic import get_default_index
+            idx = get_default_index()
+            if idx.is_available():
+                idx.index_many(list(zip(ids, final)))
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -464,92 +486,162 @@ _SYNC_TARGETS = click.Choice(
 
 @main.command()
 @click.argument("target", type=_SYNC_TARGETS)
-@click.option("--tag",       "tags",     multiple=True, help="Only sync refs with these tags")
-@click.option("--year-from", type=int,   default=None)
-@click.option("--limit",     default=500, show_default=True)
+@click.option("--tag",        "tags",      multiple=True, help="Only sync refs with these tags")
+@click.option("--year-from",  type=int,    default=None)
+@click.option("--batch-size", type=int,    default=500, show_default=True,
+              help="Number of refs per sync batch (set lower to reduce memory use)")
 @click.option("--instapaper-oa-only", is_flag=True,
               help="Only send open-access papers to Instapaper")
-def sync(target: str, tags, year_from, limit, instapaper_oa_only):
+def sync(target: str, tags, year_from, batch_size, instapaper_oa_only):
     """
     Push references to external tools.
 
     TARGET: zotero | notion | obsidian | instapaper | all
+
+    Streams the database in pages of --batch-size so the full library can be
+    synced regardless of size (hundreds of thousands of entries).
     """
     from .db import RefDatabase
 
-    with RefDatabase() as db:
-        refs = db.list_all(
-            tags=list(tags) or None,
-            year_from=year_from,
-            limit=limit,
-        )
+    db_tags     = list(tags) or None
+    targets_list = ["zotero", "notion", "obsidian", "instapaper"] if target == "all" else [target]
 
-    if not refs:
+    # Count first for progress display
+    with RefDatabase() as db:
+        total = db.count()
+
+    if total == 0:
         console.print("[yellow]No references to sync.[/yellow]")
         return
 
-    console.print(f"[blue]→[/blue] Syncing {len(refs)} reference(s) to [bold]{target}[/bold]…")
+    console.print(
+        f"[blue]→[/blue] Syncing up to {total} reference(s) to "
+        f"[bold]{target}[/bold] in pages of {batch_size}…"
+    )
 
-    targets = ["zotero", "notion", "obsidian", "instapaper"] if target == "all" else [target]
+    # Open connections to all integration targets once; stream pages through them.
+    asyncio.run(_sync_all_paginated(
+        targets_list,
+        db_tags=db_tags,
+        year_from=year_from,
+        batch_size=batch_size,
+        instapaper_oa_only=instapaper_oa_only,
+    ))
 
-    for t in targets:
-        asyncio.run(_sync_one(t, refs, instapaper_oa_only))
 
-
-async def _sync_one(target: str, refs: List[Reference], instapaper_oa_only: bool) -> None:
+async def _sync_all_paginated(
+    targets: List[str],
+    db_tags: Optional[List[str]],
+    year_from: Optional[int],
+    batch_size: int,
+    instapaper_oa_only: bool,
+) -> None:
+    """Open all integration connections, stream DB pages, push each page."""
     from .db import RefDatabase
 
+    # Pre-check configuration so we don't start streaming if nothing is set up.
+    integrations = {}
+    for t in targets:
+        integration = _make_integration(t)
+        if integration is not None:
+            integrations[t] = integration
+
+    if not integrations:
+        console.print("[yellow]No integrations configured.[/yellow]")
+        return
+
+    # Connect all integrations
+    for t, intg in integrations.items():
+        await intg.connect()
+
+    # Validate configuration before streaming
+    unconfigured = []
+    for t, intg in list(integrations.items()):
+        if not await intg.is_configured():
+            console.print(f"[yellow]⚠ {t} not configured — skipping[/yellow]")
+            unconfigured.append(t)
+    for t in unconfigured:
+        del integrations[t]
+
+    if not integrations:
+        return
+
+    # Counters per target
+    ok_counts: Dict[str, int] = {t: 0 for t in integrations}
+    total_counts: Dict[str, int] = {t: 0 for t in integrations}
+
+    try:
+        with RefDatabase() as db:
+            for chunk in db.iter_all(
+                chunk_size=batch_size,
+                tags=db_tags,
+                year_from=year_from,
+            ):
+                for t, intg in integrations.items():
+                    ok, pushed = await _push_chunk(t, intg, chunk, instapaper_oa_only, db)
+                    ok_counts[t]    += ok
+                    total_counts[t] += pushed
+    finally:
+        for intg in integrations.values():
+            await intg.disconnect()
+
+    for t in integrations:
+        console.print(
+            f"[green]✓ {t}:[/green] {ok_counts[t]}/{total_counts[t]} pushed"
+        )
+
+
+def _make_integration(target: str):
+    """Return the integration object for a target, or None if unknown."""
     if target == "zotero":
         from .integrations.zotero import ZoteroIntegration
-        async with ZoteroIntegration() as z:
-            if not await z.is_configured():
-                console.print(f"[yellow]⚠ Zotero not configured — skipping[/yellow]")
-                return
-            keys = await z.push(refs)
-            ok = sum(1 for k in keys if k)
-            console.print(f"[green]✓ Zotero:[/green] pushed {ok}/{len(refs)}")
-            if ok:
-                with RefDatabase() as db:
-                    for ref, key in zip(refs, keys):
-                        if key:
-                            from .db import _ref_id
-                            db.update_integration_ids(_ref_id(ref), zotero_item_key=key)
-
+        return ZoteroIntegration()
     elif target == "notion":
         from .integrations.notion import NotionIntegration
-        async with NotionIntegration() as n:
-            if not await n.is_configured():
-                console.print(f"[yellow]⚠ Notion not configured — skipping[/yellow]")
-                return
-            page_ids = await n.push(refs)
-            ok = sum(1 for p in page_ids if p)
-            console.print(f"[green]✓ Notion:[/green] created {ok}/{len(refs)} pages")
-            if ok:
-                with RefDatabase() as db:
-                    for ref, pid in zip(refs, page_ids):
-                        if pid:
-                            from .db import _ref_id
-                            db.update_integration_ids(_ref_id(ref), notion_page_id=pid)
-
+        return NotionIntegration()
     elif target == "obsidian":
         from .integrations.obsidian import ObsidianIntegration
-        async with ObsidianIntegration() as o:
-            if not await o.is_configured():
-                console.print(f"[yellow]⚠ Obsidian vault not found — skipping[/yellow]")
-                return
-            paths = await o.push(refs)
-            console.print(f"[green]✓ Obsidian:[/green] wrote {len(paths)} notes")
-
+        return ObsidianIntegration()
     elif target == "instapaper":
         from .integrations.instapaper import InstapaperIntegration
-        to_send = [r for r in refs if not instapaper_oa_only or r.open_access]
-        if not to_send:
-            console.print("[yellow]⚠ No refs to send to Instapaper (try without --instapaper-oa-only)[/yellow]")
-            return
-        async with InstapaperIntegration() as i:
-            results = await i.push(to_send)
-            ok = sum(1 for r in results if r == "ok")
-            console.print(f"[green]✓ Instapaper:[/green] added {ok}/{len(to_send)}")
+        return InstapaperIntegration()
+    return None
+
+
+async def _push_chunk(
+    target: str,
+    intg,
+    chunk: List[Reference],
+    instapaper_oa_only: bool,
+    db,
+) -> tuple:
+    """Push one chunk to one integration. Returns (ok_count, attempted_count)."""
+    from .db import _ref_id
+
+    if target == "instapaper":
+        chunk = [r for r in chunk if not instapaper_oa_only or r.open_access]
+        if not chunk:
+            return 0, 0
+
+    try:
+        ext_ids = await intg.push(chunk)
+    except Exception as exc:
+        console.print(f"[red]  {target} error: {exc}[/red]")
+        return 0, len(chunk)
+
+    ok = sum(1 for eid in ext_ids if eid)
+
+    # Persist integration IDs back to the database
+    for ref, eid in zip(chunk, ext_ids):
+        if not eid:
+            continue
+        rid = _ref_id(ref)
+        if target == "zotero":
+            db.update_integration_ids(rid, zotero_item_key=eid)
+        elif target == "notion":
+            db.update_integration_ids(rid, notion_page_id=eid)
+
+    return ok, len(chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +724,258 @@ def stats():
         f"\n[dim]Cache:[/dim] {cs['hits']} hits / {cs['misses']} misses "
         f"({cs['hit_rate']:.0%}) — {cs['size_bytes']/1024**2:.1f} MB"
     )
+
+    # Semantic index size
+    try:
+        from .semantic import get_default_index
+        idx = get_default_index()
+        if idx.is_available():
+            console.print(f"[dim]Semantic index:[/dim] {idx.count()} vectors indexed")
+        else:
+            console.print("[dim]Semantic index:[/dim] not available (install chromadb + sentence-transformers)")
+    except Exception:
+        pass
+
+    # Provider quota status
+    try:
+        from .quota import get_default_quota_manager
+        qm = get_default_quota_manager()
+        status = qm.get_status()
+        if status:
+            qtable = Table(title="Provider Quota (last 24 h)", box=box.SIMPLE)
+            qtable.add_column("Provider", style="cyan")
+            qtable.add_column("/ min", justify="right")
+            qtable.add_column("/ hour", justify="right")
+            qtable.add_column("/ day", justify="right")
+            for provider, info in sorted(status.items()):
+                qtable.add_row(
+                    provider,
+                    f"{info['last_minute']}/{info['limits']['per_minute'] or '∞'}",
+                    f"{info['last_hour']}/{info['limits']['per_hour'] or '∞'}",
+                    f"{info['last_day']}/{info['limits']['per_day'] or '∞'}",
+                )
+            console.print(qtable)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# semantic-search
+# ---------------------------------------------------------------------------
+
+@main.command("semantic-search")
+@click.argument("query")
+@click.option("-n", "--results", "n", default=10, show_default=True,
+              help="Number of results")
+@click.option("--year-from",  type=int,  default=None)
+@click.option("--year-to",    type=int,  default=None)
+@click.option("--type",       "ref_type", default=None)
+@click.option("--oa",         is_flag=True, help="Open-access only")
+@click.option("-f", "--format", "fmt", type=_FORMAT_CHOICES, default=None)
+@click.option("-o", "--output", default=None)
+def semantic_search(query, n, year_from, year_to, ref_type, oa, fmt, output):
+    """
+    Semantic (embedding-based) search — finds conceptually related references
+    even when the exact keywords are absent.
+
+    Requires:  pip install chromadb sentence-transformers
+    """
+    from .semantic import get_default_index
+    from .db import RefDatabase
+
+    idx = get_default_index()
+    if not idx.is_available():
+        console.print(
+            "[red]Semantic index not available.[/red]\n"
+            "Install dependencies:  pip install chromadb sentence-transformers\n"
+            "Then rebuild the index:  zoterpile index-semantic"
+        )
+        raise SystemExit(1)
+
+    if idx.count() == 0:
+        console.print(
+            "[yellow]Semantic index is empty.[/yellow]\n"
+            "Build it with:  zoterpile index-semantic"
+        )
+        return
+
+    with console.status("[cyan]Searching…"):
+        hits = idx.search(
+            query, n=n,
+            year_from=year_from, year_to=year_to,
+            ref_type=ref_type, oa_only=oa,
+        )
+
+    if not hits:
+        console.print("[yellow]No results.[/yellow]")
+        return
+
+    ref_ids = [rid for rid, _ in hits]
+    scores  = {rid: score for rid, score in hits}
+
+    with RefDatabase() as db:
+        refs = [db.get(rid) for rid in ref_ids]
+    refs = [r for r in refs if r is not None]
+
+    if fmt:
+        _write_output(refs, fmt, output)
+        return
+
+    table = Table(box=box.SIMPLE, show_header=True)
+    table.add_column("Sim",    style="dim",  width=5)
+    table.add_column("Year",   style="cyan", width=5)
+    table.add_column("Authors", width=20)
+    table.add_column("Title",  width=55)
+    table.add_column("DOI",    style="blue", width=25)
+
+    for ref in refs:
+        from .db import _ref_id
+        score = scores.get(_ref_id(ref), 0.0)
+        auth  = ref.authors[0].family if ref.authors else "?"
+        if len(ref.authors) > 1:
+            auth += " et al."
+        table.add_row(
+            f"{score:.2f}",
+            str(ref.year or "?"),
+            auth,
+            (ref.title or "")[:55],
+            (ref.doi or "")[:25],
+        )
+    console.print(table)
+    console.print(f"[dim]{len(refs)} result(s)[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# find-similar
+# ---------------------------------------------------------------------------
+
+@main.command("find-similar")
+@click.argument("ref_id")
+@click.option("-n", "--results", "n", default=5, show_default=True)
+def find_similar(ref_id: str, n: int):
+    """Find references similar to an existing one (by ID or DOI)."""
+    from .semantic import get_default_index
+    from .db import RefDatabase
+
+    idx = get_default_index()
+    if not idx.is_available():
+        console.print("[red]Semantic index not available.[/red]")
+        raise SystemExit(1)
+
+    # Resolve ref_id (might be a DOI)
+    with RefDatabase() as db:
+        seed = db.get(ref_id) or db.get_by_doi(ref_id)
+
+    if seed is None:
+        console.print(f"[red]Reference not found: {ref_id}[/red]")
+        raise SystemExit(1)
+
+    from .db import _ref_id as compute_ref_id
+    rid = compute_ref_id(seed)
+
+    with console.status("[cyan]Finding similar references…"):
+        hits = idx.find_similar(rid, n=n)
+
+    if not hits:
+        console.print("[yellow]No similar references found (index may be incomplete).[/yellow]")
+        return
+
+    result_ids = [r for r, _ in hits]
+    scores     = {r: s for r, s in hits}
+
+    with RefDatabase() as db:
+        refs = [db.get(r) for r in result_ids]
+    refs = [r for r in refs if r is not None]
+
+    table = Table(title=f"Similar to: {seed.title[:50] if seed.title else ref_id}", box=box.SIMPLE)
+    table.add_column("Sim",    style="dim",  width=5)
+    table.add_column("Year",   style="cyan", width=5)
+    table.add_column("Authors", width=20)
+    table.add_column("Title",  width=55)
+    for ref in refs:
+        score = scores.get(compute_ref_id(ref), 0.0)
+        auth  = ref.authors[0].family if ref.authors else "?"
+        if len(ref.authors) > 1:
+            auth += " et al."
+        table.add_row(
+            f"{score:.2f}",
+            str(ref.year or "?"),
+            auth,
+            (ref.title or "")[:55],
+        )
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# index-semantic  (build / rebuild the semantic index)
+# ---------------------------------------------------------------------------
+
+@main.command("index-semantic")
+@click.option("--chunk-size", default=500, show_default=True,
+              help="References to embed per batch")
+@click.option("--rebuild",    is_flag=True,
+              help="Delete existing index and rebuild from scratch")
+def index_semantic(chunk_size: int, rebuild: bool):
+    """
+    Build or rebuild the semantic (embedding) index from the database.
+
+    Safe to run on a live database — uses streaming pagination.
+    Requires:  pip install chromadb sentence-transformers
+    """
+    from .semantic import get_default_index, SemanticIndex
+    from .db import RefDatabase
+
+    idx = get_default_index()
+    if not idx.is_available():
+        console.print(
+            "[red]Dependencies not installed.[/red]\n"
+            "Run:  pip install chromadb sentence-transformers"
+        )
+        raise SystemExit(1)
+
+    if rebuild:
+        # Reset by creating a fresh collection
+        try:
+            import chromadb as _chroma
+            from pathlib import Path
+            from .config import get_config
+            cfg  = get_config()
+            path = cfg.semantic_index_path or str(
+                Path.home() / ".local" / "share" / "zoterpile" / "semantic"
+            )
+            client = _chroma.PersistentClient(path=path)
+            try:
+                client.delete_collection("references")
+            except Exception:
+                pass
+            # Reset the singleton so _get_collection re-creates it
+            import zoterpile.semantic as _sem_mod
+            _sem_mod._default_index = None
+            idx = get_default_index()
+        except Exception as exc:
+            console.print(f"[red]Could not reset index: {exc}[/red]")
+            raise SystemExit(1)
+        console.print("[yellow]Old index deleted.[/yellow]")
+
+    with RefDatabase() as db:
+        total = db.count()
+
+    if total == 0:
+        console.print("[yellow]Database is empty — nothing to index.[/yellow]")
+        return
+
+    console.print(f"[blue]→[/blue] Indexing {total} references…")
+
+    with _make_progress() as progress:
+        task = progress.add_task("[cyan]Embedding…", total=total)
+
+        def on_progress(done: int, _total: int) -> None:
+            progress.update(task, completed=done)
+
+        with RefDatabase() as db:
+            indexed = idx.reindex_all(db, chunk_size=chunk_size, progress_callback=on_progress)
+
+    console.print(f"[green]✓[/green] Indexed {indexed} references into the semantic store.")
 
 
 # ---------------------------------------------------------------------------

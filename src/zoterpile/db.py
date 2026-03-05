@@ -391,43 +391,63 @@ class RefDatabase:
         refs: List[Reference],
         tags_per_ref: Optional[List[Optional[List[str]]]] = None,
     ) -> List[str]:
-        """Bulk upsert. Returns list of IDs in the same order."""
-        ids = []
+        """
+        Bulk upsert.  Returns list of IDs in the same order as `refs`.
+
+        Optimised for large batches:
+        - One SELECT to batch-resolve DOI collisions instead of N individual SELECTs.
+        - One executemany for all inserts/updates instead of N individual executes.
+        """
+        if not refs:
+            return []
+
+        rows = [_ref_to_row(r) for r in refs]
+        for row in rows:
+            if "created_at" not in row:
+                row["created_at"] = _now()
+
         with self._db() as conn:
-            for i, ref in enumerate(refs):
-                row = _ref_to_row(ref)
-                ref_id = row["id"]
+            # --- Batch DOI collision detection ---
+            # Map doi → list of row indices so we handle duplicate DOIs in batch.
+            dois_to_idxs: Dict[str, List[int]] = {}
+            for i, row in enumerate(rows):
+                doi = row.get("doi")
+                if doi:
+                    dois_to_idxs.setdefault(doi, []).append(i)
 
-                # Resolve DOI-based ID collision (same logic as upsert)
-                if ref.doi:
-                    existing = conn.execute(
-                        "SELECT id FROM refs WHERE doi = ?", (ref.doi,)
-                    ).fetchone()
-                    if existing and existing["id"] != ref_id:
-                        ref_id = existing["id"]
-                        row["id"] = ref_id
-
-                cols = list(row.keys())
-                placeholders = ", ".join(f":{c}" for c in cols)
-                updates = ", ".join(
-                    f"{c} = excluded.{c}"
-                    for c in cols
-                    if c not in ("id", "created_at")
+            if dois_to_idxs:
+                placeholders = ", ".join("?" * len(dois_to_idxs))
+                cur = conn.execute(
+                    f"SELECT doi, id FROM refs WHERE doi IN ({placeholders})",
+                    list(dois_to_idxs.keys()),
                 )
-                sql = f"""
-                    INSERT INTO refs ({', '.join(cols)})
-                    VALUES ({placeholders})
-                    ON CONFLICT(id) DO UPDATE SET {updates}
-                """
-                if "created_at" not in row:
-                    row["created_at"] = _now()
-                conn.execute(sql, row)
+                for existing_doi, existing_id in cur.fetchall():
+                    for row_idx in dois_to_idxs[existing_doi]:
+                        if rows[row_idx]["id"] != existing_id:
+                            rows[row_idx]["id"] = existing_id
 
-                if tags_per_ref and i < len(tags_per_ref) and tags_per_ref[i]:
-                    self._apply_tags(conn, ref_id, tags_per_ref[i])
+            # --- Bulk upsert with executemany ---
+            cols = list(rows[0].keys())
+            placeholders_str = ", ".join(f":{c}" for c in cols)
+            updates = ", ".join(
+                f"{c} = excluded.{c}"
+                for c in cols
+                if c not in ("id", "created_at")
+            )
+            sql = (
+                f"INSERT INTO refs ({', '.join(cols)}) "
+                f"VALUES ({placeholders_str}) "
+                f"ON CONFLICT(id) DO UPDATE SET {updates}"
+            )
+            conn.executemany(sql, rows)
 
-                ids.append(ref_id)
-        return ids
+            # --- Tags ---
+            if tags_per_ref:
+                for i, row in enumerate(rows):
+                    if i < len(tags_per_ref) and tags_per_ref[i]:
+                        self._apply_tags(conn, row["id"], tags_per_ref[i])
+
+        return [row["id"] for row in rows]
 
     def delete(self, ref_id: str) -> None:
         with self._db() as conn:
@@ -673,6 +693,40 @@ class RefDatabase:
             "", tags=tags, year_from=year_from, year_to=year_to,
             ref_type=ref_type, oa_only=oa_only, limit=limit, offset=offset,
         )]
+
+    def iter_all(
+        self,
+        chunk_size: int = 500,
+        tags: Optional[List[str]] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        ref_type: Optional[str] = None,
+        oa_only: bool = False,
+    ) -> Generator[List[Reference], None, None]:
+        """
+        Stream all matching references in chunks without loading everything
+        into memory at once.  Yields one list of up to ``chunk_size``
+        References per iteration.
+
+        Suitable for re-indexing, bulk export, and large sync jobs.
+        """
+        offset = 0
+        while True:
+            chunk = self.list_all(
+                tags=tags,
+                year_from=year_from,
+                year_to=year_to,
+                ref_type=ref_type,
+                oa_only=oa_only,
+                limit=chunk_size,
+                offset=offset,
+            )
+            if not chunk:
+                break
+            yield chunk
+            if len(chunk) < chunk_size:
+                break
+            offset += chunk_size
 
     def count(self) -> int:
         with self._db() as conn:

@@ -88,44 +88,53 @@ class BaseProvider(ABC):
         * 429 / 503 / 502 / 500 → retry with backoff up to max_retries
         * Network errors → retry with backoff
         * Other 4xx → return None
+
+        Also consults the global QuotaManager before every request so that
+        bulk jobs respect per-provider daily/hourly budgets.
         """
-        async with self._semaphore:
-            for attempt in range(max_retries + 1):
-                # Enforce minimum interval between requests
-                if self._min_interval > 0:
-                    elapsed = time.monotonic() - self._last_request_time
-                    if elapsed < self._min_interval:
-                        await asyncio.sleep(self._min_interval - elapsed)
-                try:
-                    resp = await client.get(url, params=params, headers=headers or {})
-                    self._last_request_time = time.monotonic()
+        from ..quota import get_default_quota_manager
+        quota = get_default_quota_manager()
 
-                    if resp.status_code in (404, 410):
-                        return None  # permanent miss
+        # Quota check happens *before* the semaphore so we don't hold a
+        # concurrency slot while waiting for the budget to clear.
+        async with quota.acquire(self.name):
+            async with self._semaphore:
+                for attempt in range(max_retries + 1):
+                    # Enforce minimum interval between requests
+                    if self._min_interval > 0:
+                        elapsed = time.monotonic() - self._last_request_time
+                        if elapsed < self._min_interval:
+                            await asyncio.sleep(self._min_interval - elapsed)
+                    try:
+                        resp = await client.get(url, params=params, headers=headers or {})
+                        self._last_request_time = time.monotonic()
 
-                    if resp.status_code == 429:
-                        # Respect Retry-After header if present
-                        retry_after = float(resp.headers.get("Retry-After", 2 ** attempt))
-                        await asyncio.sleep(min(retry_after, 60))
-                        continue
+                        if resp.status_code in (404, 410):
+                            return None  # permanent miss
 
-                    if resp.status_code in (500, 502, 503, 504) and attempt < max_retries:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
+                        if resp.status_code == 429:
+                            # Respect Retry-After header if present
+                            retry_after = float(resp.headers.get("Retry-After", 2 ** attempt))
+                            await asyncio.sleep(min(retry_after, 60))
+                            continue
 
-                    resp.raise_for_status()
-                    return resp
+                        if resp.status_code in (500, 502, 503, 504) and attempt < max_retries:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
 
-                except httpx.HTTPStatusError:
-                    if attempt < max_retries:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        return None
-                except httpx.RequestError:
-                    if attempt < max_retries:
-                        await asyncio.sleep(2 ** attempt)
-                    else:
-                        return None
+                        resp.raise_for_status()
+                        return resp
+
+                    except httpx.HTTPStatusError:
+                        if attempt < max_retries:
+                            await asyncio.sleep(2 ** attempt)
+                        else:
+                            return None
+                    except httpx.RequestError:
+                        if attempt < max_retries:
+                            await asyncio.sleep(2 ** attempt)
+                        else:
+                            return None
         return None
 
     # -----------------------------------------------------------------------
