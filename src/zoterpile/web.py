@@ -87,12 +87,10 @@ def list_refs():
     limit    = min(int(request.args.get("limit", 500)), 2000)
     try:
         with RefDatabase() as db:
-            raw = (
-                db.search(q, ref_type=ref_type, oa_only=oa_only, limit=limit)
-                if q else
-                db.list_all(ref_type=ref_type, oa_only=oa_only, limit=limit)
-            )
-            result = [_ref_to_dict(ref, db.get_tags(_ref_id(ref)), _ref_id(ref))
+            raw = db.search(q or "", ref_type=ref_type, oa_only=oa_only, limit=limit)
+            ref_ids = [_ref_id(ref) for ref, _ in raw]
+            tags_map = db.get_tags_batch(ref_ids)
+            result = [_ref_to_dict(ref, tags_map[_ref_id(ref)], _ref_id(ref))
                       for ref, _ in raw]
         return jsonify(result)
     except Exception as e:
@@ -179,7 +177,7 @@ def export_refs():
         from .exporters.ris      import to_ris_string
         from .exporters.markdown import to_markdown_string
         with RefDatabase() as db:
-            refs = [r for r, _ in db.list_all(limit=10_000)]
+            refs = db.list_all(limit=10_000)
         if fmt == "ris":
             content, mime, fname = to_ris_string(refs), "application/x-research-info-systems", "refs.ris"
         elif fmt == "markdown":
@@ -197,8 +195,7 @@ def stats():
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
-            rows = db.list_all(limit=10_000)
-        refs = [r for r, _ in rows]
+            refs = db.list_all(limit=10_000)
         n = len(refs)
         avg = sum(r.completeness for r in refs) / n if n else 0.0
         return jsonify({"count": n, "avg_completeness": round(avg, 3)})

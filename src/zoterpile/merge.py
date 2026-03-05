@@ -250,8 +250,8 @@ def match_score(a: Reference, b: Reference) -> float:
 
     if a.authors and b.authors:
         # Compare first author family names
-        fa = a.authors[0].family.lower()
-        fb = b.authors[0].family.lower()
+        fa = (a.authors[0].family or "").lower()
+        fb = (b.authors[0].family or "").lower()
         score += fuzz.ratio(fa, fb) / 100.0
         checks += 1
 

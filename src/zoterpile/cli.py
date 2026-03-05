@@ -227,7 +227,7 @@ def search(query, tags, year_from, year_to, ref_type, oa, limit, fmt, output):
             year_from=year_from,
             year_to=year_to,
             ref_type=ref_type,
-            open_access_only=oa,
+            oa_only=oa,
             limit=limit,
         )
 

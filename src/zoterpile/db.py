@@ -80,6 +80,26 @@ def _authors_from_json(s: str) -> List[Author]:
         return []
 
 
+def _safe_json_list(s: Optional[str]) -> list:
+    if not s:
+        return []
+    try:
+        result = json.loads(s)
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+def _safe_json_dict(s: Optional[str]) -> dict:
+    if not s:
+        return {}
+    try:
+        result = json.loads(s)
+        return result if isinstance(result, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
 def _ref_to_row(ref: Reference) -> Dict[str, Any]:
     return {
         "id":             _ref_id(ref),
@@ -142,11 +162,11 @@ def _row_to_ref(row: sqlite3.Row) -> Reference:
         place          = row["place"],
         edition        = row["edition"],
         series         = row["series"],
-        keywords       = json.loads(row["keywords"] or "[]"),
+        keywords       = _safe_json_list(row["keywords"]),
         language       = row["language"],
         open_access    = bool(row["open_access"]) if row["open_access"] is not None else None,
         citation_count = row["citation_count"],
-        sources        = json.loads(row["sources"] or "{}"),
+        sources        = _safe_json_dict(row["sources"]),
         cite_key       = row["cite_key"],
     )
     return ref
@@ -212,12 +232,14 @@ class RefDatabase:
         UNIQUE (doi)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_doi      ON refs (doi)      WHERE doi IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS idx_arxiv    ON refs (arxiv_id) WHERE arxiv_id IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS idx_pmid     ON refs (pmid)     WHERE pmid IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS idx_year     ON refs (year);
-    CREATE INDEX IF NOT EXISTS idx_type     ON refs (ref_type);
-    CREATE INDEX IF NOT EXISTS idx_complete ON refs (completeness);
+    CREATE INDEX IF NOT EXISTS idx_doi        ON refs (doi)        WHERE doi IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_arxiv      ON refs (arxiv_id)   WHERE arxiv_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_pmid       ON refs (pmid)       WHERE pmid IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_year       ON refs (year);
+    CREATE INDEX IF NOT EXISTS idx_type       ON refs (ref_type);
+    CREATE INDEX IF NOT EXISTS idx_complete   ON refs (completeness);
+    CREATE INDEX IF NOT EXISTS idx_created_at ON refs (created_at);
+    CREATE INDEX IF NOT EXISTS idx_updated_at ON refs (updated_at);
 
     CREATE TABLE IF NOT EXISTS tags (
         id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -321,28 +343,40 @@ class RefDatabase:
     def upsert(self, ref: Reference, tags: Optional[List[str]] = None) -> str:
         """
         Insert or update a reference.  Returns the record ID.
-        On conflict (same DOI), updates all fields *except* created_at.
+
+        Deduplication strategy:
+        - Primary key is the content-addressed ``id`` (hash of DOI / arXiv / …).
+        - If a record with the *same DOI* already exists under a *different* id
+          (e.g. the paper was first saved by title, then re-looked-up by DOI),
+          we reuse the existing id so the UPSERT updates that row rather than
+          creating a duplicate.  SQLite does not support multiple ON CONFLICT
+          clauses, so we handle the DOI check explicitly.
         """
         row = _ref_to_row(ref)
         ref_id = row["id"]
 
-        cols = list(row.keys())
-        placeholders = ", ".join(f":{c}" for c in cols)
-        updates = ", ".join(
-            f"{c} = excluded.{c}"
-            for c in cols
-            if c not in ("id", "created_at")
-        )
-
-        sql = f"""
-            INSERT INTO refs ({', '.join(cols)})
-            VALUES ({placeholders})
-            ON CONFLICT(id)  DO UPDATE SET {updates}
-            ON CONFLICT(doi) DO UPDATE SET {updates}
-        """
-
         with self._db() as conn:
-            # Ensure created_at is set on first insert
+            # Resolve DOI-based ID collision before the UPSERT
+            if ref.doi:
+                existing = conn.execute(
+                    "SELECT id FROM refs WHERE doi = ?", (ref.doi,)
+                ).fetchone()
+                if existing and existing["id"] != ref_id:
+                    ref_id = existing["id"]
+                    row["id"] = ref_id
+
+            cols = list(row.keys())
+            placeholders = ", ".join(f":{c}" for c in cols)
+            updates = ", ".join(
+                f"{c} = excluded.{c}"
+                for c in cols
+                if c not in ("id", "created_at")
+            )
+            sql = f"""
+                INSERT INTO refs ({', '.join(cols)})
+                VALUES ({placeholders})
+                ON CONFLICT(id) DO UPDATE SET {updates}
+            """
             if "created_at" not in row:
                 row["created_at"] = _now()
             conn.execute(sql, row)
@@ -363,6 +397,16 @@ class RefDatabase:
             for i, ref in enumerate(refs):
                 row = _ref_to_row(ref)
                 ref_id = row["id"]
+
+                # Resolve DOI-based ID collision (same logic as upsert)
+                if ref.doi:
+                    existing = conn.execute(
+                        "SELECT id FROM refs WHERE doi = ?", (ref.doi,)
+                    ).fetchone()
+                    if existing and existing["id"] != ref_id:
+                        ref_id = existing["id"]
+                        row["id"] = ref_id
+
                 cols = list(row.keys())
                 placeholders = ", ".join(f":{c}" for c in cols)
                 updates = ", ".join(
@@ -373,8 +417,7 @@ class RefDatabase:
                 sql = f"""
                     INSERT INTO refs ({', '.join(cols)})
                     VALUES ({placeholders})
-                    ON CONFLICT(id)  DO UPDATE SET {updates}
-                    ON CONFLICT(doi) DO UPDATE SET {updates}
+                    ON CONFLICT(id) DO UPDATE SET {updates}
                 """
                 if "created_at" not in row:
                     row["created_at"] = _now()
@@ -465,6 +508,28 @@ class RefDatabase:
             )
             return [r["name"] for r in cur.fetchall()]
 
+    def get_tags_batch(self, ref_ids: List[str]) -> Dict[str, List[str]]:
+        """
+        Return a mapping of ref_id → [tag_name, …] for all given ref_ids
+        in a single query.  Far more efficient than calling get_tags in a loop.
+        """
+        if not ref_ids:
+            return {}
+        placeholders = ", ".join("?" * len(ref_ids))
+        with self._db() as conn:
+            cur = conn.execute(
+                f"""SELECT rt.ref_id, t.name
+                    FROM ref_tags rt
+                    JOIN tags t ON t.id = rt.tag_id
+                    WHERE rt.ref_id IN ({placeholders})
+                    ORDER BY rt.ref_id, t.name""",
+                ref_ids,
+            )
+            result: Dict[str, List[str]] = {rid: [] for rid in ref_ids}
+            for row in cur.fetchall():
+                result[row["ref_id"]].append(row["name"])
+        return result
+
     def all_tags(self) -> List[Dict[str, Any]]:
         with self._db() as conn:
             cur = conn.execute(
@@ -511,7 +576,7 @@ class RefDatabase:
         year_from: Optional[int] = None,
         year_to: Optional[int] = None,
         ref_type: Optional[str] = None,
-        open_access_only: bool = False,
+        oa_only: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> List[Tuple[Reference, float]]:
@@ -552,7 +617,7 @@ class RefDatabase:
         if ref_type:
             wheres.append("ref_type = :ref_type")
             params["ref_type"] = ref_type
-        if open_access_only:
+        if oa_only:
             wheres.append("open_access = 1")
 
         where_clause = f"WHERE {' AND '.join(wheres)}" if wheres else ""
@@ -600,12 +665,13 @@ class RefDatabase:
         year_from: Optional[int] = None,
         year_to: Optional[int] = None,
         ref_type: Optional[str] = None,
+        oa_only: bool = False,
         limit: int = 1000,
         offset: int = 0,
     ) -> List[Reference]:
         return [r for r, _ in self.search(
             "", tags=tags, year_from=year_from, year_to=year_to,
-            ref_type=ref_type, limit=limit, offset=offset,
+            ref_type=ref_type, oa_only=oa_only, limit=limit, offset=offset,
         )]
 
     def count(self) -> int:

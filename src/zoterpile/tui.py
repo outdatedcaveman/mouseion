@@ -699,8 +699,8 @@ class ZoterpileApp(App):
             f"https://doi.org/{ref.doi}" if ref.doi else None
         )
         if url:
-            import subprocess, shlex
-            subprocess.Popen(shlex.split(f"xdg-open {url}"))
+            import subprocess
+            subprocess.Popen(["xdg-open", url])
             self.notify(f"Opening: {url[:60]}")
         else:
             self.notify("No URL available", severity="warning")
@@ -751,24 +751,16 @@ class ZoterpileApp(App):
             from .db import RefDatabase
             with RefDatabase() as db:
                 q = self._query.strip()
-                if q:
-                    raw = db.search(
-                        q,
+                raw = db.search(
+                        q or "",
                         ref_type=self._type_filter,
                         oa_only=self._oa_filter,
                         limit=500,
                     )
-                else:
-                    raw = db.list_all(
-                        ref_type=self._type_filter,
-                        oa_only=self._oa_filter,
-                        limit=500,
-                    )
-                result = []
-                for ref, _score in raw:
-                    rid  = _ref_id(ref)
-                    tags = db.get_tags(rid)
-                    result.append((rid, ref, tags))
+                ref_ids = [_ref_id(ref) for ref, _ in raw]
+                tags_map = db.get_tags_batch(ref_ids)
+                result = [(rid, ref, tags_map[rid])
+                          for (ref, _score), rid in zip(raw, ref_ids)]
         except Exception as e:
             self.call_from_thread(
                 self.notify, f"Database error: {e}", severity="error"
@@ -830,8 +822,7 @@ class ZoterpileApp(App):
             from .exporters.markdown import export_markdown_file
 
             with RefDatabase() as db:
-                raw = db.list_all(limit=10_000)
-            refs = [r for r, _ in raw]
+                refs = db.list_all(limit=10_000)
             path = Path(path_str).expanduser()
 
             if fmt == "bibtex":

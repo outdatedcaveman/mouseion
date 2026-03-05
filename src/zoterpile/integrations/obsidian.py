@@ -169,7 +169,8 @@ def _ref_to_markdown(ref: Reference) -> str:
     if ref.keywords:
         lines.append("## Keywords")
         lines.append("")
-        kw_tags = " ".join(f"#{re.sub(r'[^\\w]', '-', kw.lower())}" for kw in ref.keywords)
+        _kw_pat = re.compile(r"[^\w]")
+        kw_tags = " ".join("#" + _kw_pat.sub("-", kw.lower()) for kw in ref.keywords)
         lines.append(kw_tags)
         lines.append("")
 

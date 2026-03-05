@@ -276,7 +276,7 @@ class TestSearch:
     def test_search_oa_filter(self, tmp_db):
         tmp_db.upsert(_make_ref(doi="10.1000/oa1", open_access=True))
         tmp_db.upsert(_make_ref(doi="10.1000/closed1", open_access=False))
-        results = tmp_db.search("", open_access_only=True)
+        results = tmp_db.search("", oa_only=True)
         assert all(r.open_access is True for r, _ in results)
 
     def test_search_no_match_returns_empty(self, tmp_db):
