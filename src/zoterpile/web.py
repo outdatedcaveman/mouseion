@@ -2084,6 +2084,7 @@ kbd {
       placeholder="10.1038/nature12373&#10;arXiv:1706.03762&#10;https://…"></textarea>
     <div class="modal-status" id="add-st"></div>
     <div class="modal-foot">
+      <button class="btn btn-ghost" id="btn-paste-clipboard" title="Paste from clipboard" style="margin-right:auto">📋 Paste</button>
       <button class="btn btn-ghost" id="btn-add-cancel">Cancel</button>
       <button class="btn btn-primary" id="btn-add-submit">Add &amp; Enrich</button>
     </div>
@@ -2147,13 +2148,15 @@ kbd {
       <div class="kbd-row"><kbd>i</kbd><span class="kbd-desc">Import file</span></div>
       <div class="kbd-row"><kbd>s</kbd><span class="kbd-desc">Library stats</span></div>
       <div class="kbd-row"><kbd>r</kbd><span class="kbd-desc">Refresh list</span></div>
+      <div class="kbd-row"><kbd>b</kbd><span class="kbd-desc">Reading board (kanban)</span></div>
+      <div class="kbd-row"><kbd>f</kbd><span class="kbd-desc">Toggle advanced filter</span></div>
       <div class="kbd-row"><kbd>?</kbd><span class="kbd-desc">This help</span></div>
       <div class="kbd-row"><kbd>j</kbd> / <kbd>↓</kbd><span class="kbd-desc">Next reference</span></div>
       <div class="kbd-row"><kbd>k</kbd> / <kbd>↑</kbd><span class="kbd-desc">Previous reference</span></div>
       <div class="kbd-row"><kbd>Del</kbd><span class="kbd-desc">Delete selected</span></div>
       <div class="kbd-row"><kbd>Ctrl</kbd>+<kbd>↵</kbd><span class="kbd-desc">Submit Add modal</span></div>
-      <div class="kbd-row"><kbd>Esc</kbd><span class="kbd-desc">Close modals</span></div>
-      <div class="kbd-row"></div>
+      <div class="kbd-row"><kbd>Esc</kbd><span class="kbd-desc">Close modals / cancel edit</span></div>
+      <div class="kbd-row"><kbd>dblclick</kbd><span class="kbd-desc">Rename collection</span></div>
     </div>
     <div class="modal-foot" style="margin-top:18px">
       <button class="btn btn-ghost" onclick="document.getElementById('kbd-modal').classList.remove('open')">Close</button>
@@ -2424,6 +2427,8 @@ document.addEventListener('keydown', e => {
   if (e.key === 's' || e.key === 'S') { document.getElementById('btn-stats').click(); return; }
   if (e.key === '/')  { e.preventDefault(); $search.focus(); return; }
   if (e.key === 'r' || e.key === 'R') { loadRefs(); return; }
+  if (e.key === 'b' || e.key === 'B') { openKanban(); return; }
+  if (e.key === 'f' || e.key === 'F') { document.getElementById('btn-adv-filter')?.click(); return; }
   // j/k navigation
   if (e.key === 'j' || e.key === 'ArrowDown') {
     e.preventDefault();
@@ -3246,6 +3251,7 @@ function renderDetail(ref) {
       ${ref.has_pdf ? `<a class="btn btn-ghost btn-sm"
           href="${apiBase()}/api/refs/${ref.id}/pdf${getCfg().key ? '?api_key=' + encodeURIComponent(getCfg().key) : ''}"
           target="_blank" rel="noopener">📄 PDF</a>` : ''}
+      <button class="btn btn-ghost btn-sm" onclick="copyDeepLink('${ref.id}')" title="Copy shareable link to this reference">⛓ Share</button>
       <button class="btn btn-ghost btn-sm" onclick="showSimilar('${ref.id}')">🔮 Similar</button>
       <button class="btn btn-ghost btn-sm" onclick="reenrich('${ref.id}')">↻ Refresh</button>
       <button class="btn btn-ghost btn-sm"
@@ -3679,6 +3685,58 @@ const TYPE_LABELS = {
   'thesis':'Thesis','dataset':'Dataset','report':'Report','website':'Web',
 };
 function typeLabel(t) { return TYPE_LABELS[t] || t; }
+
+// ── Deep-link / share ─────────────────────────────────────────────────────
+function copyDeepLink(refId) {
+  const url = `${location.origin}${location.pathname}#ref-${refId}`;
+  navigator.clipboard.writeText(url).then(() => {
+    const btn = document.querySelector(`button[onclick="copyDeepLink('${refId}')"]`);
+    if (btn) { const orig = btn.textContent; btn.textContent = '✓ Copied!'; setTimeout(() => btn.textContent = orig, 1800); }
+  }).catch(() => prompt('Copy this link:', url));
+}
+
+// Handle deep-link on load
+function handleDeepLink() {
+  const hash = location.hash;
+  if (hash.startsWith('#ref-')) {
+    const refId = hash.slice(5);
+    // Wait for refs to load, then select
+    const attempt = () => {
+      if (refs.some(r => r.id === refId)) { selectRef(refId); scrollSelIntoView(); }
+      else if (refs.length === 0) setTimeout(attempt, 300);
+    };
+    setTimeout(attempt, 500);
+  }
+}
+window.addEventListener('load', handleDeepLink);
+
+// ── Clipboard paste-to-add ─────────────────────────────────────────────────
+document.getElementById('btn-paste-clipboard').addEventListener('click', async () => {
+  try {
+    const text = await navigator.clipboard.readText();
+    const ta = document.getElementById('add-ta');
+    if (ta) { ta.value = text.trim(); ta.focus(); }
+  } catch(e) {
+    const ta = document.getElementById('add-ta');
+    if (ta) { ta.focus(); document.execCommand('paste'); }
+  }
+});
+
+// Auto-detect DOI/arXiv paste in search box and open add modal
+$search.addEventListener('paste', e => {
+  const text = (e.clipboardData || window.clipboardData).getData('text').trim();
+  const isDOI = /^10\.\d{4,}\/\S+/.test(text);
+  const isArXiv = /^(arxiv:)?\d{4}\.\d{4,}(v\d+)?$/i.test(text);
+  const isURL = /^https?:\/\//.test(text);
+  if (isDOI || isArXiv || isURL) {
+    e.preventDefault();
+    openAdd();
+    setTimeout(() => {
+      const ta = document.getElementById('add-ta');
+      if (ta) { ta.value = text; }
+    }, 50);
+  }
+});
 
 // ── Saved Searches ─────────────────────────────────────────────────────────
 let savedSearches = [];
