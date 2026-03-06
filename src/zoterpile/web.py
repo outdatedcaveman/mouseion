@@ -161,6 +161,7 @@ def _ref_to_dict(
         "status":         status or "unread",
         "cite_key":       cite_key or ref.auto_cite_key(),
         "collections":    collections or [],
+        "snippet":        getattr(ref, "_snippet", None),
     }
 
 
@@ -1765,6 +1766,8 @@ main { display: flex; flex: 1; overflow: hidden; }
 }
 .rc-meta { font-size: 11px; color: var(--muted); margin-bottom: 5px; }
 .rc-tags { display: flex; flex-wrap: wrap; gap: 3px; }
+/* FTS snippet highlight */
+mark { background: rgba(var(--primary-rgb, 99, 102, 241), .25); color: inherit; border-radius: 2px; padding: 0 1px; font-style: normal; }
 .tag {
   padding: 1px 7px; background: var(--tag-bg);
   color: var(--tag-fg); border-radius: 4px; font-size: 11px;
@@ -3685,7 +3688,9 @@ function renderList() {
       style="position:absolute;top:6px;right:6px;background:none;border:none;cursor:pointer;font-size:11px;padding:0;opacity:${pinned?'.8':'.3'}"
     >📌</button>`;
     const venue = ref.journal || ref.container_title || '';
-    const abstract = expanded && ref.abstract
+    const snippetText = ref.snippet
+      ? `<div style="font-size:11px;color:var(--muted);margin-top:3px;line-height:1.4">${ref.snippet}</div>` : '';
+    const abstract = !snippetText && expanded && ref.abstract
       ? `<div style="font-size:11px;color:var(--muted);margin-top:3px;line-height:1.4">${esc(ref.abstract.slice(0,130))}${ref.abstract.length>130?'…':''}</div>` : '';
     const venueRow = expanded && venue ? ` · ${esc(venue)}` : '';
     return `<div class="ref-card${act}" data-id="${ref.id}" onclick="cardClick(event,'${ref.id}')"
@@ -3698,7 +3703,7 @@ function renderList() {
       <div class="rc-body">
         <div class="rc-title">${esc(ref.title)}</div>
         <div class="rc-meta">${esc(auth)} · ${year}${venueRow}</div>
-        ${abstract}
+        ${snippetText || abstract}
         <div class="rc-tags">${tags}${more}${pdf}</div>
       </div>
       ${pinBtn}
@@ -4373,15 +4378,22 @@ document.getElementById('btn-paste-clipboard').addEventListener('click', async (
 // Auto-detect DOI/arXiv paste in search box and open add modal
 $search.addEventListener('paste', e => {
   const text = (e.clipboardData || window.clipboardData).getData('text').trim();
-  const isDOI = /^10\.\d{4,}\/\S+/.test(text);
-  const isArXiv = /^(arxiv:)?\d{4}\.\d{4,}(v\d+)?$/i.test(text);
-  const isURL = /^https?:\/\//.test(text);
-  if (isDOI || isArXiv || isURL) {
+  const isDOI    = /^10\.\d{4,}\/\S+/.test(text) || /https?:\/\/(?:dx\.)?doi\.org\//.test(text);
+  const isArXiv  = /^(arxiv:)?\d{4}\.\d{4,}(v\d+)?$/i.test(text) || /arxiv\.org\/abs\//.test(text);
+  const isPMID   = /^PMID:\s*\d+$/i.test(text) || /^pmid\d+$/i.test(text);
+  const isURL    = /^https?:\/\//.test(text);
+  if (isDOI || isArXiv || isPMID || isURL) {
     e.preventDefault();
+    // Extract clean identifier from URL if possible
+    let identifier = text;
+    const doiMatch = text.match(/https?:\/\/(?:dx\.)?doi\.org\/(10\.\S+)/);
+    if (doiMatch) identifier = doiMatch[1];
+    const arxivMatch = text.match(/arxiv\.org\/abs\/([\d.]+(?:v\d+)?)/i);
+    if (arxivMatch) identifier = arxivMatch[1];
     openAdd();
     setTimeout(() => {
       const ta = document.getElementById('add-ta');
-      if (ta) { ta.value = text; }
+      if (ta) { ta.value = identifier; }
     }, 50);
   }
 });

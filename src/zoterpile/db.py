@@ -967,6 +967,17 @@ class RefDatabase:
         params["limit"]  = limit
         params["offset"] = offset
 
+        # Optionally fetch FTS5 snippet for abstract column (index 1)
+        snippet_sql = ""
+        if use_fts:
+            snippet_sql = f"""
+                SELECT refs_fts.ref_id,
+                       snippet(refs_fts, 1, '<mark>', '</mark>', '…', 20) AS snip
+                FROM refs_fts
+                WHERE refs_fts MATCH :query
+                LIMIT :limit OFFSET :offset
+            """
+
         with self._db() as conn:
             try:
                 cur = conn.execute(sql, params)
@@ -975,10 +986,23 @@ class RefDatabase:
                 # FTS query might be malformed; fall back to LIKE
                 return self._search_fallback(query, limit, offset)
 
+            # Build snippet map if FTS
+            snippet_map: Dict[str, str] = {}
+            if use_fts and snippet_sql:
+                try:
+                    snip_rows = conn.execute(snippet_sql, params).fetchall()
+                    snippet_map = {r["ref_id"]: r["snip"] for r in snip_rows}
+                except Exception:
+                    pass
+
         results = []
         for row in rows:
             ref   = _row_to_ref(row)
             score = abs(row["fts_rank"]) if "fts_rank" in row.keys() and row["fts_rank"] else 0.5
+            # Attach snippet as transient attribute
+            snip = snippet_map.get(ref.id or "")
+            if snip:
+                object.__setattr__(ref, "_snippet", snip) if hasattr(ref, "__slots__") else setattr(ref, "_snippet", snip)
             results.append((ref, score))
         return results
 
