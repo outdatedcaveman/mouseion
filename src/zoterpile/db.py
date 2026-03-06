@@ -999,10 +999,11 @@ class RefDatabase:
         for row in rows:
             ref   = _row_to_ref(row)
             score = abs(row["fts_rank"]) if "fts_rank" in row.keys() and row["fts_rank"] else 0.5
-            # Attach snippet as transient attribute
-            snip = snippet_map.get(ref.id or "")
+            # Attach snippet as transient attribute using the DB row ref_id
+            row_ref_id = row["id"] if "id" in row.keys() else _ref_id(ref)
+            snip = snippet_map.get(row_ref_id or "")
             if snip:
-                object.__setattr__(ref, "_snippet", snip) if hasattr(ref, "__slots__") else setattr(ref, "_snippet", snip)
+                setattr(ref, "_snippet", snip)
             results.append((ref, score))
         return results
 

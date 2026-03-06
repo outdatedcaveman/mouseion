@@ -135,7 +135,7 @@ def merge(
         "volume", "issue", "pages", "article_number", "event_name",
         "publisher", "place", "edition", "series", "num_pages",
         "language", "license", "url",
-        "citation_count",
+        # Note: citation_count is handled separately (we take the max)
     ]
     for field in SCALAR_FIELDS:
         for ref, _conf in all_candidates:
