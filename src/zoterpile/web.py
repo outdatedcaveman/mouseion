@@ -489,6 +489,129 @@ def batch_op():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/tags")
+def list_tags():
+    """Return all tags with counts, sorted by usage (for autocomplete)."""
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            tags = db.all_tags()
+        return jsonify([{"name": t["name"], "count": t["count"]} for t in tags])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/import", methods=["POST"])
+def import_file():
+    """
+    Import references from an uploaded .bib or .ris file.
+
+    Accepts multipart/form-data with:
+        file   — the .bib or .ris file
+        enrich — 'true' (default) to enrich via CrossRef; 'false' for fast import
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    f      = request.files["file"]
+    enrich = request.form.get("enrich", "true").lower() == "true"
+    fname  = (f.filename or "").lower()
+    raw    = f.read().decode("utf-8", errors="replace")
+    try:
+        if fname.endswith(".ris"):
+            from .parsers.ris import parse_ris_string
+            refs = parse_ris_string(raw)
+        else:
+            from .parsers.bibtex import parse_bibtex_string
+            refs = parse_bibtex_string(raw)
+    except Exception as e:
+        return jsonify({"error": f"Parse error: {e}"}), 422
+
+    if not refs:
+        return jsonify({"error": "No references found in file"}), 422
+
+    job_id = uuid.uuid4().hex[:10]
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "running", "message": f"Importing {len(refs)} references…", "count": 0}
+
+    def _import_worker():
+        try:
+            from .tagger  import auto_tag, tag_from_keywords
+            from .config  import get_config
+            from .db      import RefDatabase
+
+            if enrich:
+                import anyio
+                from .lookup import enrich_batch
+                async def _run():
+                    return await enrich_batch(refs)
+                enriched = anyio.run(_run)
+            else:
+                enriched = refs
+
+            cfg = get_config()
+            with RefDatabase() as db:
+                for ref in enriched:
+                    tags = list(set(auto_tag(ref, cfg) + tag_from_keywords(ref)))
+                    db.upsert(ref, tags=tags)
+            n = len(enriched)
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "done", "count": n,
+                                 "message": f"Imported {n} reference{'s' if n != 1 else ''}"}
+        except Exception as e:
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "error", "message": str(e)}
+
+    threading.Thread(target=_import_worker, daemon=True).start()
+    return jsonify({"job_id": job_id, "count": len(refs)}), 202
+
+
+@app.route("/api/duplicates")
+def find_duplicates():
+    """
+    Return groups of references that are likely duplicates.
+    Groups by: (1) same DOI, (2) same normalised title + year.
+    """
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            all_refs = db.list_all(limit=10_000)
+
+        groups: list = []
+
+        # Group by DOI
+        doi_map: dict = {}
+        for ref in all_refs:
+            if ref.doi:
+                doi_map.setdefault(ref.doi.lower().strip(), []).append(ref)
+        for doi, grp in doi_map.items():
+            if len(grp) > 1:
+                groups.append({
+                    "reason": f"Same DOI: {doi}",
+                    "refs": [_ref_to_dict(r, [], _ref_id(r)) for r in grp],
+                })
+
+        # Group by normalised title+year (no-DOI refs only)
+        def _norm(t: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", (t or "").lower())
+
+        title_map: dict = {}
+        for ref in all_refs:
+            if not ref.doi:
+                key = (_norm(ref.title), ref.year)
+                if key[0]:
+                    title_map.setdefault(key, []).append(ref)
+        for (title, year), grp in title_map.items():
+            if len(grp) > 1:
+                groups.append({
+                    "reason": f"Same title+year ({year or '?'})",
+                    "refs": [_ref_to_dict(r, [], _ref_id(r)) for r in grp],
+                })
+
+        return jsonify(groups)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/refs/<ref_id>/pdf")
 def get_ref_pdf(ref_id: str):
     """Serve or redirect to the PDF for a reference.
@@ -522,20 +645,40 @@ def get_ref_pdf(ref_id: str):
 
 @app.route("/api/export")
 def export_refs():
-    fmt = request.args.get("fmt", "bibtex")
+    """Export references.  Supports ?fmt=bibtex|ris|markdown and optional
+    ?collection_id=<int> or ?ref_ids=id1,id2,… to narrow the set."""
+    fmt           = request.args.get("fmt", "bibtex")
+    collection_id = request.args.get("collection_id")
+    ref_ids_param = request.args.get("ref_ids", "")
     try:
         from .db import RefDatabase
         from .exporters.bibtex   import to_bibtex_string
         from .exporters.ris      import to_ris_string
         from .exporters.markdown import to_markdown_string
         with RefDatabase() as db:
-            refs = db.list_all(limit=10_000)
+            if ref_ids_param:
+                ids  = [i.strip() for i in ref_ids_param.split(",") if i.strip()]
+                refs = [r for r in (db.get(i) for i in ids) if r is not None]
+                fname_base = "selection"
+            elif collection_id:
+                refs       = db.list_collection_refs(int(collection_id), limit=10_000)
+                coll_name  = next(
+                    (c["name"] for c in db.get_collections() if c["id"] == int(collection_id)),
+                    "collection",
+                )
+                fname_base = re.sub(r"[^a-z0-9_-]", "_", coll_name.lower())[:32]
+            else:
+                refs       = db.list_all(limit=10_000)
+                fname_base = "refs"
         if fmt == "ris":
-            content, mime, fname = to_ris_string(refs), "application/x-research-info-systems", "refs.ris"
+            content, mime = to_ris_string(refs), "application/x-research-info-systems"
+            fname = fname_base + ".ris"
         elif fmt == "markdown":
-            content, mime, fname = to_markdown_string(refs), "text/markdown", "refs.md"
+            content, mime = to_markdown_string(refs), "text/markdown"
+            fname = fname_base + ".md"
         else:
-            content, mime, fname = to_bibtex_string(refs), "application/x-bibtex", "refs.bib"
+            content, mime = to_bibtex_string(refs), "application/x-bibtex"
+            fname = fname_base + ".bib"
         return Response(content, mimetype=mime,
                         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
     except Exception as e:
@@ -1281,6 +1424,76 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   margin-bottom: 3px;
 }
 .sim-meta { font-size: 11px; color: var(--muted); }
+
+/* ── Sort bar ── */
+.sort-bar {
+  display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+  padding: 4px 10px; background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px; color: var(--muted);
+}
+.sort-bar label { white-space: nowrap; }
+.sort-sel {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 2px 6px;
+  color: var(--text); font-size: 11px; outline: none;
+  cursor: pointer;
+}
+.sort-sel:focus { border-color: var(--primary); }
+
+/* ── Tag autocomplete ── */
+.tag-ac-wrap { position: relative; }
+.tag-ac-list {
+  display: none; position: absolute; top: 100%; left: 0;
+  background: var(--panel); border: 1px solid var(--border-hi);
+  border-radius: var(--r); box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  z-index: 50; min-width: 150px; max-height: 180px; overflow-y: auto;
+}
+.tag-ac-list.open { display: block; }
+.tag-ac-item {
+  padding: 6px 12px; cursor: pointer; font-size: 12px;
+  color: var(--text); transition: background .1s;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.tag-ac-item:hover, .tag-ac-item.highlighted { background: var(--border); }
+.tag-ac-item span { font-size: 10px; color: var(--muted); }
+
+/* ── Citation copy panel ── */
+.cite-panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 10px 12px; margin-top: 6px;
+}
+.cite-format-row { display: flex; gap: 4px; margin-bottom: 8px; }
+.cite-fmt-btn {
+  padding: 3px 10px; border-radius: var(--r); font-size: 11px;
+  cursor: pointer; border: 1px solid var(--border);
+  background: transparent; color: var(--muted);
+  font-family: var(--font); transition: all .15s;
+}
+.cite-fmt-btn.active { background: var(--primary-dim); border-color: var(--primary); color: var(--text); font-weight: 600; }
+.cite-text {
+  font-size: 12px; line-height: 1.6; color: var(--text);
+  user-select: all; word-break: break-word;
+  background: var(--panel); border-radius: 4px; padding: 8px 10px;
+  min-height: 36px; cursor: text;
+}
+.cite-copy-row { display: flex; justify-content: flex-end; margin-top: 6px; }
+
+/* ── Duplicates modal ── */
+.dup-group {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 10px 12px; margin-bottom: 10px;
+}
+.dup-reason { font-size: 11px; color: var(--warning); margin-bottom: 8px; font-weight: 600; }
+.dup-ref-row {
+  display: flex; gap: 8px; align-items: center;
+  padding: 6px 0; border-top: 1px solid var(--border); font-size: 12px;
+}
+.dup-ref-row:first-of-type { border-top: none; padding-top: 0; }
+.dup-ref-info { flex: 1; min-width: 0; }
+.dup-ref-title { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dup-ref-meta  { color: var(--muted); font-size: 11px; }
+.dup-list { max-height: 60vh; overflow-y: auto; }
 </style>
 </head>
 <body>
@@ -1300,14 +1513,17 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   </div>
   <div class="h-actions">
     <button class="btn btn-primary" id="btn-open-add">＋ Add</button>
+    <button class="btn btn-ghost" id="btn-open-import" title="Import .bib or .ris file">⬆ Import</button>
     <div class="dd-wrap">
       <button class="btn btn-ghost" id="btn-export-toggle">Export ▾</button>
       <div class="dd-menu" id="dd-export">
         <div class="dd-item" data-fmt="bibtex">BibTeX (.bib)</div>
         <div class="dd-item" data-fmt="ris">RIS (.ris)</div>
         <div class="dd-item" data-fmt="markdown">Markdown (.md)</div>
+        <div class="dd-item" id="dd-export-coll" data-fmt="bibtex" style="display:none">📁 Export Collection (.bib)</div>
       </div>
     </div>
+    <button class="btn btn-ghost" id="btn-duplicates" title="Find duplicate references">⚡ Dupes</button>
     <button class="btn btn-ghost" id="btn-settings" title="Settings">⚙</button>
   </div>
 </header>
@@ -1329,6 +1545,17 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   </div>
 
   <div style="display:flex;flex-direction:column;width:340px;flex-shrink:0;border-right:1px solid var(--border);">
+    <div class="sort-bar">
+      <label for="sort-sel">Sort:</label>
+      <select class="sort-sel" id="sort-sel">
+        <option value="date-desc">Recently Added</option>
+        <option value="year-desc">Year (newest)</option>
+        <option value="year-asc">Year (oldest)</option>
+        <option value="title-asc">Title A–Z</option>
+        <option value="citations-desc">Most Cited</option>
+        <option value="completeness-desc">Completeness</option>
+      </select>
+    </div>
     <div class="sel-toolbar" id="sel-toolbar">
       <span class="sel-count" id="sel-count"></span>
       <button class="sel-btn" onclick="batchTagPrompt()">🏷 Tag</button>
@@ -1402,6 +1629,51 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   </div>
 </div>
 
+<!-- ── Import Modal ── -->
+<div class="overlay" id="import-modal">
+  <div class="modal-box">
+    <h2>⬆ Import References</h2>
+    <p class="modal-hint">
+      Upload a BibTeX (.bib) or RIS (.ris) file exported from Zotero, Mendeley, Paperpile, or any reference manager.
+      Metadata will be automatically enriched from CrossRef and Semantic Scholar.
+    </p>
+    <input type="file" id="import-file" accept=".bib,.ris" style="display:none">
+    <div id="import-drop" style="
+        border: 2px dashed var(--border-hi); border-radius: var(--r);
+        padding: 28px; text-align: center; cursor: pointer;
+        color: var(--muted); font-size: 13px; transition: border-color .15s;
+      " onclick="document.getElementById('import-file').click()"
+         ondragover="event.preventDefault();this.style.borderColor='var(--primary)'"
+         ondragleave="this.style.borderColor=''"
+         ondrop="handleImportDrop(event)">
+      <div style="font-size:28px;margin-bottom:8px">📂</div>
+      Click to choose a file, or drag and drop here<br>
+      <span id="import-filename" style="color:var(--primary);font-weight:500"></span>
+    </div>
+    <label style="display:flex;align-items:center;gap:7px;margin-top:10px;font-size:12px;color:var(--muted);cursor:pointer">
+      <input type="checkbox" id="import-enrich" checked style="accent-color:var(--primary)">
+      Enrich metadata from CrossRef / Semantic Scholar (recommended)
+    </label>
+    <div class="modal-status" id="import-st"></div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="btn-import-cancel">Cancel</button>
+      <button class="btn btn-primary" id="btn-import-submit" disabled>Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Duplicates Modal ── -->
+<div class="overlay" id="dupes-modal">
+  <div class="modal-box" style="width:640px">
+    <h2>⚡ Duplicate References</h2>
+    <p class="modal-hint" id="dupes-hint">Scanning library for duplicates…</p>
+    <div class="dup-list" id="dup-list"><div class="empty"><div class="spin"></div></div></div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="document.getElementById('dupes-modal').classList.remove('open')">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 'use strict';
 
@@ -1413,6 +1685,8 @@ let addTimer    = null;
 let collections = [];
 let activeColl  = null;   // null = all refs, int = collection id
 let selectedIds = new Set(); // batch-selected ref IDs
+let sortMode    = 'date-desc';  // current sort order
+let allTags     = [];           // fetched from /api/tags for autocomplete
 
 // ── DOM refs ───────────────────────────────────────────────────────────────
 const $search   = document.getElementById('search');
@@ -1467,6 +1741,7 @@ async function apiFetch(path, opts) {
   }
   loadCollections();
   loadRefs();
+  loadAllTags();
 })();
 
 // ── Search (debounced) ─────────────────────────────────────────────────────
@@ -1541,28 +1816,253 @@ async function testConnection() {
 document.getElementById('btn-export-toggle').addEventListener('click', e => {
   e.stopPropagation();
   $ddExport.classList.toggle('open');
+  // Show/hide "Export Collection" item based on active collection
+  const collItem = document.getElementById('dd-export-coll');
+  if (collItem) collItem.style.display = activeColl != null ? '' : 'none';
 });
 document.addEventListener('click', () => $ddExport.classList.remove('open'));
 $ddExport.addEventListener('click', e => e.stopPropagation());
 document.querySelectorAll('.dd-item').forEach(el => {
   el.addEventListener('click', () => {
     const key = getCfg().key;
-    const url = apiBase() + `/api/export?fmt=${el.dataset.fmt}`;
-    // Exports need auth — append key as query param for direct download
+    let url;
+    if (el.id === 'dd-export-coll' && activeColl != null) {
+      url = apiBase() + `/api/export?fmt=${el.dataset.fmt}&collection_id=${activeColl}`;
+    } else {
+      url = apiBase() + `/api/export?fmt=${el.dataset.fmt}`;
+    }
     window.location.href = key ? url + `&api_key=${encodeURIComponent(key)}` : url;
     $ddExport.classList.remove('open');
   });
 });
 
+// ── Sort ────────────────────────────────────────────────────────────────────
+document.getElementById('sort-sel').addEventListener('change', e => {
+  sortMode = e.target.value;
+  applySort();
+  renderList();
+});
+
+function applySort() {
+  refs.sort((a, b) => {
+    switch (sortMode) {
+      case 'year-desc': return (b.year||0) - (a.year||0);
+      case 'year-asc':  return (a.year||0) - (b.year||0);
+      case 'title-asc': return (a.title||'').localeCompare(b.title||'');
+      case 'citations-desc': return (b.citation_count||0) - (a.citation_count||0);
+      case 'completeness-desc': return (b.completeness||0) - (a.completeness||0);
+      default: return 0; // date-desc: server order preserved
+    }
+  });
+}
+
 // ── Keyboard shortcuts ─────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { closeAdd(); closeSettings(); $ddExport.classList.remove('open'); }
-  if (e.key === 'a' && !isEditing()) openAdd();
-  if (e.key === '/' && !isEditing()) { e.preventDefault(); $search.focus(); }
+  const escaping = e.key === 'Escape';
+  if (escaping) {
+    closeAdd();
+    closeSettings();
+    $ddExport.classList.remove('open');
+    document.getElementById('dupes-modal').classList.remove('open');
+    document.getElementById('import-modal').classList.remove('open');
+    document.getElementById('similar-modal').classList.remove('open');
+    return;
+  }
+  if (isEditing()) return;
+  if (e.key === 'a' || e.key === 'A') { openAdd(); return; }
+  if (e.key === 'i' || e.key === 'I') { document.getElementById('btn-open-import').click(); return; }
+  if (e.key === '/')  { e.preventDefault(); $search.focus(); return; }
+  if (e.key === 'r' || e.key === 'R') { loadRefs(); return; }
+  // j/k navigation
+  if (e.key === 'j' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    const idx = refs.findIndex(r => r.id === selId);
+    if (idx < refs.length - 1) selectRef(refs[idx + 1].id);
+    else if (idx === -1 && refs.length) selectRef(refs[0].id);
+    scrollSelIntoView();
+    return;
+  }
+  if (e.key === 'k' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    const idx = refs.findIndex(r => r.id === selId);
+    if (idx > 0) selectRef(refs[idx - 1].id);
+    scrollSelIntoView();
+    return;
+  }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selId) {
+    delRef(selId);
+  }
 });
+
+function scrollSelIntoView() {
+  requestAnimationFrame(() => {
+    document.querySelector('.ref-card.active')?.scrollIntoView({ block: 'nearest' });
+  });
+}
+
 function isEditing() {
   const t = document.activeElement?.tagName;
-  return t === 'INPUT' || t === 'TEXTAREA';
+  return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT';
+}
+
+// ── Import modal ────────────────────────────────────────────────────────────
+let _importFile = null;
+
+document.getElementById('btn-open-import').addEventListener('click', () => {
+  _importFile = null;
+  document.getElementById('import-filename').textContent = '';
+  document.getElementById('btn-import-submit').disabled = true;
+  document.getElementById('import-st').textContent = '';
+  document.getElementById('import-st').className = 'modal-status';
+  document.getElementById('import-modal').classList.add('open');
+});
+
+document.getElementById('btn-import-cancel').addEventListener('click', () => {
+  document.getElementById('import-modal').classList.remove('open');
+});
+
+document.getElementById('import-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('import-modal'))
+    document.getElementById('import-modal').classList.remove('open');
+});
+
+document.getElementById('import-file').addEventListener('change', e => {
+  const file = e.target.files?.[0];
+  if (file) setImportFile(file);
+});
+
+function handleImportDrop(e) {
+  e.preventDefault();
+  document.getElementById('import-drop').style.borderColor = '';
+  const file = e.dataTransfer?.files?.[0];
+  if (file) setImportFile(file);
+}
+
+function setImportFile(file) {
+  _importFile = file;
+  document.getElementById('import-filename').textContent = file.name;
+  document.getElementById('btn-import-submit').disabled = false;
+}
+
+document.getElementById('btn-import-submit').addEventListener('click', async () => {
+  if (!_importFile) return;
+  const btn    = document.getElementById('btn-import-submit');
+  const st     = document.getElementById('import-st');
+  const enrich = document.getElementById('import-enrich').checked;
+  btn.disabled = true;
+  st.className = 'modal-status s-run';
+  st.innerHTML = '<span class="spin"></span>Uploading…';
+  try {
+    const fd = new FormData();
+    fd.append('file', _importFile);
+    fd.append('enrich', enrich ? 'true' : 'false');
+    const r = await fetch(apiBase() + '/api/import', {
+      method: 'POST',
+      headers: getCfg().key ? { 'X-API-Key': getCfg().key } : {},
+      body: fd,
+    });
+    if (r.status === 401) { openSettings('⚠ Authentication failed'); return; }
+    const data = await r.json();
+    if (data.error) { st.className = 'modal-status s-err'; st.textContent = '✗ ' + data.error; btn.disabled = false; return; }
+    st.innerHTML = `<span class="spin"></span>Importing ${data.count} references${enrich ? ' (enriching…)' : ''}`;
+    let importTimer = setInterval(async () => {
+      const jr = await apiFetch(`/api/jobs/${data.job_id}`);
+      const job = await jr.json();
+      if (job.status === 'running') {
+        st.innerHTML = `<span class="spin"></span>${esc(job.message)}`;
+        return;
+      }
+      clearInterval(importTimer);
+      if (job.status === 'done') {
+        st.className = 'modal-status s-ok';
+        st.textContent = `✓ ${job.message}`;
+        setTimeout(async () => {
+          document.getElementById('import-modal').classList.remove('open');
+          await loadRefs();
+        }, 1400);
+      } else {
+        st.className = 'modal-status s-err';
+        st.textContent = '✗ ' + job.message;
+        btn.disabled = false;
+      }
+    }, 800);
+  } catch(e) {
+    st.className = 'modal-status s-err';
+    st.textContent = '✗ Network error';
+    btn.disabled = false;
+  }
+});
+
+// ── Duplicates modal ────────────────────────────────────────────────────────
+document.getElementById('btn-duplicates').addEventListener('click', async () => {
+  const modal = document.getElementById('dupes-modal');
+  const hint  = document.getElementById('dupes-hint');
+  const list  = document.getElementById('dup-list');
+  hint.textContent = 'Scanning library for duplicates…';
+  list.innerHTML   = '<div class="empty"><div class="spin"></div></div>';
+  modal.classList.add('open');
+  try {
+    const r     = await apiFetch('/api/duplicates');
+    const groups = await r.json();
+    if (!groups.length) {
+      hint.textContent = '✓ No duplicates found!';
+      list.innerHTML = '<div class="empty"><p style="color:var(--success)">Your library is clean.</p></div>';
+      return;
+    }
+    hint.textContent = `Found ${groups.length} duplicate group${groups.length > 1 ? 's' : ''} — click a reference to view it`;
+    list.innerHTML = groups.map(g => `
+      <div class="dup-group">
+        <div class="dup-reason">⚠ ${esc(g.reason)}</div>
+        ${g.refs.map(r => `
+          <div class="dup-ref-row">
+            <div class="dup-ref-info">
+              <div class="dup-ref-title">${esc(r.title)}</div>
+              <div class="dup-ref-meta">${esc(fmtAuth(r.authors))} · ${r.year||'?'} · completeness ${Math.round(r.completeness*100)}%</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" onclick="simSelect('${r.id}');document.getElementById('dupes-modal').classList.remove('open')">View</button>
+            <button class="btn btn-ghost btn-sm" style="color:var(--error)"
+                    onclick="delRef('${r.id}').then(()=>document.getElementById('btn-duplicates').click())">Delete</button>
+          </div>`).join('')}
+      </div>`).join('');
+  } catch(e) {
+    hint.textContent = `Error: ${e.message}`;
+    list.innerHTML = '';
+  }
+});
+
+// ── Tag autocomplete ─────────────────────────────────────────────────────────
+async function loadAllTags() {
+  try {
+    const r = await apiFetch('/api/tags');
+    allTags = await r.json();
+  } catch(e) {}
+}
+
+function tagAcInput(refId) {
+  const inp   = document.getElementById(`ti-${refId}`);
+  const drop  = document.getElementById(`tag-ac-${refId}`);
+  const val   = inp.value.trim().toLowerCase();
+  if (!val) { drop.classList.remove('open'); return; }
+  const ref   = refs.find(r => r.id === refId);
+  const existing = new Set(ref?.tags || []);
+  const matches = allTags.filter(t => t.name.includes(val) && !existing.has(t.name)).slice(0, 8);
+  if (!matches.length) { drop.classList.remove('open'); return; }
+  drop.innerHTML = matches.map((t, i) =>
+    `<div class="tag-ac-item" data-tag="${esc(t.name)}"
+          onmousedown="tagAcPick('${refId}','${esc(t.name)}')">${esc(t.name)}<span>${t.count}</span></div>`
+  ).join('');
+  drop.classList.add('open');
+}
+
+function tagAcHide(refId) {
+  document.getElementById(`tag-ac-${refId}`)?.classList.remove('open');
+}
+
+function tagAcPick(refId, tag) {
+  const inp = document.getElementById(`ti-${refId}`);
+  inp.value = tag;
+  tagAcHide(refId);
+  addTagBtn(refId);
 }
 
 // ── Collections ────────────────────────────────────────────────────────────
@@ -1636,6 +2136,7 @@ async function loadRefs() {
     const r = await apiFetch('/api/refs?' + params);
     refs = await r.json();
     if (!Array.isArray(refs)) { refs = []; }
+    applySort();
     renderList();
     renderStatus();
     // Update "All References" count in sidebar
@@ -1753,8 +2254,14 @@ function renderDetail(ref) {
     <div class="section-label">Tags</div>
     <div class="tags-row" id="tl-${ref.id}">${tagsHtml}</div>
     <div class="tag-add-row">
-      <input class="tag-inp" id="ti-${ref.id}" placeholder="Add tag…"
-             onkeydown="tagKey(event,'${ref.id}')">
+      <div class="tag-ac-wrap">
+        <input class="tag-inp" id="ti-${ref.id}" placeholder="Add tag…"
+               onkeydown="tagKey(event,'${ref.id}')"
+               oninput="tagAcInput('${ref.id}')"
+               onblur="setTimeout(()=>tagAcHide('${ref.id}'),200)"
+               autocomplete="off">
+        <div class="tag-ac-list" id="tag-ac-${ref.id}"></div>
+      </div>
       <button class="btn btn-ghost btn-sm" onclick="addTagBtn('${ref.id}')">Add</button>
     </div>
 
@@ -1797,15 +2304,146 @@ function renderDetail(ref) {
 
     <hr class="div">
 
+    <div class="section-label" style="margin-top:4px">Citation</div>
+    <div class="cite-panel" id="cite-panel-${ref.id}">
+      <div class="cite-format-row">
+        <button class="cite-fmt-btn active" data-fmt="apa"  onclick="setCiteFmt('${ref.id}','apa',this)">APA</button>
+        <button class="cite-fmt-btn"        data-fmt="mla"  onclick="setCiteFmt('${ref.id}','mla',this)">MLA</button>
+        <button class="cite-fmt-btn"        data-fmt="chicago" onclick="setCiteFmt('${ref.id}','chicago',this)">Chicago</button>
+      </div>
+      <div class="cite-text" id="cite-text-${ref.id}">${esc(fmtCiteApa(ref))}</div>
+      <div class="cite-copy-row">
+        <button class="btn btn-ghost btn-sm" id="cite-copy-${ref.id}"
+                onclick="copyCitation('${ref.id}')">📋 Copy</button>
+      </div>
+    </div>
+
+    <hr class="div">
+
     <div class="d-actions">
       ${openUrl ? `<a class="btn btn-ghost btn-sm" href="${openUrl}" target="_blank" rel="noopener">🔗 Open URL</a>` : ''}
       ${ref.has_pdf ? `<a class="btn btn-ghost btn-sm"
           href="${apiBase()}/api/refs/${ref.id}/pdf${getCfg().key ? '?api_key=' + encodeURIComponent(getCfg().key) : ''}"
           target="_blank" rel="noopener">📄 PDF</a>` : ''}
       <button class="btn btn-ghost btn-sm" onclick="showSimilar('${ref.id}')">🔮 Similar</button>
+      <button class="btn btn-ghost btn-sm" onclick="reenrich('${ref.id}')">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm"
+              onclick="exportRef('${ref.id}')">⬇ Export</button>
       <button class="btn btn-ghost btn-sm" style="color:var(--error)"
               onclick="delRef('${ref.id}')">🗑 Delete</button>
     </div>`;
+}
+
+// ── Citation formatting ─────────────────────────────────────────────────────
+
+function _citeAuthors(authors, fmt) {
+  if (!authors?.length) return '';
+  if (fmt === 'mla') {
+    if (authors.length === 1) return authors[0].family + (authors[0].given ? ', ' + authors[0].given : '');
+    if (authors.length === 2) return `${authors[0].family}, ${authors[0].given || ''}, and ${authors[1].given || ''} ${authors[1].family}`;
+    return `${authors[0].family}, ${authors[0].given || ''}, et al`;
+  }
+  if (fmt === 'chicago') {
+    if (authors.length === 1) return authors[0].family + (authors[0].given ? ', ' + authors[0].given : '');
+    const first = authors[0].family + (authors[0].given ? ', ' + authors[0].given : '');
+    const rest  = authors.slice(1).map(a => (a.given ? a.given + ' ' : '') + a.family);
+    return authors.length <= 3 ? [first, ...rest].join(', ') : first + ', et al';
+  }
+  // APA
+  const fmt_apa = a => a.family + (a.given ? ', ' + a.given.split(' ').map(p=>p[0]+'.').join(' ') : '');
+  if (authors.length <= 7) return authors.map(fmt_apa).join(', ');
+  return authors.slice(0,6).map(fmt_apa).join(', ') + ', ... ' + fmt_apa(authors[authors.length-1]);
+}
+
+function fmtCiteApa(ref) {
+  const auth  = _citeAuthors(ref.authors, 'apa');
+  const year  = ref.year ? `(${ref.year})` : '';
+  const title = ref.title || '';
+  const venue = ref.journal || '';
+  const vol   = ref.volume  ? `, ${ref.volume}` : '';
+  const iss   = ref.issue   ? `(${ref.issue})`  : '';
+  const pgs   = ref.pages   ? `, ${ref.pages}`  : '';
+  const doi   = ref.doi     ? ` https://doi.org/${ref.doi}` : '';
+  return [auth, year, title + '.', venue ? (venue + vol + iss + pgs + '.' + doi) : doi].filter(Boolean).join(' ');
+}
+
+function fmtCiteMla(ref) {
+  const auth  = _citeAuthors(ref.authors, 'mla');
+  const title = ref.title ? `"${ref.title}."` : '';
+  const venue = ref.journal ? `*${ref.journal}*` : '';
+  const vol   = ref.volume ? `, vol. ${ref.volume}` : '';
+  const iss   = ref.issue  ? `, no. ${ref.issue}`  : '';
+  const year  = ref.year   ? ` (${ref.year})`      : '';
+  const pgs   = ref.pages  ? `, pp. ${ref.pages}`  : '';
+  const doi   = ref.doi    ? ` https://doi.org/${ref.doi}.` : '.';
+  return [auth + '.', title, venue + vol + iss + year + pgs + doi].filter(Boolean).join(' ');
+}
+
+function fmtCiteChicago(ref) {
+  const auth  = _citeAuthors(ref.authors, 'chicago');
+  const title = ref.title ? `"${ref.title}."` : '';
+  const venue = ref.journal ? `*${ref.journal}*` : '';
+  const vol   = ref.volume ? ` ${ref.volume}` : '';
+  const iss   = ref.issue  ? `, no. ${ref.issue}` : '';
+  const year  = ref.year   ? ` (${ref.year})`     : '';
+  const pgs   = ref.pages  ? `: ${ref.pages}`     : '';
+  const doi   = ref.doi    ? `. https://doi.org/${ref.doi}` : '';
+  return [auth + '.', title, venue + vol + iss + year + pgs + doi].filter(Boolean).join(' ');
+}
+
+let _citeRefId = null;
+let _citeFmt   = 'apa';
+
+function setCiteFmt(refId, fmt, btn) {
+  _citeFmt  = fmt;
+  _citeRefId = refId;
+  document.querySelectorAll('.cite-fmt-btn').forEach(b => b.classList.toggle('active', b === btn));
+  const ref  = refs.find(r => r.id === refId);
+  if (!ref) return;
+  const text = fmt === 'mla' ? fmtCiteMla(ref) : fmt === 'chicago' ? fmtCiteChicago(ref) : fmtCiteApa(ref);
+  document.getElementById(`cite-text-${refId}`).textContent = text;
+}
+
+function copyCitation(refId) {
+  const el = document.getElementById(`cite-text-${refId}`);
+  const btn = document.getElementById(`cite-copy-${refId}`);
+  if (!el) return;
+  navigator.clipboard.writeText(el.textContent).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = '✓ Copied!';
+    setTimeout(() => { btn.textContent = orig; }, 1500);
+  }).catch(() => {});
+}
+
+// ── Re-enrich ───────────────────────────────────────────────────────────────
+async function reenrich(refId) {
+  const ref = refs.find(r => r.id === refId);
+  if (!ref) return;
+  const identifier = ref.doi || ref.arxiv_id || ref.url || ref.title;
+  if (!identifier) return;
+  $statusbar.innerHTML = '<span class="spin"></span>Re-enriching metadata…';
+  try {
+    const r  = await apiFetch('/api/refs', { method: 'POST', body: JSON.stringify({ text: identifier }) });
+    const { job_id } = await r.json();
+    const timer = setInterval(async () => {
+      const jr  = await apiFetch(`/api/jobs/${job_id}`);
+      const job = await jr.json();
+      if (job.status !== 'running') {
+        clearInterval(timer);
+        $statusbar.textContent = job.status === 'done' ? `✓ ${job.message}` : `✗ ${job.message}`;
+        await loadRefs();
+        selectRef(refId);
+        setTimeout(() => renderStatus(), 2000);
+      }
+    }, 800);
+  } catch(e) { renderStatus(); }
+}
+
+// ── Single-ref export ────────────────────────────────────────────────────────
+function exportRef(refId) {
+  const key = getCfg().key;
+  const url = apiBase() + `/api/export?fmt=bibtex&ref_ids=${refId}`;
+  window.location.href = key ? url + `&api_key=${encodeURIComponent(key)}` : url;
 }
 
 // ── Cite key copy ───────────────────────────────────────────────────────────
@@ -2095,10 +2733,11 @@ async function pollJob(jobId) {
 // ── Status bar ─────────────────────────────────────────────────────────────
 function renderStatus() {
   const n = refs.length;
-  if (!n) { $statusbar.textContent = 'No references — press A to add one'; return; }
+  if (!n) { $statusbar.textContent = 'No references — [a] Add  [i] Import'; return; }
   const avg = refs.reduce((s, r) => s + r.completeness, 0) / n;
+  const read = refs.filter(r => r.status === 'read').length;
   $statusbar.textContent =
-    `${n} reference${n !== 1 ? 's' : ''}  ·  avg completeness ${Math.round(avg * 100)}%  ·  [a] Add  [/] Search`;
+    `${n} ref${n !== 1 ? 's' : ''}  ·  ${read} read  ·  avg ${Math.round(avg * 100)}% complete  ·  [a] Add  [i] Import  [/] Search  [j/k] Navigate`;
 }
 
 // ── Utils ──────────────────────────────────────────────────────────────────
