@@ -3541,8 +3541,15 @@ function renderDetail(ref) {
     </div>`}
     <div class="d-badges">${badges}</div>
 
-    <div class="section-label">Reading Status</div>
+    <div class="section-label" style="display:flex;align-items:center;justify-content:space-between">
+      Reading Status
+      <button class="btn btn-ghost btn-sm" id="read-timer-btn-${ref.id}"
+        onclick="toggleReadTimer('${ref.id}')"
+        title="Start/stop reading timer"
+        style="font-size:11px;padding:2px 8px">⏱ Start</button>
+    </div>
     <div class="status-row">${statusHtml}</div>
+    <div id="read-timer-display-${ref.id}" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
 
     <div class="section-label">Tags</div>
     <div class="tags-row" id="tl-${ref.id}">${tagsHtml}</div>
@@ -4767,6 +4774,56 @@ _postSelectHooks.push(ref => {
 
 // Initialize recently viewed on load
 setTimeout(renderRecentRefs, 800);
+
+// ── Reading timer ─────────────────────────────────────────────────────────
+const _readTimers = {};  // refId → { start: Date, elapsed: ms, interval: timer }
+
+function toggleReadTimer(refId) {
+  const btn = document.getElementById(`read-timer-btn-${refId}`);
+  const display = document.getElementById(`read-timer-display-${refId}`);
+  const key = `zt-readtime-${refId}`;
+  const saved = parseInt(localStorage.getItem(key) || '0');
+
+  if (_readTimers[refId]?.interval) {
+    // Stop timer
+    const elapsed = Date.now() - _readTimers[refId].start + (_readTimers[refId].elapsed || 0);
+    clearInterval(_readTimers[refId].interval);
+    delete _readTimers[refId];
+    localStorage.setItem(key, String(elapsed));
+    if (btn) btn.textContent = '⏱ Start';
+    updateTimerDisplay(refId, elapsed, display);
+  } else {
+    // Start timer
+    _readTimers[refId] = { start: Date.now(), elapsed: saved, interval: null };
+    _readTimers[refId].interval = setInterval(() => {
+      const total = Date.now() - _readTimers[refId].start + saved;
+      updateTimerDisplay(refId, total, display);
+    }, 1000);
+    if (btn) btn.textContent = '⏹ Stop';
+  }
+}
+
+function updateTimerDisplay(refId, ms, displayEl) {
+  if (!displayEl) return;
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const formatted = h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+  displayEl.textContent = `⏱ Total reading time: ${formatted}`;
+}
+
+// Init timer display for selected ref
+_postSelectHooks.push(ref => {
+  const key = `zt-readtime-${ref.id}`;
+  const saved = parseInt(localStorage.getItem(key) || '0');
+  if (saved > 0) {
+    setTimeout(() => {
+      const display = document.getElementById(`read-timer-display-${ref.id}`);
+      updateTimerDisplay(ref.id, saved, display);
+    }, 70);
+  }
+});
 
 // ── Drag-drop ref → collection ────────────────────────────────────────────
 let _dragRefId = null;
