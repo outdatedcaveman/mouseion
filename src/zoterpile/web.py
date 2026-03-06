@@ -975,6 +975,42 @@ def export_notes():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/refs/suggest-tags", methods=["POST"])
+def suggest_tags():
+    """Suggest tags for a given text (title + abstract) using:
+    1. Auto-tagger rules (keyword matching)
+    2. Existing library tags that appear in the text
+    Returns up to 10 suggested tag names.
+    """
+    body = request.json or {}
+    text = body.get("text", "").lower()
+    if not text:
+        return jsonify([])
+    try:
+        from .db import RefDatabase
+        from .models import Reference
+        with RefDatabase() as db:
+            all_tags = db.all_tags()
+        # Match existing tags by name appearing in text
+        suggestions = set()
+        for tag in all_tags:
+            name = tag["name"].lower()
+            # Match multi-word tags and single words
+            if re.search(r'\b' + re.escape(name) + r'\b', text):
+                suggestions.add(tag["name"])
+        # Also run auto-tagger on a dummy ref
+        from .tagger import auto_tag
+        from .models import RefType
+        dummy = Reference()
+        dummy.title = body.get("title", "")
+        dummy.abstract = body.get("abstract", "")
+        auto_suggestions = auto_tag(dummy)
+        suggestions.update(auto_suggestions)
+        return jsonify(sorted(suggestions)[:10])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/enrich-incomplete", methods=["POST"])
 def enrich_incomplete():
     """
@@ -3551,8 +3587,12 @@ function renderDetail(ref) {
     <div class="status-row">${statusHtml}</div>
     <div id="read-timer-display-${ref.id}" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
 
-    <div class="section-label">Tags</div>
+    <div class="section-label" style="display:flex;align-items:center;justify-content:space-between">
+      Tags
+      <button class="btn btn-ghost btn-sm" onclick="loadTagSuggestions('${ref.id}')" title="Suggest tags from content" style="font-size:10px">✨ Suggest</button>
+    </div>
     <div class="tags-row" id="tl-${ref.id}">${tagsHtml}</div>
+    <div id="tag-suggestions-${ref.id}" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px"></div>
     <div class="tag-add-row">
       <div class="tag-ac-wrap">
         <input class="tag-inp" id="ti-${ref.id}" placeholder="Add tag…"
@@ -4774,6 +4814,51 @@ _postSelectHooks.push(ref => {
 
 // Initialize recently viewed on load
 setTimeout(renderRecentRefs, 800);
+
+// ── Smart tag suggestions ─────────────────────────────────────────────────
+async function loadTagSuggestions(refId) {
+  const ref = refs.find(r => r.id === refId);
+  if (!ref) return;
+  const el = document.getElementById(`tag-suggestions-${refId}`);
+  if (!el) return;
+  el.innerHTML = '<span style="font-size:11px;color:var(--muted)">Loading…</span>';
+  try {
+    const r = await apiFetch('/api/refs/suggest-tags', {
+      method: 'POST',
+      body: JSON.stringify({ title: ref.title || '', abstract: ref.abstract || '',
+        text: ((ref.title || '') + ' ' + (ref.abstract || '')).toLowerCase() }),
+    });
+    const suggestions = await r.json();
+    if (!Array.isArray(suggestions) || !suggestions.length) {
+      el.innerHTML = '<span style="font-size:11px;color:var(--muted)">No suggestions</span>';
+      return;
+    }
+    // Filter out already-applied tags
+    const existing = new Set(ref.tags);
+    const newSugs = suggestions.filter(t => !existing.has(t));
+    if (!newSugs.length) {
+      el.innerHTML = '<span style="font-size:11px;color:var(--muted)">All suggestions already applied</span>';
+      return;
+    }
+    el.innerHTML = newSugs.map(t =>
+      `<span class="tag" style="cursor:pointer;border:1px dashed var(--border-hi)" title="Click to add tag"
+        onclick="quickAddSuggestedTag('${refId}','${esc(t)}',this)">${esc(t)} ＋</span>`
+    ).join('');
+  } catch(e) { el.innerHTML = `<span style="color:var(--error);font-size:11px">${esc(e.message)}</span>`; }
+}
+
+async function quickAddSuggestedTag(refId, tag, el) {
+  await apiFetch(`/api/refs/${refId}/tags`, {
+    method: 'POST',
+    body: JSON.stringify({ tag }),
+  });
+  el.remove();
+  const ref = refs.find(r => r.id === refId);
+  if (ref && !ref.tags.includes(tag)) {
+    ref.tags.push(tag);
+    renderDetail(ref); renderList();
+  }
+}
 
 // ── Reading timer ─────────────────────────────────────────────────────────
 const _readTimers = {};  // refId → { start: Date, elapsed: ms, interval: timer }
