@@ -362,7 +362,26 @@ class RefDatabase:
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS collections (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        name       TEXT NOT NULL,
+        parent_id  INTEGER REFERENCES collections(id) ON DELETE CASCADE,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS ref_collections (
+        ref_id        TEXT    NOT NULL REFERENCES refs(id) ON DELETE CASCADE,
+        collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+        PRIMARY KEY (ref_id, collection_id)
+    );
     """
+
+    # Incremental migrations: run on every open(), errors ignored if already applied.
+    _MIGRATIONS = [
+        "ALTER TABLE refs ADD COLUMN notes  TEXT",
+        "ALTER TABLE refs ADD COLUMN status TEXT DEFAULT 'unread'",
+    ]
 
     def __init__(self, path: Optional[str | Path] = None) -> None:
         from .config import get_config
@@ -386,6 +405,12 @@ class RefDatabase:
         self._conn = sqlite3.connect(str(self._path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(self._SCHEMA)
+        # Incremental column/table migrations (idempotent — errors = already applied).
+        for stmt in self._MIGRATIONS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
         # Performance tuning for large databases.
         # These settings are safe: WAL mode makes NORMAL synchronous crash-safe.
         self._conn.execute("PRAGMA cache_size     = -65536")   # 64 MB page cache
@@ -608,6 +633,111 @@ class RefDatabase:
                     f"UPDATE refs SET {', '.join(sets)} WHERE id = :id", params
                 )
 
+    def update_ref_fields(
+        self,
+        ref_id: str,
+        notes: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> None:
+        """Update user-editable fields (notes, status) on a reference."""
+        _VALID_STATUS = {"unread", "reading", "read"}
+        sets: List[str] = []
+        params: Dict[str, Any] = {"id": ref_id}
+        if notes is not None:
+            sets.append("notes = :notes")
+            params["notes"] = notes
+        if status is not None:
+            if status not in _VALID_STATUS:
+                raise ValueError(f"status must be one of {_VALID_STATUS}")
+            sets.append("status = :status")
+            params["status"] = status
+        if sets:
+            with self._db() as conn:
+                conn.execute(
+                    f"UPDATE refs SET {', '.join(sets)} WHERE id = :id", params
+                )
+
+    # -----------------------------------------------------------------------
+    # Collections
+    # -----------------------------------------------------------------------
+
+    def get_collections(self) -> List[Dict[str, Any]]:
+        """Return all collections with their reference counts."""
+        with self._db() as conn:
+            cur = conn.execute(
+                """SELECT c.id, c.name, c.parent_id,
+                          COUNT(rc.ref_id) AS ref_count
+                   FROM collections c
+                   LEFT JOIN ref_collections rc ON rc.collection_id = c.id
+                   GROUP BY c.id
+                   ORDER BY c.name"""
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def create_collection(self, name: str, parent_id: Optional[int] = None) -> int:
+        """Create a new collection. Returns the new collection ID."""
+        with self._db() as conn:
+            cur = conn.execute(
+                "INSERT INTO collections (name, parent_id) VALUES (?, ?)",
+                (name.strip(), parent_id),
+            )
+            return cur.lastrowid
+
+    def rename_collection(self, collection_id: int, name: str) -> None:
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE collections SET name = ? WHERE id = ?",
+                (name.strip(), collection_id),
+            )
+
+    def delete_collection(self, collection_id: int) -> None:
+        with self._db() as conn:
+            conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+
+    def add_to_collection(self, ref_id: str, collection_id: int) -> None:
+        with self._db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO ref_collections (ref_id, collection_id) VALUES (?, ?)",
+                (ref_id, collection_id),
+            )
+
+    def remove_from_collection(self, ref_id: str, collection_id: int) -> None:
+        with self._db() as conn:
+            conn.execute(
+                "DELETE FROM ref_collections WHERE ref_id = ? AND collection_id = ?",
+                (ref_id, collection_id),
+            )
+
+    def get_ref_collections(self, ref_id: str) -> List[Dict[str, Any]]:
+        """Return collections that contain the given reference."""
+        with self._db() as conn:
+            cur = conn.execute(
+                """SELECT c.id, c.name FROM collections c
+                   JOIN ref_collections rc ON rc.collection_id = c.id
+                   WHERE rc.ref_id = ?
+                   ORDER BY c.name""",
+                (ref_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def list_collection_refs(
+        self,
+        collection_id: int,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> List[Reference]:
+        """Return all references in a collection."""
+        with self._db() as conn:
+            cur = conn.execute(
+                """SELECT refs.* FROM refs
+                   JOIN ref_collections rc ON rc.ref_id = refs.id
+                   WHERE rc.collection_id = ?
+                   ORDER BY refs.year DESC, refs.title ASC
+                   LIMIT ? OFFSET ?""",
+                (collection_id, limit, offset),
+            )
+            return [_row_to_ref(r) for r in cur.fetchall()]
+
     # -----------------------------------------------------------------------
     # Tag management
     # -----------------------------------------------------------------------
@@ -706,11 +836,11 @@ class RefDatabase:
             return _row_to_ref(row) if row else None
 
     def get_extra(self, ref_id: str) -> Dict[str, Any]:
-        """Return integration/PDF fields not in the Reference model."""
+        """Return integration/PDF/notes/status fields not in the Reference model."""
         with self._db() as conn:
             cur = conn.execute(
                 "SELECT pdf_local, pdf_drive_id, notion_page_id, zotero_item_key, "
-                "created_at, updated_at FROM refs WHERE id = ?",
+                "notes, status, cite_key, created_at, updated_at FROM refs WHERE id = ?",
                 (ref_id,),
             )
             row = cur.fetchone()
@@ -718,7 +848,7 @@ class RefDatabase:
 
     def get_extras_bulk(self, ref_ids: List[str]) -> Dict[str, Dict[str, Any]]:
         """
-        Return integration/PDF metadata for multiple refs in a single query.
+        Return integration/PDF/notes/status metadata for multiple refs in a single query.
         Far more efficient than calling ``get_extra`` in a loop.
         Returns a mapping of ref_id → extras dict (missing IDs are absent).
         """
@@ -728,7 +858,7 @@ class RefDatabase:
         with self._db() as conn:
             cur = conn.execute(
                 f"SELECT id, pdf_local, pdf_drive_id, notion_page_id, "
-                f"zotero_item_key, created_at, updated_at "
+                f"zotero_item_key, notes, status, cite_key, created_at, updated_at "
                 f"FROM refs WHERE id IN ({ph})",
                 ref_ids,
             )

@@ -128,7 +128,16 @@ def _ref_id(ref) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:24]
 
 
-def _ref_to_dict(ref, tags: List[str], ref_id: str, has_pdf: bool = False) -> dict:
+def _ref_to_dict(
+    ref,
+    tags: List[str],
+    ref_id: str,
+    has_pdf: bool = False,
+    notes: Optional[str] = None,
+    status: Optional[str] = None,
+    cite_key: Optional[str] = None,
+    collections: Optional[List[Dict[str, Any]]] = None,
+) -> dict:
     return {
         "id":             ref_id,
         "title":          ref.title or "(untitled)",
@@ -148,6 +157,10 @@ def _ref_to_dict(ref, tags: List[str], ref_id: str, has_pdf: bool = False) -> di
         "citation_count": ref.citation_count,
         "tags":           tags,
         "has_pdf":        has_pdf,
+        "notes":          notes or "",
+        "status":         status or "unread",
+        "cite_key":       cite_key or ref.auto_cite_key(),
+        "collections":    collections or [],
     }
 
 
@@ -158,23 +171,41 @@ def _ref_to_dict(ref, tags: List[str], ref_id: str, has_pdf: bool = False) -> di
 @app.route("/api/refs")
 def list_refs():
     from .db import RefDatabase
-    q        = request.args.get("q", "").strip()
-    ref_type = request.args.get("type") or None
-    oa_only  = request.args.get("oa", "").lower() == "true"
-    limit    = min(int(request.args.get("limit", 500)), 2000)
+    q             = request.args.get("q", "").strip()
+    ref_type      = request.args.get("type") or None
+    oa_only       = request.args.get("oa", "").lower() == "true"
+    limit         = min(int(request.args.get("limit", 500)), 2000)
+    collection_id = request.args.get("collection_id")
     try:
         with RefDatabase() as db:
-            raw = db.search(q or "", ref_type=ref_type, oa_only=oa_only, limit=limit)
-            ref_ids = [_ref_id(ref) for ref, _ in raw]
-            tags_map = db.get_tags_batch(ref_ids)
+            if collection_id:
+                coll_refs = db.list_collection_refs(int(collection_id), limit=limit)
+                # Apply additional filters
+                if q:
+                    q_low = q.lower()
+                    coll_refs = [
+                        r for r in coll_refs
+                        if q_low in (r.title or "").lower()
+                        or q_low in " ".join(a.family for a in r.authors).lower()
+                    ]
+                raw = [(r, 0.5) for r in coll_refs]
+            else:
+                raw = db.search(q or "", ref_type=ref_type, oa_only=oa_only, limit=limit)
+            ref_ids    = [_ref_id(ref) for ref, _ in raw]
+            tags_map   = db.get_tags_batch(ref_ids)
             extras_map = db.get_extras_bulk(ref_ids)
             result = [
                 _ref_to_dict(
-                    ref, tags_map[_ref_id(ref)], _ref_id(ref),
+                    ref,
+                    tags_map.get(_ref_id(ref), []),
+                    _ref_id(ref),
                     has_pdf=bool(
                         extras_map.get(_ref_id(ref), {}).get("pdf_drive_id")
                         or extras_map.get(_ref_id(ref), {}).get("pdf_local")
                     ),
+                    notes=extras_map.get(_ref_id(ref), {}).get("notes"),
+                    status=extras_map.get(_ref_id(ref), {}).get("status"),
+                    cite_key=extras_map.get(_ref_id(ref), {}).get("cite_key"),
                 )
                 for ref, _ in raw
             ]
@@ -191,10 +222,18 @@ def get_ref(ref_id: str):
             ref = db.get(ref_id)
             if ref is None:
                 abort(404)
-            tags = db.get_tags(ref_id)
-            extra = db.get_extra(ref_id)
+            tags        = db.get_tags(ref_id)
+            extra       = db.get_extra(ref_id)
+            collections = db.get_ref_collections(ref_id)
         has_pdf = bool(extra.get("pdf_drive_id") or extra.get("pdf_local"))
-        return jsonify(_ref_to_dict(ref, tags, ref_id, has_pdf=has_pdf))
+        return jsonify(_ref_to_dict(
+            ref, tags, ref_id,
+            has_pdf=has_pdf,
+            notes=extra.get("notes"),
+            status=extra.get("status"),
+            cite_key=extra.get("cite_key"),
+            collections=collections,
+        ))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -251,6 +290,104 @@ def delete_ref(ref_id: str):
         from .db import RefDatabase
         with RefDatabase() as db:
             db.delete(ref_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/refs/<ref_id>", methods=["PATCH"])
+def patch_ref(ref_id: str):
+    """Update user-editable fields: notes and/or status."""
+    body   = request.json or {}
+    notes  = body.get("notes")   # None = don't update
+    status = body.get("status")
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            if db.get(ref_id) is None:
+                abort(404)
+            db.update_ref_fields(ref_id, notes=notes, status=status)
+        return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Collections
+# ---------------------------------------------------------------------------
+
+@app.route("/api/collections")
+def list_collections():
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            return jsonify(db.get_collections())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/collections", methods=["POST"])
+def create_collection():
+    name      = (request.json or {}).get("name", "").strip()
+    parent_id = (request.json or {}).get("parent_id")
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            cid = db.create_collection(name, parent_id)
+        return jsonify({"id": cid, "name": name}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/collections/<int:collection_id>", methods=["DELETE"])
+def delete_collection(collection_id: int):
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            db.delete_collection(collection_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/collections/<int:collection_id>", methods=["PATCH"])
+def rename_collection(collection_id: int):
+    name = (request.json or {}).get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            db.rename_collection(collection_id, name)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/refs/<ref_id>/collections", methods=["POST"])
+def add_ref_to_collection(ref_id: str):
+    collection_id = (request.json or {}).get("collection_id")
+    if collection_id is None:
+        return jsonify({"error": "collection_id is required"}), 400
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            db.add_to_collection(ref_id, int(collection_id))
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/refs/<ref_id>/collections/<int:collection_id>", methods=["DELETE"])
+def remove_ref_from_collection(ref_id: str, collection_id: int):
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            db.remove_from_collection(ref_id, collection_id)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -907,6 +1044,99 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   transition: background .1s;
 }
 .dd-item:hover { background: var(--border); }
+
+/* ── Collections sidebar ── */
+.coll-sidebar {
+  width: 190px; flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.coll-header {
+  padding: 10px 12px 8px;
+  font-size: 11px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .6px; font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.coll-new-btn {
+  background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 18px; line-height: 1; padding: 0;
+  display: flex; align-items: center;
+}
+.coll-new-btn:hover { color: var(--primary); }
+.coll-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+.coll-item {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 12px; cursor: pointer;
+  font-size: 13px; color: var(--text);
+  transition: background .1s; position: relative;
+}
+.coll-item:hover { background: var(--panel); }
+.coll-item.active { background: var(--panel); color: var(--primary); font-weight: 600; }
+.coll-item-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.coll-count { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.coll-del {
+  display: none; background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 0; margin-left: 2px;
+}
+.coll-item:hover .coll-del { display: flex; align-items: center; }
+.coll-del:hover { color: var(--error); }
+
+/* ── Status toggle ── */
+.status-row { display: flex; gap: 4px; margin-bottom: 12px; }
+.status-btn {
+  padding: 4px 12px; border-radius: 999px; font-size: 12px;
+  cursor: pointer; border: 1px solid var(--border);
+  background: transparent; color: var(--muted);
+  font-family: var(--font); transition: all .15s;
+}
+.status-btn:hover { border-color: var(--border-hi); color: var(--text); }
+.status-btn.active-unread  { background: #301a2a; border-color: #cc6699; color: #ee88bb; }
+.status-btn.active-reading { background: #1a2a40; border-color: #5588cc; color: #88aaee; }
+.status-btn.active-read    { background: #0d3326; border-color: #3ecf8e; color: #3ecf8e; }
+
+/* ── Notes editor ── */
+.notes-ta {
+  width: 100%; background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 8px 10px;
+  color: var(--text); font-size: 13px; font-family: var(--font);
+  resize: vertical; min-height: 70px; outline: none; line-height: 1.6;
+  transition: border-color .15s;
+}
+.notes-ta:focus { border-color: var(--primary); }
+.notes-ta::placeholder { color: var(--muted); }
+.notes-saved { font-size: 11px; color: var(--muted); margin-top: 4px; height: 14px; }
+
+/* ── Collection chip in detail ── */
+.coll-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px 2px 10px; background: #1a2040;
+  color: #7799ee; border-radius: 4px; font-size: 12px; margin: 2px;
+}
+.coll-chip-x {
+  background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 0;
+}
+.coll-chip-x:hover { color: var(--error); }
+.coll-add-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.coll-select {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 5px 8px;
+  color: var(--text); font-size: 12px; outline: none;
+  flex: 1; max-width: 200px;
+}
+.coll-select:focus { border-color: var(--primary); }
+
+/* ── Cite key copy badge ── */
+.b-citekey {
+  background: #1a2a1a; color: #7acc7a;
+  font-family: var(--mono); cursor: pointer;
+  transition: background .15s;
+}
+.b-citekey:hover { background: #243824; }
+.b-citekey.copied { background: #0d3326; color: #3ecf8e; }
 </style>
 </head>
 <body>
@@ -940,6 +1170,20 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 
 <!-- ── Main ── -->
 <main>
+  <!-- Collections sidebar -->
+  <div class="coll-sidebar">
+    <div class="coll-header">
+      Collections
+      <button class="coll-new-btn" id="btn-coll-new" title="New collection">＋</button>
+    </div>
+    <div class="coll-list" id="coll-list">
+      <div class="coll-item active" data-id="" onclick="selectCollection(null)">
+        <span class="coll-item-name">📚 All References</span>
+        <span class="coll-count" id="all-count"></span>
+      </div>
+    </div>
+  </div>
+
   <div class="ref-list" id="ref-list">
     <div class="empty"><div class="spin"></div></div>
   </div>
@@ -996,10 +1240,12 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 'use strict';
 
 // ── State ──────────────────────────────────────────────────────────────────
-let refs      = [];
-let selId     = null;
-let filter    = { type: '', oa: false };
-let addTimer  = null;
+let refs        = [];
+let selId       = null;
+let filter      = { type: '', oa: false };
+let addTimer    = null;
+let collections = [];
+let activeColl  = null;   // null = all refs, int = collection id
 
 // ── DOM refs ───────────────────────────────────────────────────────────────
 const $search   = document.getElementById('search');
@@ -1049,18 +1295,11 @@ async function apiFetch(path, opts) {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 (async () => {
-  // Register service worker for PWA
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
-  // If no key stored, try to detect we're on the same origin (key not needed)
-  const { key } = getCfg();
-  if (!key) {
-    // First load — open settings if we get a 401
-    loadRefs();
-  } else {
-    loadRefs();
-  }
+  loadCollections();
+  loadRefs();
 })();
 
 // ── Search (debounced) ─────────────────────────────────────────────────────
@@ -1159,18 +1398,84 @@ function isEditing() {
   return t === 'INPUT' || t === 'TEXTAREA';
 }
 
+// ── Collections ────────────────────────────────────────────────────────────
+async function loadCollections() {
+  try {
+    const r = await apiFetch('/api/collections');
+    collections = await r.json();
+    if (!Array.isArray(collections)) collections = [];
+    renderCollections();
+  } catch(e) { console.error(e); }
+}
+
+function renderCollections() {
+  const $cl = document.getElementById('coll-list');
+  const allCount = refs.length;
+  document.getElementById('all-count').textContent = allCount || '';
+  const rows = collections.map(c => {
+    const act = activeColl === c.id ? ' active' : '';
+    return `<div class="coll-item${act}" data-id="${c.id}" onclick="selectCollection(${c.id})">
+      <span class="coll-item-name">📁 ${esc(c.name)}</span>
+      <span class="coll-count">${c.ref_count || ''}</span>
+      <button class="coll-del" title="Delete collection"
+        onclick="event.stopPropagation();deleteCollection(${c.id})">×</button>
+    </div>`;
+  }).join('');
+  // Preserve "All References" item and append collections
+  $cl.innerHTML = `<div class="coll-item${activeColl === null ? ' active' : ''}" data-id=""
+      onclick="selectCollection(null)">
+    <span class="coll-item-name">📚 All References</span>
+    <span class="coll-count" id="all-count">${activeColl === null ? refs.length || '' : ''}</span>
+  </div>` + rows;
+}
+
+function selectCollection(id) {
+  activeColl = id;
+  renderCollections();
+  loadRefs();
+}
+
+document.getElementById('btn-coll-new').addEventListener('click', async () => {
+  const name = prompt('New collection name:');
+  if (!name?.trim()) return;
+  try {
+    await apiFetch('/api/collections', {
+      method: 'POST',
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    await loadCollections();
+  } catch(e) { console.error(e); }
+});
+
+async function deleteCollection(id) {
+  const c = collections.find(x => x.id === id);
+  if (!confirm(`Delete collection "${c?.name || id}"?`)) return;
+  try {
+    await apiFetch(`/api/collections/${id}`, { method: 'DELETE' });
+    if (activeColl === id) { activeColl = null; }
+    await loadCollections();
+    await loadRefs();
+  } catch(e) { console.error(e); }
+}
+
 // ── Load & render list ─────────────────────────────────────────────────────
 async function loadRefs() {
   const q = $search.value.trim();
   const params = new URLSearchParams({ q, limit: 500 });
-  if (filter.type) params.set('type', filter.type);
-  if (filter.oa)   params.set('oa', 'true');
+  if (filter.type)  params.set('type', filter.type);
+  if (filter.oa)    params.set('oa', 'true');
+  if (activeColl != null) params.set('collection_id', activeColl);
   try {
     const r = await apiFetch('/api/refs?' + params);
     refs = await r.json();
     if (!Array.isArray(refs)) { refs = []; }
     renderList();
     renderStatus();
+    // Update "All References" count in sidebar
+    if (activeColl === null) {
+      const el = document.getElementById('all-count');
+      if (el) el.textContent = refs.length || '';
+    }
   } catch(e) { console.error(e); }
 }
 
@@ -1224,6 +1529,9 @@ function renderDetail(ref) {
     ref.open_access ? `<span class="badge b-oa">🔓 Open Access</span>` : '',
     ref.ref_type && ref.ref_type !== 'unknown'
       ? `<span class="badge b-type">${esc(typeLabel(ref.ref_type))}</span>` : '',
+    ref.cite_key
+      ? `<span class="badge b-citekey" id="ck-${ref.id}" title="Click to copy cite key"
+             onclick="copyCiteKey('${ref.id}','${esc(ref.cite_key)}')">@${esc(ref.cite_key)}</span>` : '',
   ].filter(Boolean).join('');
 
   const tagsHtml = ref.tags.map(t =>
@@ -1231,17 +1539,39 @@ function renderDetail(ref) {
        onclick="rmTag('${ref.id}','${esc(t)}')">×</button></span>`
   ).join('');
 
+  const statusVal = ref.status || 'unread';
+  const statuses = ['unread', 'reading', 'read'];
+  const statusHtml = statuses.map(s => {
+    const act = statusVal === s ? ` active-${s}` : '';
+    return `<button class="status-btn${act}" onclick="setStatus('${ref.id}','${s}')">${
+      s === 'unread' ? '○ Unread' : s === 'reading' ? '◑ Reading' : '● Read'
+    }</button>`;
+  }).join('');
+
   const pct = Math.round(ref.completeness * 100);
   const bc  = ref.completeness >= .8 ? 'bar-g' : ref.completeness >= .4 ? 'bar-y' : 'bar-r';
 
   const openUrl = ref.oa_url || ref.url ||
     (ref.doi ? `https://doi.org/${encodeURIComponent(ref.doi)}` : null);
 
+  // Collections chips
+  const collsHtml = (ref.collections || []).map(c =>
+    `<span class="coll-chip">📁 ${esc(c.name)}<button class="coll-chip-x"
+       title="Remove from collection"
+       onclick="removeFromColl('${ref.id}',${c.id})">×</button></span>`
+  ).join('');
+  const collOptions = collections
+    .filter(c => !(ref.collections || []).find(rc => rc.id === c.id))
+    .map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+
   $detail.innerHTML = `
     <div class="d-title">${esc(ref.title)}</div>
     <div class="d-authors">${esc(authors)}${esc(year)}</div>
     ${venue ? `<div class="d-venue">${esc(venue)}</div>` : ''}
     <div class="d-badges">${badges}</div>
+
+    <div class="section-label">Reading Status</div>
+    <div class="status-row">${statusHtml}</div>
 
     <div class="section-label">Tags</div>
     <div class="tags-row" id="tl-${ref.id}">${tagsHtml}</div>
@@ -1256,6 +1586,28 @@ function renderDetail(ref) {
     ${ref.abstract ? `
       <div class="section-label">Abstract</div>
       <div class="abstract">${esc(ref.abstract)}</div>
+      <hr class="div">
+    ` : ''}
+
+    <div class="section-label">Notes</div>
+    <textarea class="notes-ta" id="notes-${ref.id}"
+      placeholder="Your notes, comments, key takeaways…"
+      onblur="saveNotes('${ref.id}')">${esc(ref.notes || '')}</textarea>
+    <div class="notes-saved" id="notes-st-${ref.id}"></div>
+
+    <hr class="div">
+
+    ${collections.length ? `
+      <div class="section-label">Collections</div>
+      <div id="coll-chips-${ref.id}">${collsHtml}</div>
+      ${collOptions ? `<div class="coll-add-row">
+        <select class="coll-select" id="coll-sel-${ref.id}">
+          <option value="">Add to collection…</option>
+          ${collOptions}
+        </select>
+        <button class="btn btn-ghost btn-sm"
+          onclick="addToColl('${ref.id}')">Add</button>
+      </div>` : ''}
       <hr class="div">
     ` : ''}
 
@@ -1276,6 +1628,82 @@ function renderDetail(ref) {
       <button class="btn btn-ghost btn-sm" style="color:var(--error)"
               onclick="delRef('${ref.id}')">🗑 Delete</button>
     </div>`;
+}
+
+// ── Cite key copy ───────────────────────────────────────────────────────────
+function copyCiteKey(refId, citeKey) {
+  navigator.clipboard.writeText(citeKey).then(() => {
+    const el = document.getElementById(`ck-${refId}`);
+    if (!el) return;
+    el.classList.add('copied');
+    el.textContent = '✓ Copied!';
+    setTimeout(() => {
+      el.classList.remove('copied');
+      el.textContent = '@' + citeKey;
+    }, 1500);
+  }).catch(() => {});
+}
+
+// ── Status toggle ───────────────────────────────────────────────────────────
+async function setStatus(refId, status) {
+  await apiFetch(`/api/refs/${refId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  });
+  const ref = refs.find(r => r.id === refId);
+  if (ref) { ref.status = status; renderDetail(ref); }
+}
+
+// ── Notes ───────────────────────────────────────────────────────────────────
+let _notesTimer = {};
+async function saveNotes(refId) {
+  const ta = document.getElementById(`notes-${refId}`);
+  const st = document.getElementById(`notes-st-${refId}`);
+  if (!ta) return;
+  const notes = ta.value;
+  try {
+    await apiFetch(`/api/refs/${refId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ notes }),
+    });
+    const ref = refs.find(r => r.id === refId);
+    if (ref) ref.notes = notes;
+    if (st) { st.textContent = 'Saved'; setTimeout(() => { if (st) st.textContent = ''; }, 1500); }
+  } catch(e) {
+    if (st) { st.textContent = 'Save failed'; }
+  }
+}
+
+// ── Collections in detail ───────────────────────────────────────────────────
+async function addToColl(refId) {
+  const sel = document.getElementById(`coll-sel-${refId}`);
+  const collId = sel && parseInt(sel.value);
+  if (!collId) return;
+  await apiFetch(`/api/refs/${refId}/collections`, {
+    method: 'POST',
+    body: JSON.stringify({ collection_id: collId }),
+  });
+  // Refresh detail
+  const r = await apiFetch(`/api/refs/${refId}`);
+  const updated = await r.json();
+  const ref = refs.find(x => x.id === refId);
+  if (ref) {
+    ref.collections = updated.collections;
+    renderDetail(ref);
+  }
+  await loadCollections();
+}
+
+async function removeFromColl(refId, collId) {
+  await apiFetch(`/api/refs/${refId}/collections/${collId}`, { method: 'DELETE' });
+  const r = await apiFetch(`/api/refs/${refId}`);
+  const updated = await r.json();
+  const ref = refs.find(x => x.id === refId);
+  if (ref) {
+    ref.collections = updated.collections;
+    renderDetail(ref);
+  }
+  await loadCollections();
 }
 
 // ── Tag management ─────────────────────────────────────────────────────────
