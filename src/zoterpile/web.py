@@ -128,7 +128,7 @@ def _ref_id(ref) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:24]
 
 
-def _ref_to_dict(ref, tags: List[str], ref_id: str) -> dict:
+def _ref_to_dict(ref, tags: List[str], ref_id: str, has_pdf: bool = False) -> dict:
     return {
         "id":             ref_id,
         "title":          ref.title or "(untitled)",
@@ -147,6 +147,7 @@ def _ref_to_dict(ref, tags: List[str], ref_id: str) -> dict:
         "completeness":   ref.completeness,
         "citation_count": ref.citation_count,
         "tags":           tags,
+        "has_pdf":        has_pdf,
     }
 
 
@@ -166,8 +167,17 @@ def list_refs():
             raw = db.search(q or "", ref_type=ref_type, oa_only=oa_only, limit=limit)
             ref_ids = [_ref_id(ref) for ref, _ in raw]
             tags_map = db.get_tags_batch(ref_ids)
-            result = [_ref_to_dict(ref, tags_map[_ref_id(ref)], _ref_id(ref))
-                      for ref, _ in raw]
+            extras_map = db.get_extras_bulk(ref_ids)
+            result = [
+                _ref_to_dict(
+                    ref, tags_map[_ref_id(ref)], _ref_id(ref),
+                    has_pdf=bool(
+                        extras_map.get(_ref_id(ref), {}).get("pdf_drive_id")
+                        or extras_map.get(_ref_id(ref), {}).get("pdf_local")
+                    ),
+                )
+                for ref, _ in raw
+            ]
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -182,7 +192,9 @@ def get_ref(ref_id: str):
             if ref is None:
                 abort(404)
             tags = db.get_tags(ref_id)
-        return jsonify(_ref_to_dict(ref, tags, ref_id))
+            extra = db.get_extra(ref_id)
+        has_pdf = bool(extra.get("pdf_drive_id") or extra.get("pdf_local"))
+        return jsonify(_ref_to_dict(ref, tags, ref_id, has_pdf=has_pdf))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1178,13 +1190,14 @@ function renderList() {
     const year = ref.year || '—';
     const tags = ref.tags.slice(0, 3).map(t => `<span class="tag">${esc(t)}</span>`).join('');
     const more = ref.tags.length > 3 ? `<span class="tag">+${ref.tags.length - 3}</span>` : '';
+    const pdf  = ref.has_pdf ? `<span class="tag" title="PDF available" style="opacity:.7">📄</span>` : '';
     const act  = ref.id === selId ? ' active' : '';
     return `<div class="ref-card${act}" data-id="${ref.id}" onclick="selectRef('${ref.id}')">
       <div class="dot ${d}"></div>
       <div class="rc-body">
         <div class="rc-title">${esc(ref.title)}</div>
         <div class="rc-meta">${esc(auth)} · ${year}</div>
-        <div class="rc-tags">${tags}${more}</div>
+        <div class="rc-tags">${tags}${more}${pdf}</div>
       </div>
     </div>`;
   }).join('');
@@ -1257,6 +1270,9 @@ function renderDetail(ref) {
 
     <div class="d-actions">
       ${openUrl ? `<a class="btn btn-ghost btn-sm" href="${openUrl}" target="_blank" rel="noopener">🔗 Open URL</a>` : ''}
+      ${ref.has_pdf ? `<a class="btn btn-ghost btn-sm"
+          href="${apiBase()}/api/refs/${ref.id}/pdf${getCfg().key ? '?api_key=' + encodeURIComponent(getCfg().key) : ''}"
+          target="_blank" rel="noopener">📄 PDF</a>` : ''}
       <button class="btn btn-ghost btn-sm" style="color:var(--error)"
               onclick="delRef('${ref.id}')">🗑 Delete</button>
     </div>`;
