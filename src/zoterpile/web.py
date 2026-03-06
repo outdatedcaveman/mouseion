@@ -81,19 +81,56 @@ def _require_api_key() -> Optional[Response]:
 
 @app.after_request
 def _add_cors(response: Response) -> Response:
-    """Add CORS headers to all responses (needed for browser extension and remote clients)."""
+    """Add CORS and security headers to all responses."""
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = (
         "Content-Type, Authorization, X-API-Key"
     )
+    # Security hardening
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    # Cache API responses briefly to reduce duplicate requests; SPA handles invalidation
+    if request.path.startswith("/api/") and request.method == "GET":
+        response.headers.setdefault("Cache-Control", "private, max-age=5")
     return response
+
+
+@app.before_request
+def _handle_options():
+    """Handle CORS preflight OPTIONS requests."""
+    if request.method == "OPTIONS":
+        resp = Response()
+        resp.headers["Access-Control-Allow-Origin"]  = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+        resp.headers["Access-Control-Max-Age"]       = "86400"
+        return resp
 
 
 @app.route("/api/auth/check")
 def auth_check():
     """Lightweight endpoint to verify the API key is valid."""
     return jsonify({"ok": True})
+
+
+@app.route("/api/version")
+def api_version():
+    """Return server version and basic capabilities."""
+    try:
+        from . import __version__
+    except ImportError:
+        __version__ = "unknown"
+    return jsonify({
+        "version":      __version__,
+        "name":         "zoterpile",
+        "capabilities": [
+            "search", "fts", "enrich", "export_bibtex", "export_ris",
+            "export_markdown", "export_zotero_rdf", "export_csv",
+            "collections", "tags", "notes", "kanban", "semantic_search",
+        ],
+    })
 
 # Zotero streaming state — managed by the streaming background thread
 _stream_thread: Optional[threading.Thread] = None
@@ -258,6 +295,43 @@ def get_job(job_id: str):
     if not job:
         abort(404)
     return jsonify(job)
+
+
+@app.route("/api/providers/status")
+def providers_status():
+    """Return metadata about each configured provider (name, priority, rate limits)."""
+    from .providers import DEFAULT_PROVIDERS
+    return jsonify([{
+        "name":           p.name,
+        "priority":       getattr(p, "priority", 0),
+        "max_concurrent": getattr(p, "_max_concurrent", 1),
+        "min_interval":   getattr(p, "_min_interval", 0),
+        "available":      True,
+    } for p in DEFAULT_PROVIDERS])
+
+
+@app.route("/api/refs/recent")
+def recent_refs():
+    """Return the N most recently added references (by rowid order)."""
+    n = min(int(request.args.get("n", 20)), 100)
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            conn = db._conn
+            rows = conn.execute(
+                "SELECT * FROM refs ORDER BY rowid DESC LIMIT ?", (n,)
+            ).fetchall()
+            from .db import _row_to_ref
+            refs_list = [_row_to_ref(r) for r in rows]
+            ref_ids = [r.id for r in refs_list if r.id]
+            tags_map = db.get_tags_batch(ref_ids)
+        result = [
+            _ref_to_dict(ref, tags_map.get(ref.id or "", []), ref.id or "")
+            for ref in refs_list
+        ]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/refs/<ref_id>/tags", methods=["POST"])
@@ -2814,13 +2888,23 @@ document.getElementById('btn-rotate-key').addEventListener('click', async () => 
   }
 });
 
-function openSettings(msg) {
+async function openSettings(msg) {
   const cfg = getCfg();
   $cfgUrl.value = cfg.url;
   $cfgKey.value = cfg.key;
   $cfgSt.textContent = msg || '';
   $cfgSt.className = msg ? 'modal-status s-err' : 'modal-status';
   $cfgModal.classList.add('open');
+  // Show server version in hint
+  try {
+    const r = await fetch(apiBase() + '/api/version');
+    if (r.ok) {
+      const v = await r.json();
+      const hint = document.querySelector('#settings-modal .modal-hint');
+      if (hint) hint.innerHTML = `Server: <strong>zoterpile v${v.version}</strong> · ` +
+        `<span style="color:var(--muted)">Connect to a remote server, or leave blank for local</span>`;
+    }
+  } catch(e) { /* offline */ }
 }
 function closeSettings() { $cfgModal.classList.remove('open'); }
 function saveSettings() {
