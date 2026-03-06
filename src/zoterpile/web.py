@@ -402,6 +402,43 @@ def rename_collection(collection_id: int):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/collections/<int:collection_id>/stats")
+def collection_stats(collection_id: int):
+    """Per-collection analytics: count, avg completeness, status breakdown, top tags."""
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            refs = db.list_collection_refs(collection_id, limit=5000)
+        if not refs:
+            return jsonify({
+                "count": 0, "avg_completeness": 0.0,
+                "status": {}, "top_tags": [], "years": {},
+            })
+        status_dist: dict = {}
+        year_dist: dict = {}
+        tag_counts: dict = {}
+        completeness_sum = 0.0
+        for ref in refs:
+            completeness_sum += ref.completeness
+            st = getattr(ref, "status", None) or "unread"
+            status_dist[st] = status_dist.get(st, 0) + 1
+            if ref.year:
+                decade = f"{(ref.year // 10) * 10}s"
+                year_dist[decade] = year_dist.get(decade, 0) + 1
+            for tag in (ref.keywords or []):
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        return jsonify({
+            "count": len(refs),
+            "avg_completeness": round(completeness_sum / len(refs), 3),
+            "status": status_dist,
+            "top_tags": [{"tag": t, "count": c} for t, c in top_tags],
+            "years": dict(sorted(year_dist.items())),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/refs/<ref_id>/collections", methods=["POST"])
 def add_ref_to_collection(ref_id: str):
     collection_id = (request.json or {}).get("collection_id")
@@ -1834,6 +1871,24 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 }
 .coll-item:hover .coll-del { display: flex; align-items: center; }
 .coll-del:hover { color: var(--error); }
+.coll-stats-btn {
+  display: none; background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 12px; line-height: 1; padding: 0; margin-left: 2px;
+}
+.coll-item:hover .coll-stats-btn { display: flex; align-items: center; }
+.coll-stats-popover {
+  position: fixed; z-index: 9000; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px 18px; min-width: 240px; max-width: 300px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.18);
+}
+.coll-stats-popover h4 { margin: 0 0 10px; font-size: 14px; }
+.coll-stats-popover .cs-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; }
+.coll-stats-popover .cs-label { color: var(--muted); }
+.coll-stats-popover .cs-bar-wrap { height: 6px; background: var(--border); border-radius: 3px; margin: 6px 0 10px; }
+.coll-stats-popover .cs-bar { height: 6px; background: var(--primary); border-radius: 3px; }
+.coll-stats-popover .cs-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.coll-stats-popover .cs-tag { background: var(--panel); border-radius: 999px; padding: 1px 8px; font-size: 11px; }
+.coll-stats-close { float: right; background: none; border: none; cursor: pointer; color: var(--muted); font-size: 16px; margin-top: -2px; }
 
 /* ── Status toggle ── */
 .status-row { display: flex; gap: 4px; margin-bottom: 12px; }
@@ -3366,6 +3421,8 @@ function renderCollections() {
         ondrop="event.preventDefault();this.classList.remove('drag-over');dropRefToCollection(event,${c.id})">
       <span class="coll-item-name">📁 ${esc(c.name)}</span>
       <span class="coll-count">${c.ref_count || ''}</span>
+      <button class="coll-stats-btn" title="Collection stats"
+        onclick="event.stopPropagation();showCollStats(${c.id},${JSON.stringify(c.name)})">📊</button>
       <button class="coll-del" title="Delete collection"
         onclick="event.stopPropagation();deleteCollection(${c.id})">×</button>
     </div>`;
@@ -3405,6 +3462,45 @@ async function deleteCollection(id) {
     await loadCollections();
     await loadRefs();
   } catch(e) { console.error(e); }
+}
+
+async function showCollStats(collId, collName) {
+  // Remove existing popover if any
+  document.getElementById('coll-stats-popover')?.remove();
+  const pop = document.createElement('div');
+  pop.className = 'coll-stats-popover';
+  pop.id = 'coll-stats-popover';
+  pop.innerHTML = '<h4>📊 ' + esc(collName) + ' <button class="coll-stats-close" onclick="document.getElementById(\'coll-stats-popover\').remove()">×</button></h4><p style="font-size:12px;color:var(--muted)">Loading…</p>';
+  // Position near sidebar
+  const sidebar = document.querySelector('.sidebar');
+  const rect = sidebar ? sidebar.getBoundingClientRect() : {right: 220, top: 120};
+  pop.style.left = (rect.right + 8) + 'px';
+  pop.style.top = Math.max(60, rect.top + 60) + 'px';
+  document.body.appendChild(pop);
+  // Close on outside click
+  setTimeout(() => document.addEventListener('click', function handler(e) {
+    if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener('click', handler); }
+  }), 50);
+  try {
+    const r = await apiFetch('/api/collections/' + collId + '/stats');
+    const d = await r.json();
+    if (!r.ok) { pop.querySelector('p').textContent = d.error || 'Error'; return; }
+    const pct = Math.round((d.avg_completeness || 0) * 100);
+    const statusHtml = Object.entries(d.status || {}).map(([s,n]) =>
+      `<div class="cs-row"><span class="cs-label">${s}</span><span>${n}</span></div>`
+    ).join('');
+    const tagsHtml = (d.top_tags || []).slice(0,8).map(t =>
+      `<span class="cs-tag" title="${t.count} refs">${esc(t.tag)}</span>`
+    ).join('');
+    pop.innerHTML = `
+      <h4>📊 ${esc(collName)} <button class="coll-stats-close" onclick="document.getElementById('coll-stats-popover').remove()">×</button></h4>
+      <div class="cs-row"><span class="cs-label">Total refs</span><span>${d.count}</span></div>
+      <div class="cs-row"><span class="cs-label">Avg completeness</span><span>${pct}%</span></div>
+      <div class="cs-bar-wrap"><div class="cs-bar" style="width:${pct}%"></div></div>
+      ${statusHtml}
+      ${tagsHtml ? '<div class="cs-row" style="margin-top:8px"><span class="cs-label">Top tags</span></div><div class="cs-tags">' + tagsHtml + '</div>' : ''}
+    `;
+  } catch(e) { pop.querySelector('p') && (pop.querySelector('p').textContent = 'Error loading stats'); }
 }
 
 // ── Load & render list ─────────────────────────────────────────────────────

@@ -249,20 +249,35 @@ class Reference:
         """
         Weighted completeness score 0.0–1.0.
         Useful for ranking results and highlighting gaps.
+        Weights are adjusted per ref_type where appropriate.
         """
+        is_book = self.ref_type in (RefType.BOOK, RefType.BOOK_CHAPTER)
+        is_preprint = self.ref_type == RefType.PREPRINT
+
+        # Primary identifier: DOI (or arXiv/ISBN/PMID as equivalent)
+        has_id = bool(self.doi or self.arxiv_id or self.pmid or self.isbn)
+
         checks: Dict[str, tuple[bool, float]] = {
-            "title":     (bool(self.title), 0.20),
+            "title":     (bool(self.title), 0.22),
             "authors":   (bool(self.authors), 0.15),
             "year":      (bool(self.year), 0.10),
-            "doi":       (bool(self.doi), 0.15),
-            "journal":   (bool(self.journal or self.container_title), 0.10),
-            "volume":    (bool(self.volume), 0.05),
-            "issue":     (bool(self.issue), 0.05),
-            "pages":     (bool(self.pages or self.article_number), 0.05),
-            "abstract":  (bool(self.abstract), 0.10),
-            "publisher": (bool(self.publisher), 0.05),
+            "identifier": (has_id, 0.15),
+            # Journal/venue: not expected for books or preprints
+            "venue":     (bool(self.journal or self.container_title or self.publisher),
+                          0.08),
+            "abstract":  (bool(self.abstract), 0.12),
+            # Volume/issue/pages: less expected for books and preprints
+            "volume":    (bool(self.volume),
+                          0.03 if is_book or is_preprint else 0.05),
+            "issue":     (bool(self.issue),
+                          0.02 if is_book or is_preprint else 0.04),
+            "pages":     (bool(self.pages or self.article_number),
+                          0.04 if is_book or is_preprint else 0.05),
+            # Citation count as bonus (indicates the ref is well-indexed)
+            "cited":     (self.citation_count is not None and self.citation_count > 0,
+                          0.04),
         }
-        return sum(w for (present, w) in checks.values() if present)
+        return min(1.0, sum(w for (present, w) in checks.values() if present))
 
     def has_identifier(self) -> bool:
         return bool(self.doi or self.pmid or self.arxiv_id or self.isbn)
