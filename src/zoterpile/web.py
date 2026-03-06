@@ -986,18 +986,44 @@ def stats():
 
 @app.route("/api/tags/<tag_name>", methods=["PATCH"])
 def update_tag(tag_name: str):
-    """Update tag metadata (currently: color)."""
-    body  = request.json or {}
-    color = body.get("color", "").strip()
+    """Update tag metadata: color (hex) and/or name (rename)."""
+    body     = request.json or {}
+    color    = body.get("color", "").strip()
+    new_name = body.get("name", "").strip().lower()
     if color and not re.match(r"^#[0-9a-fA-F]{3,6}$", color):
         return jsonify({"error": "Invalid color — use hex e.g. #ff6b6b"}), 400
+    if new_name and len(new_name) > 64:
+        return jsonify({"error": "Tag name too long (max 64 chars)"}), 400
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
-            db._conn.execute(
-                "UPDATE tags SET color = ? WHERE name = ?",
-                (color or "#6366f1", tag_name),
-            )
+            conn = db._conn
+            if new_name and new_name != tag_name:
+                # Rename: check no collision first
+                existing = conn.execute("SELECT id FROM tags WHERE name = ?", (new_name,)).fetchone()
+                if existing:
+                    return jsonify({"error": f"Tag '{new_name}' already exists"}), 409
+                conn.execute("UPDATE tags SET name = ? WHERE name = ?", (new_name, tag_name))
+                tag_name = new_name  # for the color update below
+            if color:
+                conn.execute("UPDATE tags SET color = ? WHERE name = ?", (color, tag_name))
+        return jsonify({"ok": True, "name": tag_name})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tags/<tag_name>", methods=["DELETE"])
+def delete_tag(tag_name: str):
+    """Delete a tag and remove it from all refs."""
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            conn = db._conn
+            tag_row = conn.execute("SELECT id FROM tags WHERE name = ?", (tag_name,)).fetchone()
+            if not tag_row:
+                return jsonify({"error": "Tag not found"}), 404
+            conn.execute("DELETE FROM ref_tags WHERE tag_id = ?", (tag_row["id"],))
+            conn.execute("DELETE FROM tags WHERE id = ?", (tag_row["id"],))
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1781,6 +1807,8 @@ _HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Anti-FOUT: apply theme before first paint -->
+<script>(function(){var t=localStorage.getItem('zt-theme');if(t==='light')document.documentElement.setAttribute('data-theme','light');})()</script>
 <meta name="theme-color" content="#5b8af5">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -4942,22 +4970,48 @@ async function loadTagManager() {
         ${swatch}
         <span class="tm-name" style="flex:1;color:${color};font-size:13px">${esc(t.name)}</span>
         <span style="font-size:11px;color:var(--muted);flex-shrink:0">${t.ref_count ?? ''} refs</span>
+        <button class="btn btn-ghost btn-sm" style="flex-shrink:0"
+          onclick="renameTag('${esc(t.name)}')">✏ Rename</button>
         <button class="btn btn-ghost btn-sm" style="color:var(--error);flex-shrink:0"
-          onclick="deleteTag('${esc(t.name)}')">Delete</button>
+          onclick="deleteTag('${esc(t.name)}')">🗑</button>
       </div>`;
     }).join('');
   } catch(e) { el.innerHTML = `<p style="color:var(--error);padding:20px">${esc(e.message)}</p>`; }
 }
 
+async function renameTag(tagName) {
+  const newName = prompt(`Rename tag "${tagName}" to:`, tagName);
+  if (!newName || newName.trim() === tagName) return;
+  try {
+    const r = await apiFetch(`/api/tags/${encodeURIComponent(tagName)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name: newName.trim().toLowerCase() }),
+    });
+    const d = await r.json();
+    if (!r.ok) { showToast(`Error: ${d.error}`); return; }
+    showToast(`Tag renamed to "${newName.trim()}"`);
+    await loadRefs();
+    await loadTagManager();
+    // Update color map
+    _tagColorMap[newName.trim()] = _tagColorMap[tagName];
+    delete _tagColorMap[tagName];
+  } catch(e) { showToast('Rename failed'); }
+}
+
 async function deleteTag(tagName) {
   if (!confirm(`Delete tag "${tagName}" from all references? This cannot be undone.`)) return;
-  // Batch-remove from all refs using the batch API
-  const tagRefs = refs.filter(r => r.tags.includes(tagName)).map(r => r.id);
-  if (tagRefs.length) {
-    await apiFetch('/api/batch', {
-      method: 'POST',
-      body: JSON.stringify({ ref_ids: tagRefs, action: 'untag', tag: tagName }),
-    });
+  try {
+    await apiFetch(`/api/tags/${encodeURIComponent(tagName)}`, { method: 'DELETE' });
+    showToast(`Deleted tag "${tagName}"`);
+  } catch(e) {
+    // Fall back to batch untag
+    const tagRefs = refs.filter(r => r.tags.includes(tagName)).map(r => r.id);
+    if (tagRefs.length) {
+      await apiFetch('/api/batch', {
+        method: 'POST',
+        body: JSON.stringify({ ref_ids: tagRefs, action: 'untag', tag: tagName }),
+      });
+    }
   }
   await loadRefs();
   await loadTagManager();
