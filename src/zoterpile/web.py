@@ -2563,6 +2563,7 @@ kbd {
       <button class="sel-btn sel-btn-del" onclick="batchDelete()">🗑 Delete</button>
       <button class="sel-btn" onclick="exportSelected()">⬇ Export</button>
       <button class="sel-btn" onclick="enrichSelected()" title="Re-fetch metadata from all providers">🔄 Re-enrich</button>
+      <button class="sel-btn" onclick="selectAll()">☑ All</button>
       <button class="sel-btn" style="margin-left:auto" onclick="clearSel()">✕ Clear</button>
     </div>
     <div class="ref-list" id="ref-list" style="flex:1;border-right:none">
@@ -2860,6 +2861,26 @@ document.getElementById('btn-add-cancel').addEventListener('click', closeAdd);
 $addModal.addEventListener('click', e => { if (e.target === $addModal) closeAdd(); });
 $addBtn.addEventListener('click', submitAdd);
 $addTa.addEventListener('keydown', e => { if (e.key === 'Enter' && e.ctrlKey) submitAdd(); });
+$addTa.addEventListener('input', () => {
+  const text = $addTa.value.trim();
+  if (!text) { $addSt.className = 'modal-status'; $addSt.textContent = ''; return; }
+  // Detect input type and give hint
+  if (/^10\.\d{4,}\/\S+/.test(text)) {
+    $addSt.className = 'modal-status s-ok'; $addSt.textContent = '✓ DOI detected';
+  } else if (/^[\d.]+v?\d*$/.test(text) && text.includes('.')) {
+    $addSt.className = 'modal-status s-ok'; $addSt.textContent = '✓ arXiv ID detected';
+  } else if (/^(arxiv|arXiv):/.test(text)) {
+    $addSt.className = 'modal-status s-ok'; $addSt.textContent = '✓ arXiv ID detected';
+  } else if (/^\d{8}$/.test(text)) {
+    $addSt.className = 'modal-status s-ok'; $addSt.textContent = '✓ PMID detected';
+  } else if (/^https?:\/\//.test(text)) {
+    $addSt.className = 'modal-status s-ok'; $addSt.textContent = '✓ URL detected';
+  } else if (text.startsWith('@') || text.includes('bibtex') || text.includes('TY  - ')) {
+    $addSt.className = 'modal-status s-ok'; $addSt.textContent = '✓ BibTeX/RIS format detected';
+  } else {
+    $addSt.className = 'modal-status'; $addSt.textContent = '⌨ Will search by title';
+  }
+});
 
 // ── Settings modal ─────────────────────────────────────────────────────────
 document.getElementById('btn-settings').addEventListener('click', () => openSettings());
@@ -3781,11 +3802,11 @@ function renderList() {
         draggable="true" ondragstart="dragRefStart(event,'${ref.id}')"
         style="position:relative;${pinStyle}${expanded ? 'padding:10px 14px;' : ''}">
       <input type="checkbox" class="ref-card-cb" ${isSel ? 'checked' : ''}
-             onclick="event.stopPropagation();toggleSel('${ref.id}',this.checked)"
-             title="Select for batch action">
+             onclick="event.stopPropagation();toggleSel('${ref.id}',this.checked,event)"
+             title="Select for batch action (Shift+click for range)">
       <div class="dot ${d}"></div>
       <div class="rc-body">
-        <div class="rc-title">${esc(ref.title)}</div>
+        <div class="rc-title">${highlightTerms(ref.title, $search.value)}</div>
         <div class="rc-meta">${esc(auth)} · ${year}${venueRow}</div>
         ${snippetText || abstract}
         <div class="rc-tags">${tags}${more}${pdf}</div>
@@ -4183,16 +4204,37 @@ async function removeFromColl(refId, collId) {
 }
 
 // ── Batch selection ────────────────────────────────────────────────────────
-function toggleSel(id, checked) {
-  if (checked) selectedIds.add(id);
-  else selectedIds.delete(id);
+let _lastSelIdx = -1;   // for shift-click range selection
+
+function toggleSel(id, checked, event) {
+  const curIdx = refs.findIndex(r => r.id === id);
+  if (event?.shiftKey && _lastSelIdx >= 0 && curIdx >= 0) {
+    // Range selection
+    const lo = Math.min(_lastSelIdx, curIdx);
+    const hi = Math.max(_lastSelIdx, curIdx);
+    for (let i = lo; i <= hi; i++) {
+      if (checked) selectedIds.add(refs[i].id);
+      else selectedIds.delete(refs[i].id);
+    }
+    renderList(); // re-render to update checkboxes
+  } else {
+    if (checked) selectedIds.add(id);
+    else selectedIds.delete(id);
+    document.querySelectorAll(`.ref-card[data-id="${id}"]`).forEach(c =>
+      c.classList.toggle('selected', checked));
+  }
+  if (checked) _lastSelIdx = curIdx;
   updateSelToolbar();
-  // Update card style without full re-render
-  document.querySelectorAll(`.ref-card[data-id="${id}"]`).forEach(c =>
-    c.classList.toggle('selected', checked));
+}
+function selectAll() {
+  refs.forEach(r => selectedIds.add(r.id));
+  _lastSelIdx = refs.length - 1;
+  updateSelToolbar();
+  renderList();
 }
 function clearSel() {
   selectedIds.clear();
+  _lastSelIdx = -1;
   updateSelToolbar();
   renderList();
 }
@@ -4415,6 +4457,21 @@ function esc(s) {
   if (!s) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
                   .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function highlightTerms(text, query) {
+  if (!text) return '';
+  const escaped = esc(text);
+  if (!query || !query.trim()) return escaped;
+  // Highlight each non-trivial query word in the title
+  const words = query.trim().split(/\s+/).filter(w => w.length > 1);
+  if (!words.length) return escaped;
+  let result = escaped;
+  for (const word of words) {
+    const re = new RegExp('(' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+    result = result.replace(re, '<mark>$1</mark>');
+  }
+  return result;
 }
 const TYPE_LABELS = {
   'journal-article':'Article','preprint':'Preprint','book':'Book',
