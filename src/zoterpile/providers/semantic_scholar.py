@@ -25,7 +25,7 @@ _BASE = "https://api.semanticscholar.org/graph/v1"
 
 # Fields to request on every call (maximise data, respect API constraints)
 _PAPER_FIELDS = (
-    "paperId,externalIds,title,abstract,authors,year,venue,journal,"
+    "paperId,externalIds,title,abstract,tldr,authors,year,venue,journal,"
     "publicationVenue,publicationDate,publicationTypes,openAccessPdf,"
     "citationCount,fieldsOfStudy,s2FieldsOfStudy"
 )
@@ -68,6 +68,12 @@ class SemanticScholarProvider(BaseProvider):
         # --- Core ---
         ref.title    = (data.get("title") or "").strip() or None
         ref.abstract = (data.get("abstract") or "").strip() or None
+        # Use TLDR as abstract fallback when full abstract is missing
+        if not ref.abstract:
+            tldr = data.get("tldr") or {}
+            tldr_text = (tldr.get("text") if isinstance(tldr, dict) else str(tldr or "")).strip()
+            if tldr_text:
+                ref.abstract = f"[TLDR] {tldr_text}"
 
         # --- Year / date ---
         ref.year = data.get("year") or None
