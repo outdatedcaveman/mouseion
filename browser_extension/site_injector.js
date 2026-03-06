@@ -58,6 +58,46 @@ const SITES = [
       return link ? 'https://www.semanticscholar.org' + link.getAttribute('href') : location.href;
     },
   },
+  {
+    name: 'ieee',
+    match: () => location.hostname.includes('ieeexplore.ieee.org'),
+    resultSelector: 'xpl-search-result-item, div.List-results-items',
+    buttonTarget: row => row.querySelector('.result-item-content, .article-metadata') || row,
+    extractText: row => {
+      const link = row.querySelector('a[href*="/document/"]');
+      return link ? 'https://ieeexplore.ieee.org' + link.getAttribute('href') : location.href;
+    },
+  },
+  {
+    name: 'acm',
+    match: () => location.hostname.includes('dl.acm.org'),
+    resultSelector: '.issue-item, li.search__item',
+    buttonTarget: row => row.querySelector('.issue-item__footer, .rlist--inline') || row,
+    extractText: row => {
+      const link = row.querySelector('a[href*="/doi/"]');
+      return link ? 'https://dl.acm.org' + link.getAttribute('href') : location.href;
+    },
+  },
+  {
+    name: 'nature',
+    match: () => location.hostname.includes('nature.com'),
+    resultSelector: 'article[data-component="article-card"], li[data-test="result"]',
+    buttonTarget: row => row.querySelector('[data-article-actions], footer') || row,
+    extractText: row => {
+      const link = row.querySelector('a[href*="/articles/"]');
+      return link ? 'https://www.nature.com' + link.getAttribute('href') : location.href;
+    },
+  },
+  {
+    name: 'springer',
+    match: () => location.hostname.includes('link.springer.com'),
+    resultSelector: 'li.resultsList__item, article.c-article-card',
+    buttonTarget: row => row.querySelector('.c-article-card__footer, .result-info') || row,
+    extractText: row => {
+      const link = row.querySelector('a[href*="/article/"]');
+      return link ? 'https://link.springer.com' + link.getAttribute('href') : location.href;
+    },
+  },
 ];
 
 // ── Core injection logic ─────────────────────────────────────────────────────

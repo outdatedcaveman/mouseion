@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "zoterpile",
-  "version": "1.0.0",
-  "description": "Save references to your zoterpile library from any page",
+  "version": "1.1.0",
+  "description": "Save references to your zoterpile library from any page. Supports Google Scholar, arXiv, PubMed, Semantic Scholar, IEEE, ACM, Nature, Springer.",
   "icons": {
     "16":  "icons/icon16.png",
     "48":  "icons/icon48.png",
@@ -35,7 +35,13 @@
         "*://arxiv.org/find/*",
         "*://pubmed.ncbi.nlm.nih.gov/*",
         "*://www.semanticscholar.org/search*",
-        "*://www.semanticscholar.org/paper/*"
+        "*://www.semanticscholar.org/paper/*",
+        "*://ieeexplore.ieee.org/search/*",
+        "*://ieeexplore.ieee.org/document/*",
+        "*://dl.acm.org/search/proceedings*",
+        "*://dl.acm.org/doi/*",
+        "*://www.nature.com/search*",
+        "*://link.springer.com/search*"
       ],
       "js": ["site_injector.js"],
       "css": ["site_injector.css"],

@@ -2095,6 +2095,14 @@ kbd {
 .cmd-section { padding: 6px 14px 2px; font-size: 10px; color: var(--muted);
   text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
 
+/* ── Drag-drop collection ── */
+.coll-item.drag-over {
+  background: var(--primary-dim) !important;
+  border-left: 2px solid var(--primary);
+}
+.ref-card[draggable="true"] { cursor: grab; }
+.ref-card[draggable="true"]:active { cursor: grabbing; }
+
 /* ── Author links ── */
 .author-link {
   color: var(--primary); cursor: pointer; text-decoration: none;
@@ -2431,6 +2439,7 @@ kbd {
       <div class="kbd-row"><kbd>Esc</kbd><span class="kbd-desc">Close modals / cancel edit</span></div>
       <div class="kbd-row"><kbd>dblclick</kbd><span class="kbd-desc">Rename collection</span></div>
       <div class="kbd-row"><kbd>Ctrl</kbd>+<kbd>k</kbd><span class="kbd-desc">Command palette</span></div>
+      <div class="kbd-row"><kbd>n</kbd><span class="kbd-desc">Focus notes (selected ref)</span></div>
     </div>
     <div class="modal-foot" style="margin-top:18px">
       <button class="btn btn-ghost" onclick="document.getElementById('kbd-modal').classList.remove('open')">Close</button>
@@ -2545,12 +2554,27 @@ function apiHeaders(extra) {
 // Wrapper for fetch that handles 401 by opening settings modal
 async function apiFetch(path, opts) {
   const url = apiBase() + path;
-  const res = await fetch(url, Object.assign({}, opts, {
-    headers: apiHeaders((opts || {}).headers),
-  }));
+  let res;
+  try {
+    res = await fetch(url, Object.assign({}, opts, {
+      headers: apiHeaders((opts || {}).headers),
+    }));
+  } catch(err) {
+    // Network error
+    if (typeof showToast !== 'undefined') showToast('⚠ Network error: ' + err.message, { duration: 4000 });
+    throw err;
+  }
   if (res.status === 401) {
     openSettings('⚠ Authentication failed — check your API key');
     throw new Error('Unauthorized');
+  }
+  if (!res.ok && res.status >= 500) {
+    // Server error — show toast but don't throw (let caller handle)
+    if (typeof showToast !== 'undefined') {
+      res.clone().json().then(d => {
+        showToast('⚠ Server error: ' + (d.error || res.status), { duration: 4000 });
+      }).catch(() => showToast('⚠ Server error ' + res.status, { duration: 4000 }));
+    }
   }
   return res;
 }
@@ -2705,6 +2729,11 @@ document.addEventListener('keydown', e => {
   if (e.key === 'r' || e.key === 'R') { loadRefs(); return; }
   if (e.key === 'b' || e.key === 'B') { openKanban(); return; }
   if (e.key === 'f' || e.key === 'F') { document.getElementById('btn-adv-filter')?.click(); return; }
+  if ((e.key === 'n' || e.key === 'N') && selId) {
+    // Focus notes textarea
+    const ta = document.getElementById(`notes-${selId}`);
+    if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); return; }
+  }
   // j/k navigation
   if (e.key === 'j' || e.key === 'ArrowDown') {
     e.preventDefault();
@@ -3295,7 +3324,10 @@ function renderCollections() {
   const rows = collections.map(c => {
     const act = activeColl === c.id ? ' active' : '';
     return `<div class="coll-item${act}" data-id="${c.id}" onclick="selectCollection(${c.id})"
-        ondblclick="event.stopPropagation();startCollRename(${c.id},${JSON.stringify(c.name)},this)">
+        ondblclick="event.stopPropagation();startCollRename(${c.id},${JSON.stringify(c.name)},this)"
+        ondragover="event.preventDefault();this.classList.add('drag-over')"
+        ondragleave="this.classList.remove('drag-over')"
+        ondrop="event.preventDefault();this.classList.remove('drag-over');dropRefToCollection(event,${c.id})">
       <span class="coll-item-name">📁 ${esc(c.name)}</span>
       <span class="coll-count">${c.ref_count || ''}</span>
       <button class="coll-del" title="Delete collection"
@@ -3397,6 +3429,7 @@ function renderList() {
       ? `<div style="font-size:11px;color:var(--muted);margin-top:3px;line-height:1.4">${esc(ref.abstract.slice(0,130))}${ref.abstract.length>130?'…':''}</div>` : '';
     const venueRow = expanded && venue ? ` · ${esc(venue)}` : '';
     return `<div class="ref-card${act}" data-id="${ref.id}" onclick="cardClick(event,'${ref.id}')"
+        draggable="true" ondragstart="dragRefStart(event,'${ref.id}')"
         style="position:relative;${pinStyle}${expanded ? 'padding:10px 14px;' : ''}">
       <input type="checkbox" class="ref-card-cb" ${isSel ? 'checked' : ''}
              onclick="event.stopPropagation();toggleSel('${ref.id}',this.checked)"
@@ -4734,6 +4767,37 @@ _postSelectHooks.push(ref => {
 
 // Initialize recently viewed on load
 setTimeout(renderRecentRefs, 800);
+
+// ── Drag-drop ref → collection ────────────────────────────────────────────
+let _dragRefId = null;
+function dragRefStart(e, refId) {
+  _dragRefId = refId;
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', refId);
+}
+
+async function dropRefToCollection(e, collId) {
+  const refId = e.dataTransfer.getData('text/plain') || _dragRefId;
+  _dragRefId = null;
+  if (!refId) return;
+  try {
+    await apiFetch(`/api/refs/${refId}/collections`, {
+      method: 'POST',
+      body: JSON.stringify({ collection_id: collId }),
+    });
+    showToast('Added to collection');
+    await loadCollections();
+    // Update local ref if it's the selected one
+    const ref = refs.find(r => r.id === refId);
+    if (ref) {
+      const c = collections.find(c => c.id === collId);
+      if (c && !ref.collections?.find(rc => rc.id === collId)) {
+        ref.collections = [...(ref.collections || []), { id: collId, name: c.name }];
+        if (selId === refId) renderDetail(ref);
+      }
+    }
+  } catch(err) { console.error(err); }
+}
 
 // ── Command Palette ────────────────────────────────────────────────────────
 const CMD_ACTIONS = [
