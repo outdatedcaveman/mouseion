@@ -646,6 +646,57 @@ def find_duplicates():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/refs/merge", methods=["POST"])
+def merge_refs():
+    """Merge two duplicate references: keep the one with higher completeness,
+    copy any missing fields from the other, then delete the weaker one."""
+    body = request.json or {}
+    keep_id = body.get("keep_id", "").strip()
+    drop_id = body.get("drop_id", "").strip()
+    if not keep_id or not drop_id or keep_id == drop_id:
+        return jsonify({"error": "keep_id and drop_id are required and must differ"}), 400
+    try:
+        import json as _json
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            keep = db.get(keep_id)
+            drop = db.get(drop_id)
+            if keep is None or drop is None:
+                abort(404)
+            # Merge: fill in missing fields on keep from drop
+            keep_upd: dict = {}
+            if not keep.title and drop.title:
+                keep_upd["title"] = drop.title
+            if not keep.year and drop.year:
+                keep_upd["year"] = drop.year
+            if not keep.journal and drop.journal:
+                keep_upd["journal"] = drop.journal
+            if not keep.abstract and drop.abstract:
+                keep_upd["abstract"] = drop.abstract
+            if not keep.doi and drop.doi:
+                keep_upd["title"] = keep.title  # just trigger update
+            if keep_upd:
+                db.update_ref_fields(keep_id, **keep_upd)  # type: ignore[arg-type]
+            # Merge tags
+            keep_tags = set(db.get_tags(keep_id))
+            drop_tags = set(db.get_tags(drop_id))
+            new_tags = drop_tags - keep_tags
+            if new_tags:
+                db.add_tags(keep_id, list(new_tags))
+            # Move the drop ref's notes into keep if keep has none
+            keep_extra = db.get_extra(keep_id)
+            drop_extra = db.get_extra(drop_id)
+            if not keep_extra.get("notes") and drop_extra.get("notes"):
+                db.update_ref_fields(keep_id, notes=drop_extra["notes"])
+            # Delete the weaker ref
+            conn = db._conn
+            conn.execute("DELETE FROM refs WHERE id = ?", (drop_id,))
+            conn.commit()
+        return jsonify({"ok": True, "kept": keep_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/refs/<ref_id>/pdf")
 def get_ref_pdf(ref_id: str):
     """Serve or redirect to the PDF for a reference.
@@ -1913,6 +1964,13 @@ kbd {
 .dup-ref-info { flex: 1; min-width: 0; }
 .dup-ref-title { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dup-ref-meta  { color: var(--muted); font-size: 11px; }
+/* ── Author links ── */
+.author-link {
+  color: var(--primary); cursor: pointer; text-decoration: none;
+  border-bottom: 1px dotted var(--primary);
+}
+.author-link:hover { border-bottom-style: solid; }
+
 /* ── Fullscreen detail ── */
 .detail.fullscreen {
   position: fixed !important; inset: 0; z-index: 7000;
@@ -2632,21 +2690,28 @@ document.getElementById('btn-duplicates').addEventListener('click', async () => 
       list.innerHTML = '<div class="empty"><p style="color:var(--success)">Your library is clean.</p></div>';
       return;
     }
-    hint.textContent = `Found ${groups.length} duplicate group${groups.length > 1 ? 's' : ''} — click a reference to view it`;
-    list.innerHTML = groups.map(g => `
+    hint.textContent = `Found ${groups.length} duplicate group${groups.length > 1 ? 's' : ''} — merge or delete duplicates`;
+    list.innerHTML = groups.map(g => {
+      // Sort group by completeness descending so best is first
+      const sorted = [...g.refs].sort((a,b) => (b.completeness||0) - (a.completeness||0));
+      const bestId = sorted[0]?.id;
+      return `
       <div class="dup-group">
         <div class="dup-reason">⚠ ${esc(g.reason)}</div>
-        ${g.refs.map(r => `
+        ${sorted.map((r, i) => `
           <div class="dup-ref-row">
             <div class="dup-ref-info">
-              <div class="dup-ref-title">${esc(r.title)}</div>
-              <div class="dup-ref-meta">${esc(fmtAuth(r.authors))} · ${r.year||'?'} · completeness ${Math.round(r.completeness*100)}%</div>
+              <div class="dup-ref-title">${esc(r.title)}${i===0?' <span style="color:var(--success);font-size:10px">★ Best</span>':''}</div>
+              <div class="dup-ref-meta">${esc(fmtAuth(r.authors))} · ${r.year||'?'} · ${Math.round(r.completeness*100)}% complete</div>
             </div>
             <button class="btn btn-ghost btn-sm" onclick="simSelect('${r.id}');document.getElementById('dupes-modal').classList.remove('open')">View</button>
+            ${i > 0 ? `<button class="btn btn-ghost btn-sm" style="color:var(--primary)"
+                    onclick="mergeDupes('${bestId}','${r.id}')">⊕ Merge into ★</button>` : ''}
             <button class="btn btn-ghost btn-sm" style="color:var(--error)"
-                    onclick="delRef('${r.id}').then(()=>document.getElementById('btn-duplicates').click())">Delete</button>
+                    onclick="delRef('${r.id}');this.closest('.dup-ref-row').remove()">Delete</button>
           </div>`).join('')}
-      </div>`).join('');
+      </div>`;
+    }).join('');
   } catch(e) {
     hint.textContent = `Error: ${e.message}`;
     list.innerHTML = '';
@@ -3156,12 +3221,16 @@ function cardClick(e, id) {
   selectRef(id);
 }
 
+const _postSelectHooks = [];
 function selectRef(id) {
   selId = id;
   document.querySelectorAll('.ref-card').forEach(c =>
     c.classList.toggle('active', c.dataset.id === id));
   const ref = refs.find(r => r.id === id);
-  if (ref) renderDetail(ref);
+  if (ref) {
+    renderDetail(ref);
+    setTimeout(() => _postSelectHooks.forEach(fn => fn(ref)), 60);
+  }
 }
 
 // ── Detail panel ───────────────────────────────────────────────────────────
@@ -3545,15 +3614,6 @@ function updateSelToolbar() {
     tb.classList.remove('visible');
     ct.textContent = '';
   }
-}
-async function batchTagPrompt() {
-  const tag = prompt('Tag to add to selected references:');
-  if (!tag?.trim()) return;
-  await apiFetch('/api/batch', {
-    method: 'POST',
-    body: JSON.stringify({ ref_ids: [...selectedIds], action: 'tag', tag: tag.trim().toLowerCase() }),
-  });
-  clearSel(); await loadRefs();
 }
 async function batchStatusPrompt() {
   const s = prompt('Set status for selected (unread / reading / read):');
@@ -4229,6 +4289,177 @@ function setTypeChip(val) {
 
 // Run after initial render
 setTimeout(injectTypeChips, 500);
+
+// ── Duplicate merge ───────────────────────────────────────────────────────
+async function mergeDupes(keepId, dropId) {
+  try {
+    const r = await apiFetch('/api/refs/merge', {
+      method: 'POST',
+      body: JSON.stringify({ keep_id: keepId, drop_id: dropId }),
+    });
+    if (!r.ok) { const e = await r.json(); alert('Merge failed: ' + (e.error || r.status)); return; }
+    showToast('Merged successfully — library reloaded');
+    // Refresh duplicates modal
+    document.getElementById('btn-duplicates').click();
+    await loadRefs();
+  } catch(e) { alert('Merge error: ' + e.message); }
+}
+
+// ── Author click-to-search ────────────────────────────────────────────────
+function patchDetailAuthors(ref) {
+  const authEl = document.getElementById(`ef-authors-${ref.id}`);
+  if (!authEl) return;
+  const rawAuthors = ref.authors.map(a =>
+    a.given ? `${a.family}, ${a.given}` : a.family).filter(Boolean);
+  if (!rawAuthors.length) return;
+  authEl.innerHTML = rawAuthors.map((a, i) =>
+    `<span class="author-link" onclick="searchAuthor(${JSON.stringify(a)})" title="Search by this author">${esc(a)}</span>${i < rawAuthors.length - 1 ? '; ' : ''}`
+  ).join('') + (ref.year ? ` (${ref.year})` : '');
+}
+
+function searchAuthor(authorName) {
+  // Search by last name
+  const lastName = authorName.split(',')[0].trim();
+  $search.value = lastName;
+  loadRefs();
+  $search.focus();
+}
+
+// ── Notes markdown preview ────────────────────────────────────────────────
+// Light markdown renderer for notes
+function renderMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    // Bold/italic
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g,'<em>$1</em>')
+    .replace(/_(.+?)_/g,'<em>$1</em>')
+    // Code
+    .replace(/`([^`]+)`/g,'<code style="background:var(--panel);border-radius:3px;padding:1px 4px;font-family:var(--mono);font-size:11px">$1</code>')
+    // Links
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,'<a href="$2" target="_blank" rel="noopener" style="color:var(--primary)">$1</a>')
+    // Bullet lists
+    .replace(/^[-*] (.+)$/gm,'<li>$1</li>')
+    .replace(/(<li>[\s\S]+?<\/li>)/g,'<ul style="margin:4px 0 4px 16px;padding:0">$1</ul>')
+    // Headings
+    .replace(/^### (.+)$/gm,'<h4 style="margin:8px 0 4px;font-size:13px;color:var(--text)">$1</h4>')
+    .replace(/^## (.+)$/gm,'<h3 style="margin:10px 0 4px;font-size:14px;color:var(--text)">$1</h3>')
+    // Line breaks
+    .replace(/\n\n/g,'<br><br>')
+    .replace(/\n/g,'<br>');
+}
+
+// Patch saveNotes to add a preview toggle button next to notes
+const _origSaveNotes = saveNotes;
+function patchNotesArea(refId) {
+  const ta = document.getElementById(`notes-${refId}`);
+  const st = document.getElementById(`notes-st-${refId}`);
+  if (!ta || !st || document.getElementById(`notes-preview-btn-${refId}`)) return;
+  const btn = document.createElement('button');
+  btn.id = `notes-preview-btn-${refId}`;
+  btn.className = 'btn btn-ghost btn-sm';
+  btn.style.cssText = 'margin-top:4px;font-size:11px';
+  btn.textContent = '👁 Preview';
+  btn.onclick = () => toggleNotesPreview(refId);
+  st.parentNode.insertBefore(btn, st.nextSibling);
+}
+
+let _notesPreviewMode = {};
+function toggleNotesPreview(refId) {
+  const ta = document.getElementById(`notes-${refId}`);
+  const btn = document.getElementById(`notes-preview-btn-${refId}`);
+  if (!ta) return;
+  if (_notesPreviewMode[refId]) {
+    // Switch back to edit
+    const preview = document.getElementById(`notes-preview-${refId}`);
+    if (preview) preview.remove();
+    ta.style.display = '';
+    if (btn) btn.textContent = '👁 Preview';
+    _notesPreviewMode[refId] = false;
+  } else {
+    // Show preview
+    const html = renderMarkdown(ta.value);
+    const div = document.createElement('div');
+    div.id = `notes-preview-${refId}`;
+    div.style.cssText = 'font-size:12px;line-height:1.6;color:var(--text);padding:8px 10px;' +
+      'background:var(--panel);border:1px solid var(--border);border-radius:var(--r);min-height:60px;margin-bottom:4px';
+    div.innerHTML = html || '<span style="color:var(--muted)">No notes yet.</span>';
+    ta.style.display = 'none';
+    ta.parentNode.insertBefore(div, ta);
+    if (btn) btn.textContent = '✏ Edit';
+    _notesPreviewMode[refId] = true;
+  }
+}
+
+// Register post-select hooks
+_postSelectHooks.push(ref => patchNotesArea(ref.id));
+_postSelectHooks.push(ref => patchDetailAuthors(ref));
+
+// ── Ref pinning ────────────────────────────────────────────────────────────
+let _pinnedRefs = new Set(JSON.parse(localStorage.getItem('zt-pinned') || '[]'));
+
+function togglePin(refId) {
+  if (_pinnedRefs.has(refId)) {
+    _pinnedRefs.delete(refId);
+    showToast('Unpinned');
+  } else {
+    _pinnedRefs.add(refId);
+    showToast('Pinned to top');
+  }
+  localStorage.setItem('zt-pinned', JSON.stringify([..._pinnedRefs]));
+  applySort();
+  renderList();
+}
+
+// Extend applySort to put pinned refs first
+const _origApplySort = applySort;
+function applySort() {
+  _origApplySort();
+  if (_pinnedRefs.size) {
+    refs.sort((a, b) => {
+      const ap = _pinnedRefs.has(a.id) ? 0 : 1;
+      const bp = _pinnedRefs.has(b.id) ? 0 : 1;
+      return ap - bp;
+    });
+  }
+}
+
+// Extend renderList to show pin indicator
+const _origRenderList = renderList;
+function renderList() {
+  _origRenderList();
+  // Add pin buttons to cards
+  document.querySelectorAll('.ref-card').forEach(card => {
+    const id = card.dataset.id;
+    if (!id) return;
+    const pinned = _pinnedRefs.has(id);
+    const existingPin = card.querySelector('.pin-btn');
+    if (existingPin) return;
+    const btn = document.createElement('button');
+    btn.className = 'pin-btn';
+    btn.title = pinned ? 'Unpin' : 'Pin to top';
+    btn.textContent = '📌';
+    btn.style.cssText = 'display:none;position:absolute;top:6px;right:6px;background:none;border:none;cursor:pointer;font-size:12px;padding:0;opacity:.6';
+    btn.onclick = e => { e.stopPropagation(); togglePin(id); };
+    card.style.position = 'relative';
+    card.appendChild(btn);
+    if (pinned) {
+      btn.style.display = 'block';
+      card.style.borderLeft = '3px solid var(--warning)';
+    }
+  });
+  // Show pin button on hover via CSS workaround
+  document.querySelectorAll('.ref-card').forEach(c => {
+    c.addEventListener('mouseenter', () => {
+      const b = c.querySelector('.pin-btn'); if (b) b.style.display = 'block';
+    });
+    c.addEventListener('mouseleave', () => {
+      const b = c.querySelector('.pin-btn');
+      if (b && !_pinnedRefs.has(c.dataset.id)) b.style.display = 'none';
+    });
+  });
+}
 
 // ── Init additions ─────────────────────────────────────────────────────────
 (async () => {
