@@ -776,6 +776,147 @@ def update_tag(tag_name: str):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/export/csv")
+def export_csv():
+    """Export references as CSV — useful for spreadsheet import."""
+    import csv
+    import io
+    collection_id = request.args.get("collection_id")
+    ref_ids_param = request.args.get("ref_ids", "")
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            if ref_ids_param:
+                ids  = [i.strip() for i in ref_ids_param.split(",") if i.strip()]
+                refs = [r for r in (db.get(i) for i in ids) if r is not None]
+            elif collection_id:
+                refs = db.list_collection_refs(int(collection_id), limit=10_000)
+            else:
+                refs = db.list_all(limit=10_000)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "cite_key", "title", "authors", "year", "journal", "volume", "issue",
+            "pages", "doi", "arxiv_id", "pmid", "url", "abstract",
+            "type", "open_access", "citation_count", "keywords",
+        ])
+        for ref in refs:
+            writer.writerow([
+                ref.cite_key or ref.auto_cite_key(),
+                ref.title or "",
+                "; ".join(a.full_name for a in ref.authors),
+                ref.year or "",
+                ref.journal or ref.container_title or "",
+                ref.volume or "",
+                ref.issue or "",
+                ref.pages or "",
+                ref.doi or "",
+                ref.arxiv_id or "",
+                ref.pmid or "",
+                ref.url or ref.oa_url or "",
+                (ref.abstract or "").replace("\n", " "),
+                ref.ref_type.value,
+                "yes" if ref.open_access else "",
+                ref.citation_count or "",
+                "; ".join(ref.keywords),
+            ])
+        content = buf.getvalue()
+        return Response(content, mimetype="text/csv",
+                        headers={"Content-Disposition": 'attachment; filename="refs.csv"'})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/enrich-incomplete", methods=["POST"])
+def enrich_incomplete():
+    """
+    Background job: re-enrich all refs with completeness below a threshold.
+    Body: { "threshold": 0.5, "limit": 100 }
+    """
+    body      = request.json or {}
+    threshold = float(body.get("threshold", 0.5))
+    limit     = min(int(body.get("limit", 100)), 500)
+    job_id    = uuid.uuid4().hex[:10]
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "running", "message": "Finding incomplete refs…", "count": 0}
+
+    def _worker():
+        try:
+            import anyio
+            from .db     import RefDatabase
+            from .lookup import enrich_batch
+            from .tagger import auto_tag, tag_from_keywords
+            from .config import get_config
+
+            with RefDatabase() as db:
+                all_refs = db.list_all(limit=10_000)
+                targets  = [r for r in all_refs if r.completeness < threshold][:limit]
+
+            if not targets:
+                with _jobs_lock:
+                    _jobs[job_id] = {"status": "done", "count": 0,
+                                     "message": "All refs already complete!"}
+                return
+
+            with _jobs_lock:
+                _jobs[job_id]["message"] = f"Enriching {len(targets)} references…"
+
+            async def _run():
+                return await enrich_batch(targets)
+
+            enriched = anyio.run(_run)
+            cfg      = get_config()
+            with RefDatabase() as db:
+                for ref in enriched:
+                    tags = list(set(auto_tag(ref, cfg) + tag_from_keywords(ref)))
+                    db.upsert(ref, tags=tags)
+
+            n = len(enriched)
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "done", "count": n,
+                                 "message": f"Enriched {n} reference{'s' if n != 1 else ''}"}
+        except Exception as e:
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "error", "message": str(e)}
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"job_id": job_id}), 202
+
+
+@app.route("/api/refs/search/similar", methods=["POST"])
+def find_similar_to_text():
+    """
+    Find library refs semantically similar to an arbitrary text passage.
+    Body: { "text": "...", "n": 8 }
+    """
+    body = request.json or {}
+    text = body.get("text", "").strip()
+    n    = min(int(body.get("n", 8)), 20)
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    try:
+        from .semantic import SemanticIndex
+        from .db import RefDatabase
+        idx   = SemanticIndex()
+        pairs = idx.search(text, n=n)
+        if not pairs:
+            return jsonify([])
+        with RefDatabase() as db:
+            results = []
+            for sid, score in pairs:
+                ref = db.get(sid)
+                if ref:
+                    tags = db.get_tags(sid)
+                    d = _ref_to_dict(ref, tags, sid)
+                    d["similarity"] = round(score, 3)
+                    results.append(d)
+        return jsonify(results)
+    except RuntimeError as e:
+        return jsonify({"error": str(e), "not_indexed": True}), 503
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------------------------------------------------------------------------
 # Streaming API — Zotero real-time sync background thread
 # ---------------------------------------------------------------------------
@@ -1665,11 +1806,13 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
         <div class="dd-item" data-fmt="bibtex">BibTeX (.bib)</div>
         <div class="dd-item" data-fmt="ris">RIS (.ris)</div>
         <div class="dd-item" data-fmt="markdown">Markdown (.md)</div>
+        <div class="dd-item" data-fmt="csv">CSV (.csv)</div>
         <div class="dd-item" id="dd-export-coll" data-fmt="bibtex" style="display:none">📁 Export Collection (.bib)</div>
       </div>
     </div>
     <button class="btn btn-ghost" id="btn-duplicates" title="Find duplicate references">⚡ Dupes</button>
     <button class="btn btn-ghost" id="btn-stats" title="Library analytics">📊 Stats</button>
+    <button class="btn btn-ghost" id="btn-enrich-all" title="Re-enrich incomplete references">🔧 Enrich</button>
     <button class="btn btn-ghost" id="btn-settings" title="Settings">⚙</button>
   </div>
 </header>
@@ -2015,13 +2158,18 @@ $ddExport.addEventListener('click', e => e.stopPropagation());
 document.querySelectorAll('.dd-item').forEach(el => {
   el.addEventListener('click', () => {
     const key = getCfg().key;
+    const fmt = el.dataset.fmt;
     let url;
-    if (el.id === 'dd-export-coll' && activeColl != null) {
-      url = apiBase() + `/api/export?fmt=${el.dataset.fmt}&collection_id=${activeColl}`;
+    if (fmt === 'csv') {
+      url = apiBase() + '/api/export/csv';
+      if (activeColl != null) url += `?collection_id=${activeColl}`;
+    } else if (el.id === 'dd-export-coll' && activeColl != null) {
+      url = apiBase() + `/api/export?fmt=${fmt}&collection_id=${activeColl}`;
     } else {
-      url = apiBase() + `/api/export?fmt=${el.dataset.fmt}`;
+      url = apiBase() + `/api/export?fmt=${fmt}`;
     }
-    window.location.href = key ? url + `&api_key=${encodeURIComponent(key)}` : url;
+    const sep = url.includes('?') ? '&' : '?';
+    window.location.href = key ? url + `${sep}api_key=${encodeURIComponent(key)}` : url;
     $ddExport.classList.remove('open');
   });
 });
@@ -2323,6 +2471,32 @@ function renderStats(d) {
     </div>
   </div>`;
 }
+
+// ── Enrich incomplete ────────────────────────────────────────────────────────
+document.getElementById('btn-enrich-all').addEventListener('click', async () => {
+  const threshold = parseFloat(prompt('Enrich refs below completeness (0.0–1.0):', '0.5') || '0.5');
+  if (isNaN(threshold)) return;
+  $statusbar.innerHTML = '<span class="spin"></span>Starting enrichment job…';
+  try {
+    const r   = await apiFetch('/api/enrich-incomplete', {
+      method: 'POST',
+      body: JSON.stringify({ threshold, limit: 100 }),
+    });
+    const { job_id } = await r.json();
+    const timer = setInterval(async () => {
+      const jr  = await apiFetch(`/api/jobs/${job_id}`);
+      const job = await jr.json();
+      $statusbar.innerHTML = job.status === 'running'
+        ? `<span class="spin"></span>${esc(job.message)}`
+        : esc(job.message);
+      if (job.status !== 'running') {
+        clearInterval(timer);
+        await loadRefs();
+        setTimeout(() => renderStatus(), 2000);
+      }
+    }, 900);
+  } catch(e) { renderStatus(); }
+});
 
 // ── Advanced filter panel ─────────────────────────────────────────────────────
 const advFilter = { yearFrom: null, yearTo: null, statuses: new Set(), hasPdf: false, tags: new Set() };
@@ -2714,11 +2888,12 @@ function renderDetail(ref) {
       <hr class="div">
     ` : ''}
 
-    <div class="section-label">Quality</div>
+    <div class="section-label">Quality & Info</div>
     <div class="comp-row">
       <div class="bar"><div class="bar-fill ${bc}" style="width:${pct}%"></div></div>
       <span>${pct}% complete</span>
       ${ref.citation_count != null ? `<span>· ${ref.citation_count.toLocaleString()} citations</span>` : ''}
+      ${ref.abstract ? `<span>· ~${Math.ceil(ref.abstract.split(/\s+/).length / 200)} min read</span>` : ''}
     </div>
 
     <hr class="div">
