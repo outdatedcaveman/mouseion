@@ -1897,6 +1897,12 @@ kbd {
 .dup-ref-info { flex: 1; min-width: 0; }
 .dup-ref-title { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dup-ref-meta  { color: var(--muted); font-size: 11px; }
+/* ── Toast animation ── */
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 .dup-list { max-height: 60vh; overflow-y: auto; }
 
 /* ── Saved searches / smart sidebar ── */
@@ -1949,6 +1955,34 @@ kbd {
 </head>
 <body>
 
+<!-- ── Toast notification ── -->
+<div id="toast-container" style="position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none"></div>
+
+<!-- ── Hover preview tooltip ── -->
+<div id="hover-preview" style="display:none;position:fixed;z-index:8000;max-width:320px;
+  background:var(--surface);border:1px solid var(--border-hi);border-radius:8px;
+  padding:12px 14px;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.3);pointer-events:none">
+  <div id="hp-title" style="font-weight:600;color:var(--text);margin-bottom:4px;line-height:1.3"></div>
+  <div id="hp-meta" style="color:var(--muted);font-size:11px;margin-bottom:6px"></div>
+  <div id="hp-abstract" style="color:var(--muted);font-size:11px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden"></div>
+</div>
+
+<!-- ── Tag Management Modal ── -->
+<div class="overlay" id="tags-modal">
+  <div class="modal-box" style="width:560px;max-height:80vh;overflow:hidden;display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h2 style="margin:0">🏷 Tag Manager</h2>
+      <button class="close-btn" onclick="document.getElementById('tags-modal').classList.remove('open')">✕</button>
+    </div>
+    <div id="tags-manager-list" style="flex:1;overflow-y:auto"></div>
+  </div>
+</div>
+
+<!-- ── Search History Dropdown ── -->
+<div id="search-history-dd" style="display:none;position:absolute;z-index:5000;
+  background:var(--surface);border:1px solid var(--border-hi);border-radius:var(--r);
+  box-shadow:0 4px 16px rgba(0,0,0,.2);min-width:300px;max-width:500px;overflow:hidden"></div>
+
 <!-- ── Header ── -->
 <header>
   <div class="logo">🗂 zoterpile <span>Reference Manager</span></div>
@@ -1977,6 +2011,7 @@ kbd {
     </div>
     <button class="btn btn-ghost" id="btn-duplicates" title="Find duplicate references">⚡ Dupes</button>
     <button class="btn btn-ghost" id="btn-stats" title="Library analytics">📊 Stats</button>
+    <button class="btn btn-ghost" id="btn-tags-mgr" title="Manage tags">🏷 Tags</button>
     <button class="btn btn-ghost" id="btn-enrich-all" title="Re-enrich incomplete references">🔧 Enrich</button>
     <button class="btn btn-ghost" id="btn-kbd-help" title="Keyboard shortcuts">?</button>
     <button class="btn btn-ghost" id="btn-settings" title="Settings">⚙</button>
@@ -2415,7 +2450,7 @@ document.addEventListener('keydown', e => {
     closeAdd();
     closeSettings();
     $ddExport.classList.remove('open');
-    ['dupes-modal','import-modal','similar-modal','stats-modal','kbd-modal','kanban-modal'].forEach(id => {
+    ['dupes-modal','import-modal','similar-modal','stats-modal','kbd-modal','kanban-modal','tags-modal'].forEach(id => {
       document.getElementById(id)?.classList.remove('open');
     });
     cancelEdit(selId);  // cancel any active edit
@@ -3598,15 +3633,6 @@ async function rmTag(refId, tag) {
 }
 
 // ── Delete ─────────────────────────────────────────────────────────────────
-async function delRef(refId) {
-  const ref = refs.find(r => r.id === refId);
-  if (!confirm(`Delete "${ref?.title || 'this reference'}"?\nThis cannot be undone.`)) return;
-  await apiFetch(`/api/refs/${refId}`, { method: 'DELETE' });
-  selId = null;
-  $detail.innerHTML = '<div class="detail-ph">Select a reference to see details</div>';
-  await loadRefs();
-}
-
 // ── Add modal ──────────────────────────────────────────────────────────────
 function openAdd() {
   $addModal.classList.add('open');
@@ -3914,6 +3940,196 @@ async function batchTagPrompt() {
   });
   clearSel(); await loadRefs();
 }
+
+// ── Toast notifications ────────────────────────────────────────────────────
+function showToast(msg, opts = {}) {
+  const { duration = 3500, action = null, actionLabel = 'Undo' } = opts;
+  const $c = document.getElementById('toast-container');
+  const id = `toast-${Date.now()}`;
+  const div = document.createElement('div');
+  div.id = id;
+  div.style.cssText = 'pointer-events:auto;background:var(--panel);border:1px solid var(--border-hi);' +
+    'border-radius:8px;padding:10px 14px;font-size:13px;color:var(--text);display:flex;' +
+    'align-items:center;gap:10px;box-shadow:0 4px 16px rgba(0,0,0,.3);' +
+    'animation:fadeInUp .2s ease;max-width:360px';
+  const btnHtml = action
+    ? `<button style="background:var(--primary);border:none;color:#fff;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;font-family:var(--font)" onclick="this.closest('#${id}')._undoAction?.()">${actionLabel}</button>`
+    : '';
+  div.innerHTML = `<span style="flex:1">${msg}</span>${btnHtml}
+    <button onclick="this.parentElement.remove()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;line-height:1;padding:0">✕</button>`;
+  if (action) div._undoAction = action;
+  $c.appendChild(div);
+  setTimeout(() => div.remove(), duration);
+  return div;
+}
+
+// ── Undo-safe delete ref ───────────────────────────────────────────────────
+async function delRef(refId) {
+  const ref = refs.find(r => r.id === refId);
+  const title = ref?.title || 'reference';
+  // Remove from local cache immediately
+  refs = refs.filter(r => r.id !== refId);
+  if (selId === refId) {
+    selId = null;
+    $detail.innerHTML = '<div class="detail-ph">Select a reference to see details</div>';
+  }
+  renderList(); renderStatus();
+  let undone = false;
+  showToast(`Deleted: "${title.length > 40 ? title.slice(0,37)+'…' : title}"`, {
+    duration: 5000,
+    actionLabel: 'Undo',
+    action: async () => {
+      undone = true;
+      // Reload refs (server hasn't deleted yet — undo just cancels)
+      await loadRefs();
+      // We'll actually hit the server after 5s only if not undone
+    },
+  });
+  // Delayed server delete — gives 5s for undo
+  await new Promise(res => setTimeout(res, 5000));
+  if (!undone) {
+    await apiFetch(`/api/refs/${refId}`, { method: 'DELETE' });
+  }
+}
+
+// ── Hover preview ─────────────────────────────────────────────────────────
+const $hoverPreview = document.getElementById('hover-preview');
+let _hoverTimer = null;
+let _hoverActive = false;
+
+document.getElementById('ref-list').addEventListener('mouseover', e => {
+  const card = e.target.closest('.ref-card');
+  if (!card) return;
+  const id = card.dataset.id;
+  const ref = refs.find(r => r.id === id);
+  if (!ref?.abstract) return;
+  clearTimeout(_hoverTimer);
+  _hoverTimer = setTimeout(() => {
+    const rect = card.getBoundingClientRect();
+    document.getElementById('hp-title').textContent = ref.title || '';
+    document.getElementById('hp-meta').textContent =
+      [fmtAuth(ref.authors), ref.year, ref.journal || ref.container_title]
+      .filter(Boolean).join(' · ');
+    document.getElementById('hp-abstract').textContent = ref.abstract;
+    $hoverPreview.style.display = 'block';
+    // Position right of card, or left if near edge
+    const x = rect.right + 12;
+    const y = Math.min(rect.top, window.innerHeight - 200);
+    $hoverPreview.style.left = (x + 320 < window.innerWidth ? x : rect.left - 332) + 'px';
+    $hoverPreview.style.top  = y + 'px';
+    _hoverActive = true;
+  }, 600);
+});
+
+document.getElementById('ref-list').addEventListener('mouseout', e => {
+  const card = e.target.closest('.ref-card');
+  if (!card) return;
+  clearTimeout(_hoverTimer);
+  _hoverTimer = setTimeout(() => {
+    $hoverPreview.style.display = 'none';
+    _hoverActive = false;
+  }, 100);
+});
+
+// ── Tag Manager ────────────────────────────────────────────────────────────
+async function openTagManager() {
+  document.getElementById('tags-modal').classList.add('open');
+  await loadTagManager();
+}
+
+async function loadTagManager() {
+  const el = document.getElementById('tags-manager-list');
+  el.innerHTML = '<div class="spin" style="margin:30px auto"></div>';
+  try {
+    const r = await apiFetch('/api/tags');
+    const tags = await r.json();
+    if (!tags.length) { el.innerHTML = '<p style="color:var(--muted);padding:20px;text-align:center">No tags yet.</p>'; return; }
+    el.innerHTML = tags.map(t => {
+      const color = t.color || '#6366f1';
+      const swatch = `<input type="color" value="${color}" title="Tag color"
+        onchange="setTagColor('${esc(t.name)}',this.value);this.parentElement.querySelector('.tm-name').style.color=this.value"
+        style="width:20px;height:20px;padding:0;border:none;border-radius:50%;cursor:pointer;background:none;flex-shrink:0">`;
+      return `<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border)">
+        ${swatch}
+        <span class="tm-name" style="flex:1;color:${color};font-size:13px">${esc(t.name)}</span>
+        <span style="font-size:11px;color:var(--muted);flex-shrink:0">${t.ref_count ?? ''} refs</span>
+        <button class="btn btn-ghost btn-sm" style="color:var(--error);flex-shrink:0"
+          onclick="deleteTag('${esc(t.name)}')">Delete</button>
+      </div>`;
+    }).join('');
+  } catch(e) { el.innerHTML = `<p style="color:var(--error);padding:20px">${esc(e.message)}</p>`; }
+}
+
+async function deleteTag(tagName) {
+  if (!confirm(`Delete tag "${tagName}" from all references? This cannot be undone.`)) return;
+  // Batch-remove from all refs using the batch API
+  const tagRefs = refs.filter(r => r.tags.includes(tagName)).map(r => r.id);
+  if (tagRefs.length) {
+    await apiFetch('/api/batch', {
+      method: 'POST',
+      body: JSON.stringify({ ref_ids: tagRefs, action: 'untag', tag: tagName }),
+    });
+  }
+  await loadRefs();
+  await loadTagManager();
+  delete _tagColorMap[tagName];
+}
+
+document.getElementById('btn-tags-mgr').addEventListener('click', openTagManager);
+
+// ── Search history ─────────────────────────────────────────────────────────
+let _searchHistory = JSON.parse(localStorage.getItem('zt-search-history') || '[]');
+const $searchHistDD = document.getElementById('search-history-dd');
+
+function saveSearchHistory(q) {
+  if (!q) return;
+  _searchHistory = [q, ..._searchHistory.filter(x => x !== q)].slice(0, 12);
+  localStorage.setItem('zt-search-history', JSON.stringify(_searchHistory));
+}
+
+$search.addEventListener('focus', () => {
+  if (!_searchHistory.length) return;
+  renderSearchHistory();
+  const rect = $search.getBoundingClientRect();
+  $searchHistDD.style.top  = (rect.bottom + 4) + 'px';
+  $searchHistDD.style.left = rect.left + 'px';
+  $searchHistDD.style.width = rect.width + 'px';
+  $searchHistDD.style.display = 'block';
+});
+
+$search.addEventListener('blur', () => setTimeout(() => { $searchHistDD.style.display = 'none'; }, 200));
+
+function renderSearchHistory() {
+  $searchHistDD.innerHTML = _searchHistory.map((q, i) =>
+    `<div onclick="applyHistorySearch(${i})" style="padding:7px 12px;cursor:pointer;font-size:13px;
+      display:flex;align-items:center;gap:8px;color:var(--text)"
+      onmouseover="this.style.background='var(--panel)'" onmouseout="this.style.background=''">
+      <span style="color:var(--muted);font-size:11px">🕐</span>
+      <span style="flex:1">${esc(q)}</span>
+      <button onclick="event.stopPropagation();removeHistoryItem(${i})" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:12px">✕</button>
+    </div>`
+  ).join('');
+}
+
+function applyHistorySearch(idx) {
+  $search.value = _searchHistory[idx];
+  $searchHistDD.style.display = 'none';
+  loadRefs();
+}
+
+function removeHistoryItem(idx) {
+  _searchHistory.splice(idx, 1);
+  localStorage.setItem('zt-search-history', JSON.stringify(_searchHistory));
+  renderSearchHistory();
+  if (!_searchHistory.length) $searchHistDD.style.display = 'none';
+}
+
+// Hook into existing search handler to save history
+const _origSearchInput = $search.oninput;
+$search.addEventListener('change', () => {
+  const q = $search.value.trim();
+  if (q.length >= 3) saveSearchHistory(q);
+});
 
 // ── Init additions ─────────────────────────────────────────────────────────
 (async () => {
