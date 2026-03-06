@@ -1561,6 +1561,82 @@ def rotate_api_key():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/settings/webhooks", methods=["GET"])
+def get_webhooks():
+    """Return configured webhook URLs."""
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            raw = db.get_setting("webhooks", "[]")
+        import json as _json
+        hooks = _json.loads(raw) if raw else []
+        return jsonify(hooks)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/webhooks", methods=["POST"])
+def add_webhook():
+    """Add a webhook URL. Body: { "url": "https://..." }"""
+    body = request.json or {}
+    url  = body.get("url", "").strip()
+    if not url or not url.startswith("https://"):
+        return jsonify({"error": "A valid https:// URL is required"}), 400
+    try:
+        import json as _json
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            raw   = db.get_setting("webhooks", "[]")
+            hooks = _json.loads(raw) if raw else []
+            if url not in hooks:
+                hooks.append(url)
+            db.set_setting("webhooks", _json.dumps(hooks))
+        return jsonify({"ok": True, "count": len(hooks)}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings/webhooks", methods=["DELETE"])
+def remove_webhook():
+    """Remove a webhook URL. Body: { "url": "https://..." }"""
+    body = request.json or {}
+    url  = body.get("url", "").strip()
+    try:
+        import json as _json
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            raw   = db.get_setting("webhooks", "[]")
+            hooks = [h for h in _json.loads(raw) if h != url]
+            db.set_setting("webhooks", _json.dumps(hooks))
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _fire_webhooks(event: str, data: dict) -> None:
+    """Fire configured webhooks in a background thread (best-effort, non-blocking)."""
+    def _worker():
+        try:
+            import json as _json, httpx as _httpx
+            from .db import RefDatabase
+            with RefDatabase() as db:
+                raw = db.get_setting("webhooks", "[]")
+            hooks = _json.loads(raw) if raw else []
+            if not hooks:
+                return
+            payload = _json.dumps({"event": event, "data": data})
+            with _httpx.Client(timeout=10) as client:
+                for url in hooks:
+                    try:
+                        client.post(url, content=payload,
+                                    headers={"Content-Type": "application/json"})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 @app.route("/api/refs/check-cite-key")
 def check_cite_key():
     """Check if a cite key is already in use. Returns {available: bool, used_by: id|null}."""
@@ -2413,6 +2489,26 @@ kbd {
   font-family: var(--font); transition: border-color .1s, color .1s;
 }
 .kanban-move-btn:hover { border-color: var(--primary); color: var(--primary); }
+
+/* ── Mobile responsive ── */
+@media (max-width: 768px) {
+  main { flex-direction: column; overflow: hidden; }
+  .sidebar { width: 100%; max-height: 40px; overflow: hidden; transition: max-height .3s; border-right: none; border-bottom: 1px solid var(--border); }
+  .sidebar.mobile-open { max-height: 60vh; overflow-y: auto; }
+  .sidebar-toggle { display: flex; }
+  div[style*="width:340px"] { width: 100% !important; flex-shrink: 0; min-width: 0; }
+  .detail { display: none; }
+  .detail.mobile-visible { display: block; width: 100% !important; }
+  .header { padding: 0 10px; gap: 6px; }
+  .h-title { font-size: 16px; }
+  .btn { padding: 5px 10px; font-size: 12px; }
+  .modal-box { width: 96vw !important; padding: 16px !important; }
+}
+@media (max-width: 480px) {
+  .h-actions { gap: 4px; }
+  .btn { padding: 4px 7px; font-size: 11px; }
+  .rc-title { font-size: 13px; }
+}
 </style>
 </head>
 <body>
@@ -4006,6 +4102,7 @@ function renderDetail(ref) {
           target="_blank" rel="noopener">📄 PDF</a>` : ''}
       <button class="btn btn-ghost btn-sm" onclick="copyDeepLink('${ref.id}')" title="Copy shareable link to this reference">⛓ Share</button>
       ${ref.title ? `<a class="btn btn-ghost btn-sm" href="https://scholar.google.com/scholar?q=${encodeURIComponent(ref.title)}" target="_blank" rel="noopener" title="Search Google Scholar">🎓 Scholar</a>` : ''}
+      ${ref.authors?.length ? `<button class="btn btn-ghost btn-sm" onclick="searchAuthor(${JSON.stringify((ref.authors[0].given?ref.authors[0].family+', '+ref.authors[0].given:ref.authors[0].family))})" title="Find all refs by this author">👤 By author</button>` : ''}
       <button class="btn btn-ghost btn-sm" onclick="showSimilar('${ref.id}')">🔮 Similar</button>
       <button class="btn btn-ghost btn-sm" onclick="reenrich('${ref.id}')">↻ Refresh</button>
       <button class="btn btn-ghost btn-sm"
