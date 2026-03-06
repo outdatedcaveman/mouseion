@@ -18,7 +18,7 @@ import threading
 import uuid
 from typing import Any, Dict, List, Optional
 
-from flask import Flask, Response, abort, jsonify, request
+from flask import Flask, Response, abort, jsonify, redirect, request, send_file
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +242,37 @@ def delete_ref(ref_id: str):
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/refs/<ref_id>/pdf")
+def get_ref_pdf(ref_id: str):
+    """Serve or redirect to the PDF for a reference.
+
+    Priority:
+      1. Google Drive file ID → redirect to Drive viewer
+      2. Local file path (still on disk) → stream to browser
+      3. 404
+    """
+    try:
+        from pathlib import Path as _P
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            extra = db.get_extra(ref_id)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    drive_id = extra.get("pdf_drive_id")
+    if drive_id:
+        from .integrations.google_drive import get_view_url
+        return redirect(get_view_url(drive_id))
+
+    local = extra.get("pdf_local")
+    if local:
+        path = _P(local)
+        if path.exists():
+            return send_file(path, mimetype="application/pdf")
+
+    return jsonify({"error": "PDF not available"}), 404
 
 
 @app.route("/api/export")

@@ -45,6 +45,10 @@ dev = [
     "pytest-httpx>=0.30",
     "respx>=0.21",
 ]
+drive = [
+    "google-api-python-client>=2.100",
+    "google-auth>=2.20",
+]
 
 [project.scripts]
 zoterpile     = "zoterpile.cli:main"

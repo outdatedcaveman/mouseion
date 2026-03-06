@@ -7,10 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ && \
     rm -rf /var/lib/apt/lists/*
 
-# Install package and dependencies
+# Install package and dependencies (including Google Drive extras)
 COPY pyproject.toml README.md ./
 COPY src/ src/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[drive]"
 
 # Persistent volume will be mounted at /data
 RUN mkdir -p /data

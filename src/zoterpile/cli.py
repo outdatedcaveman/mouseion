@@ -914,7 +914,9 @@ def stream_cmd(source, do_enrich):
 @click.option("--email",           default=None, help="Email for Unpaywall (overrides config)")
 @click.option("--concurrency", default=5, show_default=True,
               help="Number of simultaneous download connections")
-def fetch_pdfs(tags, limit, oa_only, email, concurrency):
+@click.option("--to-drive", is_flag=True, default=False,
+              help="Upload each PDF to Google Drive after download and remove the local copy")
+def fetch_pdfs(tags, limit, oa_only, email, concurrency, to_drive):
     """Try to download open-access PDFs for stored references."""
     import asyncio as _aio
     from .db import RefDatabase, _ref_id
@@ -941,8 +943,11 @@ def fetch_pdfs(tags, limit, oa_only, email, concurrency):
 
         async def _one(ref):
             rid = _ref_id(ref)
-            # Skip if already recorded as downloaded.
-            local = extras.get(rid, {}).get("pdf_local")
+            extra = extras.get(rid, {})
+            # Skip if already on Drive (when --to-drive) or already on disk.
+            if to_drive and extra.get("pdf_drive_id"):
+                return None
+            local = extra.get("pdf_local")
             if local:
                 from pathlib import Path as _P
                 if _P(local).exists():
@@ -956,13 +961,81 @@ def fetch_pdfs(tags, limit, oa_only, email, concurrency):
         ok = 0
         with RefDatabase() as db2:
             for ref, path in zip(refs, paths):
-                if path:
+                if not path:
+                    continue
+                if to_drive:
+                    try:
+                        from .integrations.google_drive import upload_pdf as _gd_upload
+                        drive_id = _gd_upload(path, ref)
+                        db2.update_integration_ids(_ref_id(ref), pdf_drive_id=drive_id)
+                        path.unlink(missing_ok=True)
+                    except Exception as exc:
+                        console.print(f"[yellow]Drive upload failed for "
+                                      f"{ref.title or '?'}: {exc}[/yellow]")
+                        db2.update_integration_ids(_ref_id(ref), pdf_local=str(path))
+                else:
                     db2.update_integration_ids(_ref_id(ref), pdf_local=str(path))
-                    ok += 1
+                ok += 1
         return ok
 
     ok = asyncio.run(_run())
-    console.print(f"[green]✓[/green] Downloaded {ok}/{len(refs)} PDFs")
+    dest = "Google Drive" if to_drive else "disk"
+    console.print(f"[green]✓[/green] Downloaded {ok}/{len(refs)} PDFs → {dest}")
+
+
+# ---------------------------------------------------------------------------
+# drive-upload
+# ---------------------------------------------------------------------------
+
+@main.command("drive-upload")
+@click.option("--delete-local", is_flag=True, default=False,
+              help="Remove local copy after a successful Drive upload")
+@click.option("--limit", default=10000, show_default=True)
+def drive_upload(delete_local, limit):
+    """Upload locally stored PDFs to Google Drive.
+
+    Finds all refs that have a local PDF file but no Drive ID and uploads them.
+    Use --delete-local to reclaim disk space afterward.
+    """
+    from pathlib import Path as _P
+    from .db import RefDatabase, _ref_id
+    from .integrations.google_drive import upload_pdf as _gd_upload
+
+    with RefDatabase() as db:
+        refs = db.list_all(limit=limit)
+        rids = [_ref_id(r) for r in refs]
+        extras = db.get_extras_bulk(rids)
+
+    to_upload = [
+        (r, extras[rid]["pdf_local"])
+        for r in refs
+        if (rid := _ref_id(r)) in extras
+        and extras[rid].get("pdf_local")
+        and not extras[rid].get("pdf_drive_id")
+    ]
+
+    if not to_upload:
+        console.print("[yellow]No local PDFs to upload.[/yellow]")
+        return
+
+    console.print(f"[blue]→[/blue] Uploading {len(to_upload)} PDF(s) to Google Drive…")
+    ok = 0
+    with RefDatabase() as db2:
+        for ref, local_path in to_upload:
+            path = _P(local_path)
+            if not path.exists():
+                continue
+            try:
+                drive_id = _gd_upload(path, ref)
+                db2.update_integration_ids(_ref_id(ref), pdf_drive_id=drive_id)
+                if delete_local:
+                    path.unlink(missing_ok=True)
+                ok += 1
+                console.print(f"  [green]✓[/green] {ref.title or path.name}")
+            except Exception as exc:
+                console.print(f"  [red]✗[/red] {ref.title or path.name}: {exc}")
+
+    console.print(f"[green]✓[/green] Uploaded {ok}/{len(to_upload)} PDFs to Drive")
 
 
 # ---------------------------------------------------------------------------
