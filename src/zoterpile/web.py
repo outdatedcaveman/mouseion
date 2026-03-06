@@ -825,6 +825,26 @@ def stats():
         # Reading status
         status_map = {row["s"]: row["c"] for row in status_rows}
 
+        # Reading goal progress (from settings)
+        from .db import RefDatabase as _RDB2
+        with _RDB2() as _db2:
+            goal_monthly = int(_db2.get_setting("reading_goal_monthly", "0") or 0)
+            goal_weekly  = int(_db2.get_setting("reading_goal_weekly", "0") or 0)
+            # Count refs marked 'read' in current month and week
+            import datetime as _dt
+            _now2 = _dt.datetime.utcnow()
+            _month_start = _now2.replace(day=1, hour=0, minute=0, second=0).strftime('%Y-%m-%d')
+            _week_start  = (_now2 - _dt.timedelta(days=_now2.weekday())).replace(
+                hour=0, minute=0, second=0).strftime('%Y-%m-%d')
+            read_month = _db2._conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE status='read' AND updated_at >= ?",
+                (_month_start,)
+            ).fetchone()[0]
+            read_week = _db2._conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE status='read' AND updated_at >= ?",
+                (_week_start,)
+            ).fetchone()[0]
+
         return jsonify({
             "count":            n,
             "avg_completeness": round(avg, 3),
@@ -837,6 +857,12 @@ def stats():
             "top_authors":      top_authors,
             "citation_stats":   citation_stats,
             "status":           status_map,
+            "reading_goal": {
+                "monthly": goal_monthly,
+                "weekly":  goal_weekly,
+                "read_this_month": read_month,
+                "read_this_week":  read_week,
+            },
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1239,6 +1265,60 @@ def delete_saved_search(search_id: int):
         with RefDatabase() as db:
             db.delete_saved_search(search_id)
         return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings", methods=["GET"])
+def get_settings():
+    """Get user settings (reading goal, theme pref, etc.)."""
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            reading_goal_monthly = db.get_setting("reading_goal_monthly", "0")
+            reading_goal_weekly  = db.get_setting("reading_goal_weekly", "0")
+        return jsonify({
+            "reading_goal_monthly": int(reading_goal_monthly or 0),
+            "reading_goal_weekly":  int(reading_goal_weekly or 0),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/settings", methods=["PATCH"])
+def update_settings():
+    """Update user settings."""
+    body = request.json or {}
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            if "reading_goal_monthly" in body:
+                db.set_setting("reading_goal_monthly", str(int(body["reading_goal_monthly"])))
+            if "reading_goal_weekly" in body:
+                db.set_setting("reading_goal_weekly", str(int(body["reading_goal_weekly"])))
+        return jsonify({"ok": True})
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": "Goal values must be integers"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/refs/check-cite-key")
+def check_cite_key():
+    """Check if a cite key is already in use. Returns {available: bool, used_by: id|null}."""
+    key = request.args.get("key", "").strip()
+    if not key:
+        return jsonify({"error": "key is required"}), 400
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            conn = db._conn
+            row = conn.execute(
+                "SELECT id FROM refs WHERE cite_key = ? LIMIT 1", (key,)
+            ).fetchone()
+        if row:
+            return jsonify({"available": False, "used_by": row["id"]})
+        return jsonify({"available": True, "used_by": None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2822,6 +2902,38 @@ function renderStats(d) {
       <h4>Top Authors</h4>
       <div class="bar-chart">${topN(d.top_authors, 'count', 6)}</div>
     </div>
+    ${d.reading_goal ? (() => {
+      const g = d.reading_goal;
+      const mPct = g.monthly > 0 ? Math.min(100, Math.round(g.read_this_month / g.monthly * 100)) : 0;
+      const wPct = g.weekly  > 0 ? Math.min(100, Math.round(g.read_this_week  / g.weekly  * 100)) : 0;
+      return `<div class="stats-card" style="grid-column:1/-1">
+        <h4 style="display:flex;align-items:center;justify-content:space-between">
+          Reading Goals
+          <button class="btn btn-ghost btn-sm" onclick="editReadingGoals()">⚙ Set goals</button>
+        </h4>
+        ${g.monthly > 0 ? `
+        <div style="margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+            <span>Monthly: ${g.read_this_month} / ${g.monthly} papers</span>
+            <span style="color:${mPct>=100?'var(--success)':'var(--muted)'}">${mPct}%</span>
+          </div>
+          <div style="height:10px;background:var(--border);border-radius:5px;overflow:hidden">
+            <div style="height:100%;width:${mPct}%;background:${mPct>=100?'var(--success)':'var(--primary)'};border-radius:5px;transition:width .4s"></div>
+          </div>
+        </div>` : ''}
+        ${g.weekly > 0 ? `
+        <div>
+          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+            <span>Weekly: ${g.read_this_week} / ${g.weekly} papers</span>
+            <span style="color:${wPct>=100?'var(--success)':'var(--muted)'}">${wPct}%</span>
+          </div>
+          <div style="height:10px;background:var(--border);border-radius:5px;overflow:hidden">
+            <div style="height:100%;width:${wPct}%;background:${wPct>=100?'var(--success)':'var(--warning)'};border-radius:5px;transition:width .4s"></div>
+          </div>
+        </div>` : ''}
+        ${g.monthly === 0 && g.weekly === 0 ? '<p style="color:var(--muted);font-size:12px;margin:4px 0">No reading goals set. Click ⚙ Set goals to add one.</p>' : ''}
+      </div>`;
+    })() : ''}
   </div>`;
 }
 
@@ -4533,6 +4645,47 @@ _postSelectHooks.push(ref => {
 
 // Initialize recently viewed on load
 setTimeout(renderRecentRefs, 800);
+
+// ── Reading goals ─────────────────────────────────────────────────────────
+async function editReadingGoals() {
+  const monthly = prompt('Monthly reading goal (papers per month, 0 to disable):',
+    '');
+  if (monthly === null) return;
+  const weekly = prompt('Weekly reading goal (papers per week, 0 to disable):', '');
+  if (weekly === null) return;
+  try {
+    await apiFetch('/api/settings', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        reading_goal_monthly: parseInt(monthly) || 0,
+        reading_goal_weekly:  parseInt(weekly) || 0,
+      }),
+    });
+    showToast('Reading goals updated');
+    // Refresh stats
+    document.getElementById('btn-stats').click();
+  } catch(e) { alert('Failed to save goals: ' + e.message); }
+}
+
+// ── Cite-key uniqueness checker ───────────────────────────────────────────
+// Hook: after user edits cite_key via startEdit, check uniqueness
+const _origCommitEdit = commitEdit;
+async function commitEdit(refId, field) {
+  if (field === 'cite_key') {
+    const inp = document.getElementById('edit-active-inp');
+    if (inp) {
+      const newKey = inp.value.trim();
+      if (newKey) {
+        const r = await apiFetch(`/api/refs/check-cite-key?key=${encodeURIComponent(newKey)}`);
+        const data = await r.json();
+        if (!data.available && data.used_by !== refId) {
+          if (!confirm(`Cite key "${newKey}" is already used by another reference. Use it anyway?`)) return;
+        }
+      }
+    }
+  }
+  return _origCommitEdit(refId, field);
+}
 
 // ── Init additions ─────────────────────────────────────────────────────────
 (async () => {
