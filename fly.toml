@@ -1,0 +1,37 @@
+# fly.toml — Fly.io deployment config for zoterpile
+# Docs: https://fly.io/docs/reference/configuration/
+#
+# One-time setup:
+#   fly auth login
+#   fly apps create zoterpile          # pick a unique name
+#   fly volumes create zoterpile_data --size 3 --region iad
+#   fly deploy
+#
+# After first deploy, grab your API key from the startup logs:
+#   fly logs
+#
+# To set secret env vars (API keys for CrossRef, S2, etc.):
+#   fly secrets set ZOTERPILE_CROSSREF_EMAIL=you@example.com
+#   fly secrets set ZOTERPILE_S2_API_KEY=...
+
+app = "zoterpile"          # change this to your chosen app name
+primary_region = "iad"     # Washington DC — change to nearest region
+
+[build]
+  # Uses the Dockerfile in the repo root
+
+[mounts]
+  source      = "zoterpile_data"   # volume name created above
+  destination = "/data"            # DB + config land here
+
+[http_service]
+  internal_port       = 8080
+  force_https         = true
+  auto_stop_machines  = "off"      # never sleep
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  memory   = "256mb"
+  cpu_kind = "shared"
+  cpus     = 1

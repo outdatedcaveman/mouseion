@@ -1,0 +1,13 @@
+.git
+.github
+.env
+*.pyc
+__pycache__
+*.egg-info
+.eggs
+dist
+build
+tests/
+browser_extension/
+*.md
+!README.md
