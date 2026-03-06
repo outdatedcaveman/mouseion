@@ -381,6 +381,13 @@ class RefDatabase:
     _MIGRATIONS = [
         "ALTER TABLE refs ADD COLUMN notes  TEXT",
         "ALTER TABLE refs ADD COLUMN status TEXT DEFAULT 'unread'",
+        """CREATE TABLE IF NOT EXISTS saved_searches (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL,
+            query      TEXT NOT NULL DEFAULT '',
+            filters    TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now'))
+        )""",
     ]
 
     def __init__(self, path: Optional[str | Path] = None) -> None:
@@ -1117,6 +1124,29 @@ class RefDatabase:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, str(value)),
             )
+
+    # -----------------------------------------------------------------------
+    # Saved searches
+    # -----------------------------------------------------------------------
+
+    def list_saved_searches(self) -> List[Dict[str, Any]]:
+        with self._db() as conn:
+            cur = conn.execute(
+                "SELECT id, name, query, filters, created_at FROM saved_searches ORDER BY name"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def create_saved_search(self, name: str, query: str, filters: str) -> int:
+        with self._db() as conn:
+            cur = conn.execute(
+                "INSERT INTO saved_searches (name, query, filters) VALUES (?, ?, ?)",
+                (name, query, filters),
+            )
+            return cur.lastrowid  # type: ignore[return-value]
+
+    def delete_saved_search(self, search_id: int) -> None:
+        with self._db() as conn:
+            conn.execute("DELETE FROM saved_searches WHERE id = ?", (search_id,))
 
 
 # ---------------------------------------------------------------------------

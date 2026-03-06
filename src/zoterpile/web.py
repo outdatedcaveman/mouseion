@@ -1153,6 +1153,45 @@ def _notion_webhook_secret() -> Optional[str]:
 # PWA support — manifest, service worker, icon
 # ---------------------------------------------------------------------------
 
+@app.route("/api/saved-searches", methods=["GET"])
+def list_saved_searches():
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            return jsonify(db.list_saved_searches())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/saved-searches", methods=["POST"])
+def create_saved_search():
+    import json as _json
+    body = request.json or {}
+    name = body.get("name", "").strip()
+    query = body.get("query", "")
+    filters = body.get("filters", {})
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            sid = db.create_saved_search(name, query, _json.dumps(filters))
+        return jsonify({"ok": True, "id": sid}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/saved-searches/<int:search_id>", methods=["DELETE"])
+def delete_saved_search(search_id: int):
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            db.delete_saved_search(search_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
@@ -1859,6 +1898,53 @@ kbd {
 .dup-ref-title { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dup-ref-meta  { color: var(--muted); font-size: 11px; }
 .dup-list { max-height: 60vh; overflow-y: auto; }
+
+/* ── Saved searches / smart sidebar ── */
+.coll-section-header {
+  padding: 8px 12px 4px; font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .6px; font-weight: 600;
+  border-top: 1px solid var(--border); margin-top: 4px;
+}
+.coll-save-search {
+  padding: 6px 12px; cursor: pointer; border-top: 1px solid var(--border);
+}
+.coll-save-search:hover { background: var(--panel); }
+.coll-item-inline-edit {
+  flex: 1; background: var(--panel); border: 1px solid var(--primary);
+  border-radius: 4px; padding: 1px 5px; font-size: 13px; color: var(--text);
+  outline: none; font-family: var(--font); min-width: 0;
+}
+
+/* ── Kanban board ── */
+.kanban-col {
+  flex: 1; min-width: 260px; max-width: 340px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); display: flex; flex-direction: column; overflow: hidden;
+}
+.kanban-col-header {
+  padding: 10px 12px; font-size: 12px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .5px;
+  display: flex; justify-content: space-between; align-items: center;
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.kanban-col-items {
+  flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px;
+}
+.kanban-card {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; cursor: pointer;
+  transition: border-color .15s, box-shadow .15s;
+}
+.kanban-card:hover { border-color: var(--border-hi); box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+.kanban-card-title { font-size: 12px; color: var(--text); line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.kanban-card-meta { font-size: 10px; color: var(--muted); margin-top: 4px; }
+.kanban-move-btn {
+  font-size: 11px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 4px; padding: 2px 6px; cursor: pointer; color: var(--muted);
+  font-family: var(--font); transition: border-color .1s, color .1s;
+}
+.kanban-move-btn:hover { border-color: var(--primary); color: var(--primary); }
 </style>
 </head>
 <body>
@@ -1903,13 +1989,21 @@ kbd {
   <div class="coll-sidebar">
     <div class="coll-header">
       Collections
-      <button class="coll-new-btn" id="btn-coll-new" title="New collection">＋</button>
+      <div style="display:flex;gap:4px;align-items:center">
+        <button class="coll-new-btn" id="btn-kanban-toggle" title="Toggle kanban reading board" style="font-size:14px">⊞</button>
+        <button class="coll-new-btn" id="btn-coll-new" title="New collection">＋</button>
+      </div>
     </div>
     <div class="coll-list" id="coll-list">
       <div class="coll-item active" data-id="" onclick="selectCollection(null)">
         <span class="coll-item-name">📚 All References</span>
         <span class="coll-count" id="all-count"></span>
       </div>
+    </div>
+    <div class="coll-section-header">Smart Searches</div>
+    <div class="coll-list" id="saved-search-list" style="max-height:180px"></div>
+    <div class="coll-item coll-save-search" id="btn-save-search" onclick="saveCurrentSearch()">
+      <span style="color:var(--muted);font-size:12px">＋ Save current search</span>
     </div>
   </div>
 
@@ -2016,6 +2110,17 @@ kbd {
       <button class="btn btn-ghost" id="btn-cfg-test">Test connection</button>
       <button class="btn btn-primary" id="btn-cfg-save">Save</button>
     </div>
+  </div>
+</div>
+
+<!-- ── Kanban Reading Board ── -->
+<div class="overlay" id="kanban-modal">
+  <div class="modal-box" style="width:min(95vw,1100px);max-height:80vh;overflow:hidden;display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h2 style="margin:0">⊞ Reading Board</h2>
+      <button class="close-btn" onclick="document.getElementById('kanban-modal').classList.remove('open')">✕</button>
+    </div>
+    <div id="kanban-board" style="display:flex;gap:12px;overflow-x:auto;flex:1;padding-bottom:8px"></div>
   </div>
 </div>
 
@@ -2307,7 +2412,7 @@ document.addEventListener('keydown', e => {
     closeAdd();
     closeSettings();
     $ddExport.classList.remove('open');
-    ['dupes-modal','import-modal','similar-modal','stats-modal','kbd-modal'].forEach(id => {
+    ['dupes-modal','import-modal','similar-modal','stats-modal','kbd-modal','kanban-modal'].forEach(id => {
       document.getElementById(id)?.classList.remove('open');
     });
     cancelEdit(selId);  // cancel any active edit
@@ -2869,7 +2974,8 @@ function renderCollections() {
   document.getElementById('all-count').textContent = allCount || '';
   const rows = collections.map(c => {
     const act = activeColl === c.id ? ' active' : '';
-    return `<div class="coll-item${act}" data-id="${c.id}" onclick="selectCollection(${c.id})">
+    return `<div class="coll-item${act}" data-id="${c.id}" onclick="selectCollection(${c.id})"
+        ondblclick="event.stopPropagation();startCollRename(${c.id},${JSON.stringify(c.name)},this)">
       <span class="coll-item-name">📁 ${esc(c.name)}</span>
       <span class="coll-count">${c.ref_count || ''}</span>
       <button class="coll-del" title="Delete collection"
@@ -3573,6 +3679,188 @@ const TYPE_LABELS = {
   'thesis':'Thesis','dataset':'Dataset','report':'Report','website':'Web',
 };
 function typeLabel(t) { return TYPE_LABELS[t] || t; }
+
+// ── Saved Searches ─────────────────────────────────────────────────────────
+let savedSearches = [];
+
+async function loadSavedSearches() {
+  try {
+    const r = await apiFetch('/api/saved-searches');
+    savedSearches = await r.json();
+    if (!Array.isArray(savedSearches)) savedSearches = [];
+    renderSavedSearches();
+  } catch(e) { console.error(e); }
+}
+
+function renderSavedSearches() {
+  const $el = document.getElementById('saved-search-list');
+  if (!$el) return;
+  if (!savedSearches.length) {
+    $el.innerHTML = '<div style="padding:6px 12px;font-size:11px;color:var(--muted)">No saved searches</div>';
+    return;
+  }
+  $el.innerHTML = savedSearches.map(s => `
+    <div class="coll-item" onclick="loadSavedSearch(${s.id})">
+      <span class="coll-item-name" title="${esc(s.query || '')}">🔖 ${esc(s.name)}</span>
+      <button class="coll-del" title="Delete saved search"
+        onclick="event.stopPropagation();deleteSavedSearch(${s.id})">×</button>
+    </div>`).join('');
+}
+
+async function saveCurrentSearch() {
+  const q = $search.value.trim();
+  const name = prompt('Save search as:');
+  if (!name?.trim()) return;
+  const filters = {
+    type: advFilter.type,
+    oa: advFilter.oa,
+    status: advFilter.status,
+    yearMin: advFilter.yearMin,
+    yearMax: advFilter.yearMax,
+    tags: [...advFilter.tags],
+  };
+  try {
+    await apiFetch('/api/saved-searches', {
+      method: 'POST',
+      body: JSON.stringify({ name: name.trim(), query: q, filters }),
+    });
+    await loadSavedSearches();
+  } catch(e) { alert('Failed to save search: ' + e.message); }
+}
+
+function loadSavedSearch(id) {
+  const s = savedSearches.find(x => x.id === id);
+  if (!s) return;
+  $search.value = s.query || '';
+  try {
+    const f = JSON.parse(s.filters || '{}');
+    advFilter.type   = f.type   || '';
+    advFilter.oa     = f.oa     || false;
+    advFilter.status = f.status || '';
+    advFilter.yearMin = f.yearMin || '';
+    advFilter.yearMax = f.yearMax || '';
+    advFilter.tags   = new Set(f.tags || []);
+  } catch(_) {}
+  loadRefs();
+}
+
+async function deleteSavedSearch(id) {
+  if (!confirm('Delete this saved search?')) return;
+  await apiFetch(`/api/saved-searches/${id}`, { method: 'DELETE' });
+  await loadSavedSearches();
+}
+
+// ── Collection inline rename ───────────────────────────────────────────────
+function startCollRename(collId, currentName, itemEl) {
+  const nameEl = itemEl.querySelector('.coll-item-name');
+  if (!nameEl) return;
+  const inp = document.createElement('input');
+  inp.className = 'coll-item-inline-edit';
+  inp.value = currentName;
+  nameEl.replaceWith(inp);
+  inp.focus(); inp.select();
+  const finish = async () => {
+    const newName = inp.value.trim();
+    if (newName && newName !== currentName) {
+      try {
+        await apiFetch(`/api/collections/${collId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ name: newName }),
+        });
+        await loadCollections();
+      } catch(e) { alert('Rename failed: ' + e.message); await loadCollections(); }
+    } else {
+      await loadCollections();
+    }
+  };
+  inp.addEventListener('blur', finish);
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); inp.blur(); }
+    if (e.key === 'Escape') { inp.value = currentName; inp.blur(); }
+  });
+}
+
+// ── Kanban Reading Board ───────────────────────────────────────────────────
+const KANBAN_COLS = [
+  { id: 'unread',  label: 'To Read',   color: '#6b7280', next: 'reading' },
+  { id: 'reading', label: 'Reading',   color: '#f59e0b', next: 'read'    },
+  { id: 'read',    label: 'Done',      color: '#10b981', next: null       },
+];
+
+async function openKanban() {
+  const modal = document.getElementById('kanban-modal');
+  modal.classList.add('open');
+  renderKanban();
+}
+
+async function renderKanban() {
+  const board = document.getElementById('kanban-board');
+  board.innerHTML = '<div class="spin" style="margin:40px auto"></div>';
+  try {
+    const r = await apiFetch('/api/refs?limit=2000');
+    const all = await r.json();
+    if (!Array.isArray(all)) { board.innerHTML = '<p style="color:var(--muted);padding:20px">Error loading references.</p>'; return; }
+    const groups = { unread: [], reading: [], read: [] };
+    all.forEach(ref => {
+      const s = ref.status || 'unread';
+      if (groups[s]) groups[s].push(ref); else groups.unread.push(ref);
+    });
+    board.innerHTML = KANBAN_COLS.map(col => {
+      const items = groups[col.id];
+      const cards = items.map(ref => {
+        const auth = fmtAuth(ref.authors);
+        const year = ref.year ? ` (${ref.year})` : '';
+        const nextCol = col.next ? KANBAN_COLS.find(c => c.id === col.next) : null;
+        const moveBtn = nextCol
+          ? `<button class="kanban-move-btn" onclick="kanbanMove('${ref.id}','${nextCol.id}')">→ ${nextCol.label}</button>`
+          : '';
+        return `<div class="kanban-card" onclick="selectRef('${ref.id}');document.getElementById('kanban-modal').classList.remove('open')">
+          <div class="kanban-card-title">${esc(ref.title || '(no title)')}</div>
+          <div class="kanban-card-meta">${esc(auth)}${esc(year)}</div>
+          ${moveBtn ? `<div style="margin-top:6px">${moveBtn}</div>` : ''}
+        </div>`;
+      }).join('') || '<div style="color:var(--muted);font-size:12px;text-align:center;padding:20px 0">Empty</div>';
+      return `<div class="kanban-col">
+        <div class="kanban-col-header" style="border-top:3px solid ${col.color}">
+          <span style="color:${col.color}">${col.label}</span>
+          <span style="color:var(--muted);font-weight:400">${items.length}</span>
+        </div>
+        <div class="kanban-col-items">${cards}</div>
+      </div>`;
+    }).join('');
+  } catch(e) { board.innerHTML = `<p style="color:var(--error);padding:20px">${esc(e.message)}</p>`; }
+}
+
+async function kanbanMove(refId, newStatus) {
+  await apiFetch(`/api/refs/${refId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status: newStatus }),
+  });
+  renderKanban(); // refresh board in place
+  // also update local refs cache
+  const ref = refs.find(r => r.id === refId);
+  if (ref) { ref.status = newStatus; renderList(); }
+}
+
+document.getElementById('btn-kanban-toggle').addEventListener('click', openKanban);
+
+// ── Bulk tag dropdown ──────────────────────────────────────────────────────
+async function batchTagPrompt() {
+  const allTags = await apiFetch('/api/tags').then(r => r.json()).catch(() => []);
+  const tagNames = Array.isArray(allTags) ? allTags.map(t => t.name) : [];
+  const tag = prompt(`Tag to add to ${selectedIds.size} selected references:\nExisting tags: ${tagNames.slice(0,10).join(', ')}${tagNames.length>10?' …':''}`);
+  if (!tag?.trim()) return;
+  await apiFetch('/api/batch', {
+    method: 'POST',
+    body: JSON.stringify({ ref_ids: [...selectedIds], action: 'tag', tag: tag.trim().toLowerCase() }),
+  });
+  clearSel(); await loadRefs();
+}
+
+// ── Init additions ─────────────────────────────────────────────────────────
+(async () => {
+  await loadSavedSearches();
+})();
 </script>
 </body>
 </html>
