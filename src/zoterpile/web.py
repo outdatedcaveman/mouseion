@@ -2118,6 +2118,8 @@ kbd {
         <span class="coll-count" id="all-count"></span>
       </div>
     </div>
+    <div class="coll-section-header">Recent</div>
+    <div class="coll-list" id="recent-refs-list" style="max-height:120px"></div>
     <div class="coll-section-header">Smart Searches</div>
     <div class="coll-list" id="saved-search-list" style="max-height:180px"></div>
     <div class="coll-item coll-save-search" id="btn-save-search" onclick="saveCurrentSearch()">
@@ -2137,6 +2139,8 @@ kbd {
         <option value="completeness-desc">Completeness</option>
       </select>
       <button class="filter-toggle-btn" id="btn-adv-filter" title="Advanced filters">⚗ Filter</button>
+      <button class="filter-toggle-btn" id="btn-view-toggle" title="Toggle list density" onclick="toggleViewMode()">☰</button>
+      <button class="filter-toggle-btn" id="btn-export-visible" title="Export all visible refs" onclick="exportVisible()">⬇</button>
     </div>
     <div class="adv-filter-panel" id="adv-filter-panel">
       <div class="af-section">
@@ -3188,29 +3192,44 @@ function renderList() {
     </div>`;
     return;
   }
+  const expanded = typeof _viewMode !== 'undefined' && _viewMode === 'expanded';
   $list.innerHTML = refs.map(ref => {
     const d    = dotCls(ref.completeness);
     const auth = fmtAuth(ref.authors);
     const year = ref.year || '—';
-    const tags = ref.tags.slice(0, 3).map(t => {
+    const maxTags = expanded ? 5 : 3;
+    const tags = ref.tags.slice(0, maxTags).map(t => {
       const c = _tagColorMap[t];
       const s = c ? ` style="background:${c}22;color:${c}"` : '';
       return `<span class="tag"${s}>${esc(t)}</span>`;
     }).join('');
-    const more = ref.tags.length > 3 ? `<span class="tag">+${ref.tags.length - 3}</span>` : '';
+    const more = ref.tags.length > maxTags ? `<span class="tag">+${ref.tags.length - maxTags}</span>` : '';
     const pdf  = ref.has_pdf ? `<span class="tag" title="PDF available" style="opacity:.7">📄</span>` : '';
     const isSel  = selectedIds.has(ref.id);
+    const pinned = typeof _pinnedRefs !== 'undefined' && _pinnedRefs.has(ref.id);
     const act  = (ref.id === selId ? ' active' : '') + (isSel ? ' selected' : '');
-    return `<div class="ref-card${act}" data-id="${ref.id}" onclick="cardClick(event,'${ref.id}')">
+    const pinStyle = pinned ? 'border-left:3px solid var(--warning);' : '';
+    const pinBtn = `<button class="pin-btn" onclick="event.stopPropagation();togglePin('${ref.id}')"
+      title="${pinned ? 'Unpin' : 'Pin to top'}"
+      style="position:absolute;top:6px;right:6px;background:none;border:none;cursor:pointer;font-size:11px;padding:0;opacity:${pinned?'.8':'.3'}"
+    >📌</button>`;
+    const venue = ref.journal || ref.container_title || '';
+    const abstract = expanded && ref.abstract
+      ? `<div style="font-size:11px;color:var(--muted);margin-top:3px;line-height:1.4">${esc(ref.abstract.slice(0,130))}${ref.abstract.length>130?'…':''}</div>` : '';
+    const venueRow = expanded && venue ? ` · ${esc(venue)}` : '';
+    return `<div class="ref-card${act}" data-id="${ref.id}" onclick="cardClick(event,'${ref.id}')"
+        style="position:relative;${pinStyle}${expanded ? 'padding:10px 14px;' : ''}">
       <input type="checkbox" class="ref-card-cb" ${isSel ? 'checked' : ''}
              onclick="event.stopPropagation();toggleSel('${ref.id}',this.checked)"
              title="Select for batch action">
       <div class="dot ${d}"></div>
       <div class="rc-body">
         <div class="rc-title">${esc(ref.title)}</div>
-        <div class="rc-meta">${esc(auth)} · ${year}</div>
+        <div class="rc-meta">${esc(auth)} · ${year}${venueRow}</div>
+        ${abstract}
         <div class="rc-tags">${tags}${more}${pdf}</div>
       </div>
+      ${pinBtn}
     </div>`;
   }).join('');
 }
@@ -3245,7 +3264,7 @@ function renderDetail(ref) {
   const venue = ref.journal || '';
 
   const badges = [
-    ref.doi      ? `<span class="badge b-doi">DOI: ${esc(ref.doi)}</span>` : '',
+    ref.doi      ? `<span class="badge b-doi" onclick="copyToClipboard('${esc(ref.doi)}','DOI')" title="Click to copy DOI" style="cursor:pointer">DOI: ${esc(ref.doi)}</span>` : '',
     ref.arxiv_id ? `<span class="badge b-arxiv">arXiv: ${esc(ref.arxiv_id)}</span>` : '',
     ref.open_access ? `<span class="badge b-oa">🔓 Open Access</span>` : '',
     ref.ref_type && ref.ref_type !== 'unknown'
@@ -4425,41 +4444,95 @@ function applySort() {
   }
 }
 
-// Extend renderList to show pin indicator
-const _origRenderList = renderList;
-function renderList() {
-  _origRenderList();
-  // Add pin buttons to cards
-  document.querySelectorAll('.ref-card').forEach(card => {
-    const id = card.dataset.id;
-    if (!id) return;
-    const pinned = _pinnedRefs.has(id);
-    const existingPin = card.querySelector('.pin-btn');
-    if (existingPin) return;
-    const btn = document.createElement('button');
-    btn.className = 'pin-btn';
-    btn.title = pinned ? 'Unpin' : 'Pin to top';
-    btn.textContent = '📌';
-    btn.style.cssText = 'display:none;position:absolute;top:6px;right:6px;background:none;border:none;cursor:pointer;font-size:12px;padding:0;opacity:.6';
-    btn.onclick = e => { e.stopPropagation(); togglePin(id); };
-    card.style.position = 'relative';
-    card.appendChild(btn);
-    if (pinned) {
-      btn.style.display = 'block';
-      card.style.borderLeft = '3px solid var(--warning)';
-    }
-  });
-  // Show pin button on hover via CSS workaround
-  document.querySelectorAll('.ref-card').forEach(c => {
-    c.addEventListener('mouseenter', () => {
-      const b = c.querySelector('.pin-btn'); if (b) b.style.display = 'block';
-    });
-    c.addEventListener('mouseleave', () => {
-      const b = c.querySelector('.pin-btn');
-      if (b && !_pinnedRefs.has(c.dataset.id)) b.style.display = 'none';
-    });
-  });
+// Pin buttons are injected by renderList directly (see _pinnedRefs handling there)
+
+// ── Copy to clipboard helper ──────────────────────────────────────────────
+function copyToClipboard(text, label = 'Text') {
+  navigator.clipboard.writeText(text).then(() => {
+    showToast(`${label} copied to clipboard`);
+  }).catch(() => prompt(`Copy ${label}:`, text));
 }
+
+// ── List view mode (compact / expanded) ───────────────────────────────────
+let _viewMode = localStorage.getItem('zt-view-mode') || 'compact';
+
+function toggleViewMode() {
+  _viewMode = _viewMode === 'compact' ? 'expanded' : 'compact';
+  localStorage.setItem('zt-view-mode', _viewMode);
+  document.getElementById('btn-view-toggle').textContent = _viewMode === 'compact' ? '☰' : '▤';
+  document.getElementById('btn-view-toggle').classList.toggle('active', _viewMode === 'expanded');
+  renderList();
+}
+
+// (expanded view rendering is handled inside the main renderList via _viewMode flag)
+
+// ── Export visible refs ────────────────────────────────────────────────────
+async function exportVisible() {
+  if (!refs.length) { showToast('No references to export'); return; }
+  const fmt = prompt('Export format (bibtex / ris / json / csv):', 'bibtex');
+  if (!fmt) return;
+  const fmtClean = fmt.trim().toLowerCase();
+  if (!['bibtex','ris','json','csv'].includes(fmtClean)) {
+    showToast('Unknown format: ' + fmtClean); return;
+  }
+  const ids = refs.map(r => r.id);
+  if (fmtClean === 'json') {
+    const blob = new Blob([JSON.stringify(refs, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'zoterpile-export.json'; a.click(); return;
+  }
+  if (fmtClean === 'csv') {
+    const r = await apiFetch(`/api/export/csv?ids=${ids.join(',')}`);
+    const text = await r.text();
+    const blob = new Blob([text], { type: 'text/csv' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'zoterpile-export.csv'; a.click(); return;
+  }
+  // bibtex / ris
+  const r = await apiFetch('/api/export', {
+    method: 'POST',
+    body: JSON.stringify({ ref_ids: ids, format: fmtClean }),
+  });
+  const text = await r.text();
+  const mt = fmtClean === 'bibtex' ? 'text/plain' : 'application/x-research-info-systems';
+  const blob = new Blob([text], { type: mt });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = `zoterpile-export.${fmtClean === 'bibtex' ? 'bib' : 'ris'}`; a.click();
+}
+
+// ── Recently viewed refs ───────────────────────────────────────────────────
+let _recentIds = JSON.parse(localStorage.getItem('zt-recent') || '[]');
+
+function addRecentRef(refId) {
+  _recentIds = [refId, ..._recentIds.filter(x => x !== refId)].slice(0, 7);
+  localStorage.setItem('zt-recent', JSON.stringify(_recentIds));
+  renderRecentRefs();
+}
+
+function renderRecentRefs() {
+  const el = document.getElementById('recent-refs-list');
+  if (!el) return;
+  const recent = _recentIds
+    .map(id => refs.find(r => r.id === id))
+    .filter(Boolean);
+  if (!recent.length) {
+    el.innerHTML = '<div style="padding:4px 12px;font-size:11px;color:var(--muted)">None yet</div>';
+    return;
+  }
+  el.innerHTML = recent.map(r =>
+    `<div class="coll-item" onclick="selectRef('${r.id}')" title="${esc(r.title)}">
+      <span class="coll-item-name" style="font-size:12px">🕐 ${esc(r.title?.slice(0,28) || '(no title)')}${(r.title?.length||0)>28?'…':''}</span>
+    </div>`
+  ).join('');
+}
+
+// Hook into _postSelectHooks to track recently viewed
+_postSelectHooks.push(ref => {
+  addRecentRef(ref.id);
+});
+
+// Initialize recently viewed on load
+setTimeout(renderRecentRefs, 800);
 
 // ── Init additions ─────────────────────────────────────────────────────────
 (async () => {
