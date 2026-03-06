@@ -938,6 +938,43 @@ def export_csv():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/export/notes")
+def export_notes():
+    """Export all notes from the library as a Markdown document."""
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            all_refs = db.list_all(limit=10_000)
+            lines = ["# Zoterpile — Notes Export\n"]
+            has_notes = False
+            for ref in all_refs:
+                extra = db.get_extra(_ref_id(ref))
+                notes = extra.get("notes", "")
+                if not notes:
+                    continue
+                has_notes = True
+                authors = ", ".join(
+                    a.family + (f", {a.given[0]}." if a.given else "")
+                    for a in ref.authors[:3] if a.family
+                )
+                lines.append(f"\n## {ref.title or '(untitled)'}")
+                if authors:
+                    lines.append(f"*{authors}{'et al.' if len(ref.authors) > 3 else ''}*"
+                                 + (f", {ref.year}" if ref.year else ""))
+                lines.append(f"\n{notes}\n")
+                lines.append("---")
+            if not has_notes:
+                lines.append("\n*No notes found in library.*")
+        content = "\n".join(lines)
+        return Response(
+            content,
+            mimetype="text/markdown",
+            headers={"Content-Disposition": "attachment; filename=zoterpile-notes.md"},
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/enrich-incomplete", methods=["POST"])
 def enrich_incomplete():
     """
@@ -2044,6 +2081,20 @@ kbd {
 .dup-ref-info { flex: 1; min-width: 0; }
 .dup-ref-title { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dup-ref-meta  { color: var(--muted); font-size: 11px; }
+/* ── Command palette ── */
+#cmd-palette { background: rgba(0,0,0,.6); }
+.cmd-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px; cursor: pointer; font-size: 13px; color: var(--text);
+  border-left: 2px solid transparent;
+}
+.cmd-item:hover, .cmd-item.active { background: var(--panel); border-left-color: var(--primary); }
+.cmd-icon { font-size: 15px; width: 22px; text-align: center; flex-shrink: 0; color: var(--muted); }
+.cmd-label { flex: 1; }
+.cmd-shortcut { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.cmd-section { padding: 6px 14px 2px; font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
+
 /* ── Author links ── */
 .author-link {
   color: var(--primary); cursor: pointer; text-decoration: none;
@@ -2322,6 +2373,20 @@ kbd {
   </div>
 </div>
 
+<!-- ── Command Palette ── -->
+<div class="overlay" id="cmd-palette" style="align-items:flex-start;padding-top:80px">
+  <div class="modal-box" style="width:560px;padding:0;overflow:hidden">
+    <div style="display:flex;align-items:center;padding:12px 14px;border-bottom:1px solid var(--border);gap:8px">
+      <span style="color:var(--muted);font-size:16px">⌘</span>
+      <input id="cmd-input" type="text" placeholder="Type a command or search…"
+        style="flex:1;background:none;border:none;outline:none;font-size:15px;color:var(--text);font-family:var(--font)"
+        oninput="cmdFilter()" autocomplete="off">
+      <kbd style="font-size:10px">Esc</kbd>
+    </div>
+    <div id="cmd-results" style="max-height:360px;overflow-y:auto;padding:4px 0"></div>
+  </div>
+</div>
+
 <!-- ── Kanban Reading Board ── -->
 <div class="overlay" id="kanban-modal">
   <div class="modal-box" style="width:min(95vw,1100px);max-height:80vh;overflow:hidden;display:flex;flex-direction:column">
@@ -2365,6 +2430,7 @@ kbd {
       <div class="kbd-row"><kbd>Ctrl</kbd>+<kbd>↵</kbd><span class="kbd-desc">Submit Add modal</span></div>
       <div class="kbd-row"><kbd>Esc</kbd><span class="kbd-desc">Close modals / cancel edit</span></div>
       <div class="kbd-row"><kbd>dblclick</kbd><span class="kbd-desc">Rename collection</span></div>
+      <div class="kbd-row"><kbd>Ctrl</kbd>+<kbd>k</kbd><span class="kbd-desc">Command palette</span></div>
     </div>
     <div class="modal-foot" style="margin-top:18px">
       <button class="btn btn-ghost" onclick="document.getElementById('kbd-modal').classList.remove('open')">Close</button>
@@ -2623,6 +2689,7 @@ document.addEventListener('keydown', e => {
     closeAdd();
     closeSettings();
     $ddExport.classList.remove('open');
+    closeCmdPalette();
     ['dupes-modal','import-modal','similar-modal','stats-modal','kbd-modal','kanban-modal','tags-modal'].forEach(id => {
       document.getElementById(id)?.classList.remove('open');
     });
@@ -3747,13 +3814,35 @@ function updateSelToolbar() {
   }
 }
 async function batchStatusPrompt() {
-  const s = prompt('Set status for selected (unread / reading / read):');
-  if (!['unread','reading','read'].includes(s)) return;
-  await apiFetch('/api/batch', {
-    method: 'POST',
-    body: JSON.stringify({ ref_ids: [...selectedIds], action: 'set_status', status: s }),
+  // Show a small dropdown popover instead of a prompt()
+  const tb = document.getElementById('sel-toolbar');
+  const existing = document.getElementById('status-popover');
+  if (existing) { existing.remove(); return; }
+  const pop = document.createElement('div');
+  pop.id = 'status-popover';
+  pop.style.cssText = 'position:absolute;z-index:9999;background:var(--surface);border:1px solid var(--border-hi);border-radius:var(--r);padding:4px;box-shadow:0 4px 12px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:2px;top:100%;left:0;margin-top:4px';
+  ['○ Unread','◑ Reading','● Read'].forEach((label, i) => {
+    const vals = ['unread','reading','read'];
+    const btn = document.createElement('button');
+    btn.textContent = label;
+    btn.style.cssText = 'background:none;border:none;padding:6px 14px;cursor:pointer;color:var(--text);font-size:13px;font-family:var(--font);border-radius:4px;text-align:left';
+    btn.onmouseover = () => btn.style.background = 'var(--panel)';
+    btn.onmouseout  = () => btn.style.background = 'none';
+    btn.onclick = async () => {
+      pop.remove();
+      await apiFetch('/api/batch', {
+        method: 'POST',
+        body: JSON.stringify({ ref_ids: [...selectedIds], action: 'set_status', status: vals[i] }),
+      });
+      clearSel(); await loadRefs();
+    };
+    pop.appendChild(btn);
   });
-  clearSel(); await loadRefs();
+  tb.style.position = 'relative';
+  tb.appendChild(pop);
+  setTimeout(() => document.addEventListener('click', function h(e) {
+    if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener('click', h); }
+  }), 10);
 }
 async function batchCollPrompt() {
   if (!collections.length) { alert('No collections exist. Create one first.'); return; }
@@ -4645,6 +4734,121 @@ _postSelectHooks.push(ref => {
 
 // Initialize recently viewed on load
 setTimeout(renderRecentRefs, 800);
+
+// ── Command Palette ────────────────────────────────────────────────────────
+const CMD_ACTIONS = [
+  { icon: '＋', label: 'Add reference',            shortcut: 'a',  action: () => openAdd() },
+  { icon: '⬆', label: 'Import file (BibTeX/RIS)',  shortcut: 'i',  action: () => document.getElementById('btn-open-import').click() },
+  { icon: '📊', label: 'Library analytics',         shortcut: 's',  action: () => document.getElementById('btn-stats').click() },
+  { icon: '⊞', label: 'Reading board (kanban)',     shortcut: 'b',  action: () => openKanban() },
+  { icon: '🏷', label: 'Tag manager',               shortcut: '',   action: () => openTagManager() },
+  { icon: '⚡', label: 'Find duplicates',            shortcut: '',   action: () => document.getElementById('btn-duplicates').click() },
+  { icon: '🔧', label: 'Enrich incomplete refs',    shortcut: '',   action: () => document.getElementById('btn-enrich-all').click() },
+  { icon: '⬇', label: 'Export visible references',  shortcut: '',   action: () => exportVisible() },
+  { icon: '📝', label: 'Export notes as Markdown',  shortcut: '',   action: () => { window.open('/api/export/notes', '_blank'); } },
+  { icon: '🌙', label: 'Toggle light/dark theme',   shortcut: '',   action: () => document.getElementById('btn-theme-toggle').click() },
+  { icon: '▤', label: 'Toggle expanded view',       shortcut: '',   action: () => toggleViewMode() },
+  { icon: '↻', label: 'Refresh list',               shortcut: 'r',  action: () => loadRefs() },
+  { icon: '?', label: 'Keyboard shortcuts',          shortcut: '?',  action: () => document.getElementById('kbd-modal').classList.add('open') },
+  { icon: '⚙', label: 'Settings',                   shortcut: '',   action: () => document.getElementById('btn-settings').click() },
+];
+
+let _cmdIdx = 0;
+let _cmdFiltered = [...CMD_ACTIONS];
+
+function openCmdPalette() {
+  document.getElementById('cmd-palette').classList.add('open');
+  const inp = document.getElementById('cmd-input');
+  inp.value = '';
+  _cmdFiltered = [...CMD_ACTIONS];
+  _cmdIdx = 0;
+  renderCmdResults('');
+  setTimeout(() => inp.focus(), 50);
+}
+
+function closeCmdPalette() {
+  document.getElementById('cmd-palette').classList.remove('open');
+}
+
+function cmdFilter() {
+  const q = document.getElementById('cmd-input').value.toLowerCase();
+  _cmdIdx = 0;
+  // Search refs too if query looks like a search
+  renderCmdResults(q);
+}
+
+function renderCmdResults(q) {
+  const $r = document.getElementById('cmd-results');
+  // Filter actions
+  const actions = q
+    ? CMD_ACTIONS.filter(a => a.label.toLowerCase().includes(q))
+    : CMD_ACTIONS;
+  _cmdFiltered = [...actions];
+  // Matching refs (top 5)
+  const matchRefs = q && q.length >= 2
+    ? refs.filter(r => (r.title||'').toLowerCase().includes(q) ||
+        fmtAuth(r.authors).toLowerCase().includes(q)).slice(0, 5)
+    : [];
+  if (matchRefs.length) {
+    matchRefs.forEach(r => _cmdFiltered.push({ _ref: r }));
+  }
+
+  let html = '';
+  if (actions.length) {
+    html += '<div class="cmd-section">Actions</div>';
+    html += actions.map((a, i) =>
+      `<div class="cmd-item${i === _cmdIdx ? ' active' : ''}" onclick="runCmd(${i})">
+        <span class="cmd-icon">${a.icon}</span>
+        <span class="cmd-label">${esc(a.label)}</span>
+        ${a.shortcut ? `<kbd class="cmd-shortcut">${a.shortcut}</kbd>` : ''}
+      </div>`
+    ).join('');
+  }
+  if (matchRefs.length) {
+    html += '<div class="cmd-section">References</div>';
+    html += matchRefs.map((r, i) => {
+      const idx = actions.length + i;
+      return `<div class="cmd-item${idx === _cmdIdx ? ' active' : ''}" onclick="runCmd(${idx})">
+        <span class="cmd-icon">📄</span>
+        <span class="cmd-label">${esc(r.title?.slice(0,50) || '(untitled)')}${(r.title?.length||0)>50?'…':''}</span>
+        <span class="cmd-shortcut">${r.year||''}</span>
+      </div>`;
+    }).join('');
+  }
+  if (!html) html = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:13px">No results</div>';
+  $r.innerHTML = html;
+}
+
+function runCmd(idx) {
+  const item = _cmdFiltered[idx];
+  if (!item) return;
+  closeCmdPalette();
+  if (item._ref) {
+    selectRef(item._ref.id); scrollSelIntoView();
+  } else if (item.action) {
+    item.action();
+  }
+}
+
+// Keyboard navigation in palette
+document.getElementById('cmd-input').addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeCmdPalette(); return; }
+  if (e.key === 'ArrowDown') { e.preventDefault(); _cmdIdx = Math.min(_cmdIdx+1, _cmdFiltered.length-1); renderCmdResults(e.target.value.toLowerCase()); return; }
+  if (e.key === 'ArrowUp')   { e.preventDefault(); _cmdIdx = Math.max(_cmdIdx-1, 0); renderCmdResults(e.target.value.toLowerCase()); return; }
+  if (e.key === 'Enter')     { e.preventDefault(); runCmd(_cmdIdx); return; }
+});
+
+// Cmd+K / Ctrl+K to open
+document.addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    openCmdPalette();
+  }
+});
+
+document.getElementById('cmd-palette').addEventListener('click', e => {
+  if (e.target === document.getElementById('cmd-palette')) closeCmdPalette();
+});
 
 // ── Reading goals ─────────────────────────────────────────────────────────
 async function editReadingGoals() {
