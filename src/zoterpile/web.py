@@ -1343,6 +1343,22 @@ _HTML = r"""<!DOCTYPE html>
   --font:        system-ui,-apple-system,'Segoe UI',sans-serif;
   --mono:        'JetBrains Mono','Fira Code','Courier New',monospace;
 }
+[data-theme="light"] {
+  --bg:          #f8f9fb;
+  --surface:     #ffffff;
+  --panel:       #f0f1f5;
+  --border:      #e2e4eb;
+  --border-hi:   #c8ccd8;
+  --primary:     #3b6ff0;
+  --primary-dim: #dce6ff;
+  --success:     #10a56a;
+  --warning:     #d4870e;
+  --error:       #dc2626;
+  --text:        #1a1d2e;
+  --muted:       #7a7f99;
+  --tag-bg:      #ededf8;
+  --tag-fg:      #4b4f99;
+}
 html, body { height: 100%; overflow: hidden; }
 body {
   font-family: var(--font);
@@ -1897,6 +1913,14 @@ kbd {
 .dup-ref-info { flex: 1; min-width: 0; }
 .dup-ref-title { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dup-ref-meta  { color: var(--muted); font-size: 11px; }
+/* ── Fullscreen detail ── */
+.detail.fullscreen {
+  position: fixed !important; inset: 0; z-index: 7000;
+  width: 100% !important; max-width: 100% !important;
+  border-radius: 0; overflow-y: auto;
+}
+.detail.fullscreen #btn-detail-fullscreen { display: inline-block !important; }
+
 /* ── Toast animation ── */
 @keyframes fadeInUp {
   from { opacity: 0; transform: translateY(12px); }
@@ -2013,6 +2037,7 @@ kbd {
     <button class="btn btn-ghost" id="btn-stats" title="Library analytics">📊 Stats</button>
     <button class="btn btn-ghost" id="btn-tags-mgr" title="Manage tags">🏷 Tags</button>
     <button class="btn btn-ghost" id="btn-enrich-all" title="Re-enrich incomplete references">🔧 Enrich</button>
+    <button class="btn btn-ghost" id="btn-theme-toggle" title="Toggle light/dark mode">☀</button>
     <button class="btn btn-ghost" id="btn-kbd-help" title="Keyboard shortcuts">?</button>
     <button class="btn btn-ghost" id="btn-settings" title="Settings">⚙</button>
   </div>
@@ -2100,6 +2125,12 @@ kbd {
     </div>
   </div>
   <div class="detail" id="detail">
+    <button id="btn-detail-fullscreen" title="Fullscreen detail view"
+      onclick="toggleDetailFullscreen()"
+      style="position:sticky;top:0;float:right;margin:0 0 -28px 8px;z-index:10;
+             background:var(--panel);border:1px solid var(--border);border-radius:4px;
+             padding:2px 7px;font-size:12px;color:var(--muted);cursor:pointer;
+             display:none">⤢</button>
     <div class="detail-ph">Select a reference to see details</div>
   </div>
 </main>
@@ -2453,6 +2484,7 @@ document.addEventListener('keydown', e => {
     ['dupes-modal','import-modal','similar-modal','stats-modal','kbd-modal','kanban-modal','tags-modal'].forEach(id => {
       document.getElementById(id)?.classList.remove('open');
     });
+    if (_detailFullscreen) toggleDetailFullscreen();
     cancelEdit(selId);  // cancel any active edit
     return;
   }
@@ -3134,6 +3166,10 @@ function selectRef(id) {
 
 // ── Detail panel ───────────────────────────────────────────────────────────
 function renderDetail(ref) {
+  // Show fullscreen toggle button
+  const $fsBtn = document.getElementById('btn-detail-fullscreen');
+  if ($fsBtn) $fsBtn.style.display = 'inline-block';
+
   const authors = ref.authors.map(a =>
     a.given ? `${a.family}, ${a.given}` : a.family).join('; ') || '—';
   const year  = ref.year ? ` (${ref.year})` : '';
@@ -4130,6 +4166,69 @@ $search.addEventListener('change', () => {
   const q = $search.value.trim();
   if (q.length >= 3) saveSearchHistory(q);
 });
+
+// ── Theme toggle ───────────────────────────────────────────────────────────
+(function initTheme() {
+  const saved = localStorage.getItem('zt-theme') || 'dark';
+  if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  const btn = document.getElementById('btn-theme-toggle');
+  if (btn) btn.textContent = saved === 'light' ? '🌙' : '☀';
+})();
+
+document.getElementById('btn-theme-toggle').addEventListener('click', () => {
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const newTheme = isLight ? 'dark' : 'light';
+  if (newTheme === 'light') document.documentElement.setAttribute('data-theme', 'light');
+  else document.documentElement.removeAttribute('data-theme');
+  localStorage.setItem('zt-theme', newTheme);
+  document.getElementById('btn-theme-toggle').textContent = newTheme === 'light' ? '🌙' : '☀';
+});
+
+// ── Fullscreen detail ──────────────────────────────────────────────────────
+let _detailFullscreen = false;
+function toggleDetailFullscreen() {
+  _detailFullscreen = !_detailFullscreen;
+  $detail.classList.toggle('fullscreen', _detailFullscreen);
+  const btn = document.getElementById('btn-detail-fullscreen');
+  if (btn) btn.textContent = _detailFullscreen ? '⤡' : '⤢';
+  if (!_detailFullscreen) $detail.scrollTop = 0;
+}
+
+// Close fullscreen on Escape
+const _origEscHandler = null; // already handled in keydown listener above
+
+// ── Quick type filter in list header ──────────────────────────────────────
+// Add type filter chips above the list for quick access
+function injectTypeChips() {
+  const sortBar = document.querySelector('.sort-bar');
+  if (!sortBar || document.getElementById('type-chips-row')) return;
+  const types = [
+    { v: '',                    l: 'All'      },
+    { v: 'journal-article',     l: 'Articles' },
+    { v: 'preprint',            l: 'Preprints'},
+    { v: 'book',                l: 'Books'    },
+    { v: 'conference-paper',    l: 'Conf.'    },
+    { v: 'thesis',              l: 'Thesis'   },
+  ];
+  const row = document.createElement('div');
+  row.id = 'type-chips-row';
+  row.style.cssText = 'display:flex;gap:4px;padding:6px 12px;flex-wrap:wrap;border-bottom:1px solid var(--border);background:var(--surface)';
+  row.innerHTML = types.map(t => `<button class="af-pill${t.v === (filter.type||'') ? ' on' : ''}"
+    onclick="setTypeChip('${t.v}')">${t.l}</button>`).join('');
+  sortBar.parentNode.insertBefore(row, sortBar);
+}
+
+function setTypeChip(val) {
+  filter.type = val || undefined;
+  document.querySelectorAll('#type-chips-row .af-pill').forEach(b => {
+    const bv = b.getAttribute('onclick').match(/'([^']*)'/)?.[1] || '';
+    b.classList.toggle('on', bv === (val || ''));
+  });
+  loadRefs();
+}
+
+// Run after initial render
+setTimeout(injectTypeChips, 500);
 
 // ── Init additions ─────────────────────────────────────────────────────────
 (async () => {
