@@ -687,13 +687,91 @@ def export_refs():
 
 @app.route("/api/stats")
 def stats():
+    """Rich library analytics for the stats dashboard."""
+    try:
+        from collections import Counter, defaultdict
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            all_refs = db.list_all(limit=10_000)
+            all_tags = db.all_tags()
+            # Read counts from extras
+            conn = db._conn
+            status_rows = conn.execute(
+                "SELECT COALESCE(status,'unread') as s, COUNT(*) as c FROM refs GROUP BY s"
+            ).fetchall()
+
+        n   = len(all_refs)
+        avg = sum(r.completeness for r in all_refs) / n if n else 0.0
+
+        # Papers by year (last 30 years)
+        year_counts: dict = Counter()
+        for r in all_refs:
+            if r.year and r.year >= 1990:
+                year_counts[r.year] += 1
+        by_year = [{"year": y, "count": c} for y, c in sorted(year_counts.items())]
+
+        # Papers by type
+        type_counts: dict = Counter(r.ref_type.value for r in all_refs)
+        by_type = [{"type": t, "count": c} for t, c in type_counts.most_common(8)]
+
+        # Open access
+        oa_count = sum(1 for r in all_refs if r.open_access)
+
+        # Top journals
+        journal_counts: dict = Counter(r.journal for r in all_refs if r.journal)
+        top_journals = [{"name": j, "count": c} for j, c in journal_counts.most_common(10)]
+
+        # Top authors
+        author_counts: dict = Counter()
+        for r in all_refs:
+            for a in r.authors:
+                if a.family:
+                    author_counts[a.family + (f", {a.given[0]}." if a.given else "")] += 1
+        top_authors = [{"name": a, "count": c} for a, c in author_counts.most_common(10)]
+
+        # Citation count stats
+        cited = [r.citation_count for r in all_refs if r.citation_count is not None]
+        citation_stats = {
+            "total":  sum(cited),
+            "max":    max(cited) if cited else 0,
+            "median": sorted(cited)[len(cited)//2] if cited else 0,
+        }
+
+        # Reading status
+        status_map = {row["s"]: row["c"] for row in status_rows}
+
+        return jsonify({
+            "count":            n,
+            "avg_completeness": round(avg, 3),
+            "oa_count":         oa_count,
+            "oa_pct":           round(oa_count / n * 100, 1) if n else 0,
+            "by_year":          by_year,
+            "by_type":          by_type,
+            "top_tags":         [{"name": t["name"], "count": t["count"]} for t in all_tags[:15]],
+            "top_journals":     top_journals,
+            "top_authors":      top_authors,
+            "citation_stats":   citation_stats,
+            "status":           status_map,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tags/<tag_name>", methods=["PATCH"])
+def update_tag(tag_name: str):
+    """Update tag metadata (currently: color)."""
+    body  = request.json or {}
+    color = body.get("color", "").strip()
+    if color and not re.match(r"^#[0-9a-fA-F]{3,6}$", color):
+        return jsonify({"error": "Invalid color — use hex e.g. #ff6b6b"}), 400
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
-            refs = db.list_all(limit=10_000)
-        n = len(refs)
-        avg = sum(r.completeness for r in refs) / n if n else 0.0
-        return jsonify({"count": n, "avg_completeness": round(avg, 3)})
+            db._conn.execute(
+                "UPDATE tags SET color = ? WHERE name = ?",
+                (color or "#6366f1", tag_name),
+            )
+        return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1479,6 +1557,73 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 }
 .cite-copy-row { display: flex; justify-content: flex-end; margin-top: 6px; }
 
+/* ── Advanced filter panel ── */
+.adv-filter-panel {
+  display: none; flex-direction: column; gap: 12px;
+  padding: 10px 12px; background: var(--surface);
+  border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.adv-filter-panel.open { display: flex; }
+.af-section { display: flex; flex-direction: column; gap: 4px; }
+.af-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; font-weight: 600; }
+.af-row { display: flex; gap: 4px; flex-wrap: wrap; }
+.af-pill {
+  padding: 3px 9px; border-radius: 999px; font-size: 11px;
+  cursor: pointer; border: 1px solid var(--border);
+  background: transparent; color: var(--muted);
+  font-family: var(--font); transition: all .15s;
+}
+.af-pill:hover { border-color: var(--border-hi); color: var(--text); }
+.af-pill.on { background: var(--primary-dim); border-color: var(--primary); color: var(--text); font-weight: 600; }
+.af-year-row { display: flex; gap: 6px; align-items: center; }
+.af-year-inp {
+  width: 62px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 3px 6px;
+  color: var(--text); font-size: 11px; outline: none;
+}
+.af-year-inp:focus { border-color: var(--primary); }
+.af-tag-list { display: flex; flex-wrap: wrap; gap: 3px; max-height: 70px; overflow-y: auto; }
+.af-clear { margin-left: auto; background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 11px; }
+.af-clear:hover { color: var(--error); }
+.filter-toggle-btn {
+  padding: 2px 8px; border-radius: var(--r); font-size: 11px;
+  cursor: pointer; border: 1px solid var(--border);
+  background: transparent; color: var(--muted);
+  font-family: var(--font); transition: all .15s; flex-shrink: 0;
+}
+.filter-toggle-btn.active { border-color: var(--primary); color: var(--primary); }
+
+/* ── Stats modal ── */
+.stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.stats-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 12px 14px;
+}
+.stats-card h4 { font-size: 11px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .5px; margin-bottom: 10px; }
+.stats-num { font-size: 28px; font-weight: 700; color: var(--text); line-height: 1; }
+.stats-sub { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.bar-chart { display: flex; flex-direction: column; gap: 4px; }
+.bc-row { display: flex; align-items: center; gap: 6px; }
+.bc-label { width: 100px; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; text-align: right; }
+.bc-bar-wrap { flex: 1; height: 12px; background: var(--border); border-radius: 2px; overflow: hidden; }
+.bc-bar { height: 100%; border-radius: 2px; background: var(--primary); transition: width .3s; }
+.bc-val { font-size: 10px; color: var(--muted); width: 28px; text-align: right; flex-shrink: 0; }
+.year-chart { display: flex; align-items: flex-end; gap: 2px; height: 60px; }
+.yc-col { flex: 1; background: var(--primary); border-radius: 2px 2px 0 0;
+  min-width: 3px; transition: background .15s; cursor: default; position: relative; }
+.yc-col:hover { background: var(--success); }
+.yc-col[title]:hover::after {
+  content: attr(title); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+  background: var(--panel); border: 1px solid var(--border-hi); padding: 2px 6px;
+  font-size: 10px; color: var(--text); border-radius: 3px; white-space: nowrap; pointer-events: none; z-index: 10;
+}
+.status-donut { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.sd-item { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+.sd-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.stats-modal-box { max-height: 82vh; overflow-y: auto; }
+
 /* ── Duplicates modal ── */
 .dup-group {
   background: var(--surface); border: 1px solid var(--border);
@@ -1524,6 +1669,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
       </div>
     </div>
     <button class="btn btn-ghost" id="btn-duplicates" title="Find duplicate references">⚡ Dupes</button>
+    <button class="btn btn-ghost" id="btn-stats" title="Library analytics">📊 Stats</button>
     <button class="btn btn-ghost" id="btn-settings" title="Settings">⚙</button>
   </div>
 </header>
@@ -1555,6 +1701,38 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
         <option value="citations-desc">Most Cited</option>
         <option value="completeness-desc">Completeness</option>
       </select>
+      <button class="filter-toggle-btn" id="btn-adv-filter" title="Advanced filters">⚗ Filter</button>
+    </div>
+    <div class="adv-filter-panel" id="adv-filter-panel">
+      <div class="af-section">
+        <div class="af-label">Year range</div>
+        <div class="af-year-row">
+          <input class="af-year-inp" id="af-year-from" placeholder="From" type="number" min="1000" max="2099">
+          <span style="color:var(--muted)">–</span>
+          <input class="af-year-inp" id="af-year-to" placeholder="To" type="number" min="1000" max="2099">
+        </div>
+      </div>
+      <div class="af-section">
+        <div class="af-label">Reading status</div>
+        <div class="af-row">
+          <button class="af-pill" data-status="unread">○ Unread</button>
+          <button class="af-pill" data-status="reading">◑ Reading</button>
+          <button class="af-pill" data-status="read">● Read</button>
+        </div>
+      </div>
+      <div class="af-section">
+        <div class="af-label">Has PDF</div>
+        <div class="af-row">
+          <button class="af-pill" id="af-pdf">📄 PDF only</button>
+        </div>
+      </div>
+      <div class="af-section" id="af-tags-section">
+        <div class="af-label">Tags</div>
+        <div class="af-tag-list" id="af-tag-list"></div>
+      </div>
+      <div style="display:flex;justify-content:flex-end">
+        <button class="af-clear" id="af-clear-btn">✕ Clear filters</button>
+      </div>
     </div>
     <div class="sel-toolbar" id="sel-toolbar">
       <span class="sel-count" id="sel-count"></span>
@@ -1625,6 +1803,18 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
     <div class="similar-list" id="similar-list"></div>
     <div class="modal-foot">
       <button class="btn btn-ghost" onclick="document.getElementById('similar-modal').classList.remove('open')">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Stats Modal ── -->
+<div class="overlay" id="stats-modal">
+  <div class="modal-box stats-modal-box" style="width:700px">
+    <h2>📊 Library Analytics</h2>
+    <p class="modal-hint" id="stats-hint">Loading…</p>
+    <div id="stats-content"></div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="document.getElementById('stats-modal').classList.remove('open')">Close</button>
     </div>
   </div>
 </div>
@@ -1871,6 +2061,7 @@ document.addEventListener('keydown', e => {
   if (isEditing()) return;
   if (e.key === 'a' || e.key === 'A') { openAdd(); return; }
   if (e.key === 'i' || e.key === 'I') { document.getElementById('btn-open-import').click(); return; }
+  if (e.key === 's' || e.key === 'S') { document.getElementById('btn-stats').click(); return; }
   if (e.key === '/')  { e.preventDefault(); $search.focus(); return; }
   if (e.key === 'r' || e.key === 'R') { loadRefs(); return; }
   // j/k navigation
@@ -2030,11 +2221,227 @@ document.getElementById('btn-duplicates').addEventListener('click', async () => 
   }
 });
 
-// ── Tag autocomplete ─────────────────────────────────────────────────────────
+// ── Stats modal ──────────────────────────────────────────────────────────────
+document.getElementById('btn-stats').addEventListener('click', async () => {
+  const modal   = document.getElementById('stats-modal');
+  const hint    = document.getElementById('stats-hint');
+  const content = document.getElementById('stats-content');
+  hint.textContent = 'Loading analytics…';
+  content.innerHTML = '';
+  modal.classList.add('open');
+  try {
+    const r    = await apiFetch('/api/stats');
+    const data = await r.json();
+    if (data.error) { hint.textContent = 'Error: ' + data.error; return; }
+    hint.textContent = `${data.count} references in your library`;
+    content.innerHTML = renderStats(data);
+  } catch(e) { hint.textContent = 'Error: ' + e.message; }
+});
+
+function renderStats(d) {
+  const maxYear = d.by_year.length ? Math.max(...d.by_year.map(x=>x.count)) : 1;
+  const yearCols = d.by_year.map(x => {
+    const h = Math.round(x.count / maxYear * 60);
+    return `<div class="yc-col" style="height:${h}px" title="${x.year}: ${x.count}"></div>`;
+  }).join('');
+  const yearLabels = d.by_year.length ? (() => {
+    const years = d.by_year.map(x=>x.year);
+    return `<div style="display:flex;justify-content:space-between;font-size:9px;color:var(--muted);margin-top:2px">
+      <span>${years[0]}</span><span>${years[Math.floor(years.length/2)]||''}</span><span>${years[years.length-1]}</span></div>`;
+  })() : '';
+
+  const topN = (arr, key, max) => {
+    const mx = arr.length ? arr[0][key] : 1;
+    return arr.slice(0,max).map(x =>
+      `<div class="bc-row">
+        <div class="bc-label" title="${esc(x.name||x.type||'')}">${esc((x.name||x.type||'').slice(0,16))}</div>
+        <div class="bc-bar-wrap"><div class="bc-bar" style="width:${Math.round(x[key]/mx*100)}%"></div></div>
+        <div class="bc-val">${x[key]}</div>
+      </div>`
+    ).join('');
+  };
+
+  const st = d.status || {};
+  const unread  = st.unread  || 0;
+  const reading = st.reading || 0;
+  const read    = st.read    || 0;
+  const statusTotal = unread + reading + read || 1;
+
+  const typeColors = {'journal-article':'#5b8af5','preprint':'#f0b429','book':'#3ecf8e',
+    'book-chapter':'#a78bfa','conference-paper':'#fb923c','thesis':'#f472b6'};
+
+  return `
+  <div class="stats-grid">
+    <div class="stats-card">
+      <h4>Total References</h4>
+      <div class="stats-num">${d.count.toLocaleString()}</div>
+      <div class="stats-sub">avg ${Math.round(d.avg_completeness*100)}% metadata completeness</div>
+    </div>
+    <div class="stats-card">
+      <h4>Open Access</h4>
+      <div class="stats-num">${d.oa_count.toLocaleString()}</div>
+      <div class="stats-sub">${d.oa_pct}% of library</div>
+    </div>
+    <div class="stats-card" style="grid-column:1/-1">
+      <h4>Publications by Year</h4>
+      <div class="year-chart">${yearCols}</div>
+      ${yearLabels}
+    </div>
+    <div class="stats-card">
+      <h4>Reading Progress</h4>
+      <div class="status-donut">
+        <div class="sd-item"><div class="sd-dot" style="background:#ee88bb"></div>${unread} unread</div>
+        <div class="sd-item"><div class="sd-dot" style="background:#88aaee"></div>${reading} reading</div>
+        <div class="sd-item"><div class="sd-dot" style="background:#3ecf8e"></div>${read} read</div>
+      </div>
+      <div style="margin-top:8px;height:8px;border-radius:4px;overflow:hidden;background:var(--border);display:flex">
+        <div style="width:${Math.round(read/statusTotal*100)}%;background:#3ecf8e"></div>
+        <div style="width:${Math.round(reading/statusTotal*100)}%;background:#88aaee"></div>
+        <div style="width:${Math.round(unread/statusTotal*100)}%;background:#ee88bb"></div>
+      </div>
+    </div>
+    <div class="stats-card">
+      <h4>Citations</h4>
+      <div class="stats-num">${(d.citation_stats.total||0).toLocaleString()}</div>
+      <div class="stats-sub">max ${(d.citation_stats.max||0).toLocaleString()} · median ${d.citation_stats.median||0}</div>
+    </div>
+    <div class="stats-card">
+      <h4>By Type</h4>
+      <div class="bar-chart">${topN(d.by_type, 'count', 6)}</div>
+    </div>
+    <div class="stats-card">
+      <h4>Top Tags</h4>
+      <div class="bar-chart">${topN(d.top_tags, 'count', 6)}</div>
+    </div>
+    <div class="stats-card">
+      <h4>Top Journals</h4>
+      <div class="bar-chart">${topN(d.top_journals, 'count', 6)}</div>
+    </div>
+    <div class="stats-card">
+      <h4>Top Authors</h4>
+      <div class="bar-chart">${topN(d.top_authors, 'count', 6)}</div>
+    </div>
+  </div>`;
+}
+
+// ── Advanced filter panel ─────────────────────────────────────────────────────
+const advFilter = { yearFrom: null, yearTo: null, statuses: new Set(), hasPdf: false, tags: new Set() };
+
+document.getElementById('btn-adv-filter').addEventListener('click', () => {
+  const panel = document.getElementById('adv-filter-panel');
+  const btn   = document.getElementById('btn-adv-filter');
+  const open  = panel.classList.toggle('open');
+  btn.classList.toggle('active', open);
+  if (open) renderAdvTagOptions();
+});
+
+document.getElementById('af-year-from').addEventListener('input', e => {
+  advFilter.yearFrom = e.target.value ? parseInt(e.target.value) : null;
+  applyAdvFilter();
+});
+document.getElementById('af-year-to').addEventListener('input', e => {
+  advFilter.yearTo = e.target.value ? parseInt(e.target.value) : null;
+  applyAdvFilter();
+});
+
+document.querySelectorAll('.af-pill[data-status]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const s = btn.dataset.status;
+    if (advFilter.statuses.has(s)) { advFilter.statuses.delete(s); btn.classList.remove('on'); }
+    else { advFilter.statuses.add(s); btn.classList.add('on'); }
+    applyAdvFilter();
+  });
+});
+
+document.getElementById('af-pdf').addEventListener('click', function() {
+  advFilter.hasPdf = !advFilter.hasPdf;
+  this.classList.toggle('on', advFilter.hasPdf);
+  applyAdvFilter();
+});
+
+document.getElementById('af-clear-btn').addEventListener('click', () => {
+  advFilter.yearFrom = null; advFilter.yearTo = null;
+  advFilter.statuses.clear(); advFilter.hasPdf = false; advFilter.tags.clear();
+  document.getElementById('af-year-from').value = '';
+  document.getElementById('af-year-to').value   = '';
+  document.querySelectorAll('.af-pill').forEach(b => b.classList.remove('on'));
+  renderAdvTagOptions();
+  applyAdvFilter();
+});
+
+function renderAdvTagOptions() {
+  const container = document.getElementById('af-tag-list');
+  if (!allTags.length) { container.innerHTML = '<span style="color:var(--muted);font-size:11px">No tags yet</span>'; return; }
+  container.innerHTML = allTags.slice(0,30).map(t =>
+    `<button class="af-pill${advFilter.tags.has(t.name) ? ' on' : ''}"
+             onclick="toggleAdvTag('${esc(t.name)}')">${esc(t.name)}</button>`
+  ).join('');
+}
+
+function toggleAdvTag(name) {
+  if (advFilter.tags.has(name)) advFilter.tags.delete(name);
+  else advFilter.tags.add(name);
+  renderAdvTagOptions();
+  applyAdvFilter();
+}
+
+let _fullRefs = null; // cache of unfiltered refs
+
+function applyAdvFilter() {
+  const hasActiveFilter =
+    advFilter.yearFrom || advFilter.yearTo ||
+    advFilter.statuses.size || advFilter.hasPdf || advFilter.tags.size;
+
+  // Update the filter button indicator
+  document.getElementById('btn-adv-filter').classList.toggle('active', hasActiveFilter);
+
+  if (!hasActiveFilter) {
+    if (_fullRefs) { refs = _fullRefs; _fullRefs = null; }
+    applySort(); renderList(); renderStatus();
+    return;
+  }
+  if (!_fullRefs) _fullRefs = [...refs];
+  refs = _fullRefs.filter(r => {
+    if (advFilter.yearFrom && (r.year||0) < advFilter.yearFrom) return false;
+    if (advFilter.yearTo   && (r.year||0) > advFilter.yearTo)   return false;
+    if (advFilter.statuses.size && !advFilter.statuses.has(r.status||'unread')) return false;
+    if (advFilter.hasPdf && !r.has_pdf) return false;
+    if (advFilter.tags.size) {
+      const rTags = new Set(r.tags);
+      for (const t of advFilter.tags) if (!rTags.has(t)) return false;
+    }
+    return true;
+  });
+  applySort();
+  renderList();
+  renderStatus();
+}
+
+// ── Tag color management ─────────────────────────────────────────────────────
+let _tagColorMap = {};
+
 async function loadAllTags() {
   try {
     const r = await apiFetch('/api/tags');
     allTags = await r.json();
+    // Build color map
+    _tagColorMap = {};
+    for (const t of allTags) {
+      if (t.color && t.color !== '#6366f1') _tagColorMap[t.name] = t.color;
+    }
+  } catch(e) {}
+}
+
+async function setTagColor(tagName, color) {
+  try {
+    await apiFetch(`/api/tags/${encodeURIComponent(tagName)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ color }),
+    });
+    _tagColorMap[tagName] = color;
+    // Re-render current detail if it has this tag
+    const ref = refs.find(r => r.id === selId);
+    if (ref?.tags.includes(tagName)) renderDetail(ref);
   } catch(e) {}
 }
 
@@ -2136,8 +2543,8 @@ async function loadRefs() {
     const r = await apiFetch('/api/refs?' + params);
     refs = await r.json();
     if (!Array.isArray(refs)) { refs = []; }
-    applySort();
-    renderList();
+    _fullRefs = null; // invalidate advanced filter cache
+    applyAdvFilter(); // re-applies any active filters; calls applySort+renderList internally
     renderStatus();
     // Update "All References" count in sidebar
     if (activeColl === null) {
@@ -2161,7 +2568,11 @@ function renderList() {
     const d    = dotCls(ref.completeness);
     const auth = fmtAuth(ref.authors);
     const year = ref.year || '—';
-    const tags = ref.tags.slice(0, 3).map(t => `<span class="tag">${esc(t)}</span>`).join('');
+    const tags = ref.tags.slice(0, 3).map(t => {
+      const c = _tagColorMap[t];
+      const s = c ? ` style="background:${c}22;color:${c}"` : '';
+      return `<span class="tag"${s}>${esc(t)}</span>`;
+    }).join('');
     const more = ref.tags.length > 3 ? `<span class="tag">+${ref.tags.length - 3}</span>` : '';
     const pdf  = ref.has_pdf ? `<span class="tag" title="PDF available" style="opacity:.7">📄</span>` : '';
     const isSel  = selectedIds.has(ref.id);
@@ -2212,10 +2623,18 @@ function renderDetail(ref) {
              onclick="copyCiteKey('${ref.id}','${esc(ref.cite_key)}')">@${esc(ref.cite_key)}</span>` : '',
   ].filter(Boolean).join('');
 
-  const tagsHtml = ref.tags.map(t =>
-    `<span class="tag-edit">${esc(t)}<button class="tag-x"
-       onclick="rmTag('${ref.id}','${esc(t)}')">×</button></span>`
-  ).join('');
+  const tagsHtml = ref.tags.map(t => {
+    const color = _tagColorMap[t];
+    const style = color ? `style="background:${color}22;color:${color};border-color:${color}44"` : '';
+    return `<span class="tag-edit" ${style}>
+      ${esc(t)}
+      <input type="color" class="tag-color-inp" title="Set tag color"
+             value="${color || '#6366f1'}"
+             onchange="setTagColor('${esc(t)}',this.value)"
+             style="width:10px;height:10px;padding:0;border:none;background:none;cursor:pointer;opacity:.5;flex-shrink:0">
+      <button class="tag-x" onclick="rmTag('${ref.id}','${esc(t)}')">×</button>
+    </span>`;
+  }).join('');
 
   const statusVal = ref.status || 'unread';
   const statuses = ['unread', 'reading', 'read'];
@@ -2737,7 +3156,7 @@ function renderStatus() {
   const avg = refs.reduce((s, r) => s + r.completeness, 0) / n;
   const read = refs.filter(r => r.status === 'read').length;
   $statusbar.textContent =
-    `${n} ref${n !== 1 ? 's' : ''}  ·  ${read} read  ·  avg ${Math.round(avg * 100)}% complete  ·  [a] Add  [i] Import  [/] Search  [j/k] Navigate`;
+    `${n} ref${n !== 1 ? 's' : ''}  ·  ${read} read  ·  avg ${Math.round(avg * 100)}% complete  ·  [a] Add  [i] Import  [s] Stats  [/] Search  [j/k] Navigate`;
 }
 
 // ── Utils ──────────────────────────────────────────────────────────────────
