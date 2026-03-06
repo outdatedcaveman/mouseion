@@ -24,6 +24,22 @@
       "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://scholar.google.com/*",
+        "*://scholar.google.co.uk/*",
+        "*://scholar.google.ca/*",
+        "*://scholar.google.com.au/*",
+        "*://arxiv.org/search/*",
+        "*://arxiv.org/find/*",
+        "*://pubmed.ncbi.nlm.nih.gov/*",
+        "*://www.semanticscholar.org/search*",
+        "*://www.semanticscholar.org/paper/*"
+      ],
+      "js": ["site_injector.js"],
+      "css": ["site_injector.css"],
+      "run_at": "document_idle"
     }
   ],
   "permissions": ["storage", "activeTab", "scripting", "contextMenus"],

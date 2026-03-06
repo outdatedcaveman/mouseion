@@ -1,0 +1,61 @@
+/* Zoterpile site-injector button styles */
+
+.zp-inject-btn {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: inherit;
+  line-height: 1.5;
+  border: 1px solid #6b7280;
+  border-radius: 4px;
+  background: transparent;
+  color: #374151;
+  cursor: pointer;
+  white-space: nowrap;
+  vertical-align: middle;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.zp-inject-btn:hover:not(:disabled) {
+  background: #1a56db;
+  border-color: #1a56db;
+  color: #fff;
+}
+
+.zp-inject-btn:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.zp-inject-btn.zp-saved {
+  border-color: #059669;
+  color: #059669;
+}
+
+.zp-inject-btn.zp-error {
+  border-color: #dc2626;
+  color: #dc2626;
+}
+
+/* Dark-mode support */
+@media (prefers-color-scheme: dark) {
+  .zp-inject-btn {
+    border-color: #9ca3af;
+    color: #e5e7eb;
+  }
+  .zp-inject-btn:hover:not(:disabled) {
+    background: #2563eb;
+    border-color: #2563eb;
+    color: #fff;
+  }
+  .zp-inject-btn.zp-saved {
+    border-color: #34d399;
+    color: #34d399;
+  }
+  .zp-inject-btn.zp-error {
+    border-color: #f87171;
+    color: #f87171;
+  }
+}

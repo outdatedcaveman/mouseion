@@ -393,6 +393,102 @@ def remove_ref_from_collection(ref_id: str, collection_id: int):
         return jsonify({"error": str(e)}), 500
 
 
+# ---------------------------------------------------------------------------
+# Semantic similarity
+# ---------------------------------------------------------------------------
+
+@app.route("/api/refs/<ref_id>/similar")
+def get_similar(ref_id: str):
+    """Return semantically similar references using the embedding index."""
+    n = min(int(request.args.get("n", 8)), 20)
+    try:
+        from .semantic import SemanticIndex
+        from .db import RefDatabase
+        idx = SemanticIndex()
+        pairs = idx.find_similar(ref_id, n=n)
+        if not pairs:
+            return jsonify([])
+        with RefDatabase() as db:
+            results = []
+            for sid, score in pairs:
+                ref = db.get(sid)
+                if ref:
+                    tags = db.get_tags(sid)
+                    d = _ref_to_dict(ref, tags, sid)
+                    d["similarity"] = round(score, 3)
+                    results.append(d)
+        return jsonify(results)
+    except RuntimeError as e:
+        return jsonify({"error": str(e), "not_indexed": True}), 503
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Batch operations
+# ---------------------------------------------------------------------------
+
+@app.route("/api/batch", methods=["POST"])
+def batch_op():
+    """
+    Apply a single action to multiple references at once.
+
+    Body:
+        ref_ids       list[str]  — reference IDs to act on
+        action        str        — one of: delete, tag, untag, set_status,
+                                           add_to_collection, remove_from_collection
+        tag           str        — required for tag/untag
+        status        str        — required for set_status
+        collection_id int        — required for collection ops
+    """
+    body    = request.json or {}
+    ref_ids = body.get("ref_ids", [])
+    action  = body.get("action", "")
+    if not ref_ids or not action:
+        return jsonify({"error": "ref_ids and action are required"}), 400
+    try:
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            if action == "delete":
+                for rid in ref_ids:
+                    db.delete(rid)
+            elif action == "tag":
+                tag = body.get("tag", "").strip().lower()
+                if not tag:
+                    return jsonify({"error": "tag is required"}), 400
+                for rid in ref_ids:
+                    db.add_tags(rid, [tag])
+            elif action == "untag":
+                tag = body.get("tag", "").strip().lower()
+                if not tag:
+                    return jsonify({"error": "tag is required"}), 400
+                for rid in ref_ids:
+                    db.remove_tag(rid, tag)
+            elif action == "set_status":
+                status = body.get("status", "")
+                for rid in ref_ids:
+                    db.update_ref_fields(rid, status=status)
+            elif action == "add_to_collection":
+                cid = body.get("collection_id")
+                if cid is None:
+                    return jsonify({"error": "collection_id is required"}), 400
+                for rid in ref_ids:
+                    db.add_to_collection(rid, int(cid))
+            elif action == "remove_from_collection":
+                cid = body.get("collection_id")
+                if cid is None:
+                    return jsonify({"error": "collection_id is required"}), 400
+                for rid in ref_ids:
+                    db.remove_from_collection(rid, int(cid))
+            else:
+                return jsonify({"error": f"Unknown action: {action}"}), 400
+        return jsonify({"ok": True, "count": len(ref_ids)})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/refs/<ref_id>/pdf")
 def get_ref_pdf(ref_id: str):
     """Serve or redirect to the PDF for a reference.
@@ -1137,6 +1233,54 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 }
 .b-citekey:hover { background: #243824; }
 .b-citekey.copied { background: #0d3326; color: #3ecf8e; }
+
+/* ── Batch selection ── */
+.ref-card-cb {
+  position: absolute; top: 12px; left: 7px;
+  width: 14px; height: 14px; cursor: pointer; z-index: 1;
+  opacity: 0; transition: opacity .1s; accent-color: var(--primary);
+}
+.ref-card:hover .ref-card-cb,
+.ref-card.selected .ref-card-cb { opacity: 1; }
+.ref-card.selected { background: #181828; border-left: 3px solid var(--primary); padding-left: 11px; }
+.sel-toolbar {
+  display: none; align-items: center; gap: 6px; flex-shrink: 0;
+  padding: 6px 10px; background: var(--panel);
+  border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+.sel-toolbar.visible { display: flex; }
+.sel-count { font-size: 12px; color: var(--muted); margin-right: 4px; }
+.sel-btn {
+  padding: 4px 10px; border-radius: var(--r); font-size: 12px;
+  cursor: pointer; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text);
+  font-family: var(--font); transition: background .1s;
+}
+.sel-btn:hover { background: var(--panel); }
+.sel-btn-del { border-color: #552222; color: var(--error); }
+.sel-btn-del:hover { background: #2a0a0a; }
+
+/* ── Similar papers modal ── */
+.similar-list { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow-y: auto; }
+.sim-row {
+  display: flex; gap: 12px; align-items: flex-start;
+  padding: 10px 12px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--r);
+  cursor: pointer; transition: background .1s;
+}
+.sim-row:hover { background: var(--panel); }
+.sim-score {
+  flex-shrink: 0; width: 38px; text-align: center;
+  font-size: 11px; font-weight: 700; color: var(--primary);
+  padding-top: 2px;
+}
+.sim-body { flex: 1; min-width: 0; }
+.sim-title {
+  font-size: 13px; font-weight: 500; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-bottom: 3px;
+}
+.sim-meta { font-size: 11px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -1184,8 +1328,18 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
     </div>
   </div>
 
-  <div class="ref-list" id="ref-list">
-    <div class="empty"><div class="spin"></div></div>
+  <div style="display:flex;flex-direction:column;width:340px;flex-shrink:0;border-right:1px solid var(--border);">
+    <div class="sel-toolbar" id="sel-toolbar">
+      <span class="sel-count" id="sel-count"></span>
+      <button class="sel-btn" onclick="batchTagPrompt()">🏷 Tag</button>
+      <button class="sel-btn" onclick="batchStatusPrompt()">◑ Status</button>
+      <button class="sel-btn" onclick="batchCollPrompt()">📁 Collection</button>
+      <button class="sel-btn sel-btn-del" onclick="batchDelete()">🗑 Delete</button>
+      <button class="sel-btn" style="margin-left:auto" onclick="clearSel()">✕ Clear</button>
+    </div>
+    <div class="ref-list" id="ref-list" style="flex:1;border-right:none">
+      <div class="empty"><div class="spin"></div></div>
+    </div>
   </div>
   <div class="detail" id="detail">
     <div class="detail-ph">Select a reference to see details</div>
@@ -1236,6 +1390,18 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   </div>
 </div>
 
+<!-- ── Similar Papers Modal ── -->
+<div class="overlay" id="similar-modal">
+  <div class="modal-box" style="width:620px">
+    <h2>🔮 Similar Papers</h2>
+    <p class="modal-hint" id="similar-hint">Finding semantically similar papers from your library…</p>
+    <div class="similar-list" id="similar-list"></div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="document.getElementById('similar-modal').classList.remove('open')">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 'use strict';
 
@@ -1246,6 +1412,7 @@ let filter      = { type: '', oa: false };
 let addTimer    = null;
 let collections = [];
 let activeColl  = null;   // null = all refs, int = collection id
+let selectedIds = new Set(); // batch-selected ref IDs
 
 // ── DOM refs ───────────────────────────────────────────────────────────────
 const $search   = document.getElementById('search');
@@ -1496,8 +1663,12 @@ function renderList() {
     const tags = ref.tags.slice(0, 3).map(t => `<span class="tag">${esc(t)}</span>`).join('');
     const more = ref.tags.length > 3 ? `<span class="tag">+${ref.tags.length - 3}</span>` : '';
     const pdf  = ref.has_pdf ? `<span class="tag" title="PDF available" style="opacity:.7">📄</span>` : '';
-    const act  = ref.id === selId ? ' active' : '';
-    return `<div class="ref-card${act}" data-id="${ref.id}" onclick="selectRef('${ref.id}')">
+    const isSel  = selectedIds.has(ref.id);
+    const act  = (ref.id === selId ? ' active' : '') + (isSel ? ' selected' : '');
+    return `<div class="ref-card${act}" data-id="${ref.id}" onclick="cardClick(event,'${ref.id}')">
+      <input type="checkbox" class="ref-card-cb" ${isSel ? 'checked' : ''}
+             onclick="event.stopPropagation();toggleSel('${ref.id}',this.checked)"
+             title="Select for batch action">
       <div class="dot ${d}"></div>
       <div class="rc-body">
         <div class="rc-title">${esc(ref.title)}</div>
@@ -1506,6 +1677,12 @@ function renderList() {
       </div>
     </div>`;
   }).join('');
+}
+
+function cardClick(e, id) {
+  // Checkbox click is handled separately; plain click selects the detail view
+  if (e.target.type === 'checkbox') return;
+  selectRef(id);
 }
 
 function selectRef(id) {
@@ -1625,6 +1802,7 @@ function renderDetail(ref) {
       ${ref.has_pdf ? `<a class="btn btn-ghost btn-sm"
           href="${apiBase()}/api/refs/${ref.id}/pdf${getCfg().key ? '?api_key=' + encodeURIComponent(getCfg().key) : ''}"
           target="_blank" rel="noopener">📄 PDF</a>` : ''}
+      <button class="btn btn-ghost btn-sm" onclick="showSimilar('${ref.id}')">🔮 Similar</button>
       <button class="btn btn-ghost btn-sm" style="color:var(--error)"
               onclick="delRef('${ref.id}')">🗑 Delete</button>
     </div>`;
@@ -1704,6 +1882,132 @@ async function removeFromColl(refId, collId) {
     renderDetail(ref);
   }
   await loadCollections();
+}
+
+// ── Batch selection ────────────────────────────────────────────────────────
+function toggleSel(id, checked) {
+  if (checked) selectedIds.add(id);
+  else selectedIds.delete(id);
+  updateSelToolbar();
+  // Update card style without full re-render
+  document.querySelectorAll(`.ref-card[data-id="${id}"]`).forEach(c =>
+    c.classList.toggle('selected', checked));
+}
+function clearSel() {
+  selectedIds.clear();
+  updateSelToolbar();
+  renderList();
+}
+function updateSelToolbar() {
+  const n = selectedIds.size;
+  const tb = document.getElementById('sel-toolbar');
+  const ct = document.getElementById('sel-count');
+  if (n > 0) {
+    tb.classList.add('visible');
+    ct.textContent = `${n} selected`;
+  } else {
+    tb.classList.remove('visible');
+    ct.textContent = '';
+  }
+}
+async function batchTagPrompt() {
+  const tag = prompt('Tag to add to selected references:');
+  if (!tag?.trim()) return;
+  await apiFetch('/api/batch', {
+    method: 'POST',
+    body: JSON.stringify({ ref_ids: [...selectedIds], action: 'tag', tag: tag.trim().toLowerCase() }),
+  });
+  clearSel(); await loadRefs();
+}
+async function batchStatusPrompt() {
+  const s = prompt('Set status for selected (unread / reading / read):');
+  if (!['unread','reading','read'].includes(s)) return;
+  await apiFetch('/api/batch', {
+    method: 'POST',
+    body: JSON.stringify({ ref_ids: [...selectedIds], action: 'set_status', status: s }),
+  });
+  clearSel(); await loadRefs();
+}
+async function batchCollPrompt() {
+  if (!collections.length) { alert('No collections exist. Create one first.'); return; }
+  const list = collections.map((c,i) => `${i+1}. ${c.name}`).join('\n');
+  const n = parseInt(prompt(`Add to collection:\n${list}\nEnter number:`));
+  if (!n || n < 1 || n > collections.length) return;
+  const cid = collections[n-1].id;
+  await apiFetch('/api/batch', {
+    method: 'POST',
+    body: JSON.stringify({ ref_ids: [...selectedIds], action: 'add_to_collection', collection_id: cid }),
+  });
+  clearSel(); await loadRefs(); await loadCollections();
+}
+async function batchDelete() {
+  const n = selectedIds.size;
+  if (!confirm(`Delete ${n} reference${n!==1?'s':''}? This cannot be undone.`)) return;
+  await apiFetch('/api/batch', {
+    method: 'POST',
+    body: JSON.stringify({ ref_ids: [...selectedIds], action: 'delete' }),
+  });
+  if (selectedIds.has(selId)) {
+    selId = null;
+    $detail.innerHTML = '<div class="detail-ph">Select a reference to see details</div>';
+  }
+  clearSel(); await loadRefs();
+}
+
+// ── Similar papers ─────────────────────────────────────────────────────────
+async function showSimilar(refId) {
+  const modal = document.getElementById('similar-modal');
+  const hint  = document.getElementById('similar-hint');
+  const list  = document.getElementById('similar-list');
+  hint.textContent = 'Searching semantic index…';
+  list.innerHTML   = '<div style="text-align:center;padding:20px;color:var(--muted)"><span class="spin"></span></div>';
+  modal.classList.add('open');
+  try {
+    const r = await apiFetch(`/api/refs/${refId}/similar?n=8`);
+    const data = await r.json();
+    if (data.error) {
+      if (data.not_indexed) {
+        hint.textContent = 'Semantic index not built. Run: zoterpile index-semantic';
+      } else {
+        hint.textContent = `Error: ${data.error}`;
+      }
+      list.innerHTML = '';
+      return;
+    }
+    if (!data.length) {
+      hint.textContent = 'No similar papers found — try running zoterpile index-semantic first.';
+      list.innerHTML = '';
+      return;
+    }
+    hint.textContent = `${data.length} similar papers from your library (sorted by similarity)`;
+    list.innerHTML = data.map(ref => {
+      const auth = fmtAuth(ref.authors);
+      const pct  = Math.round(ref.similarity * 100);
+      return `<div class="sim-row" onclick="simSelect('${ref.id}');document.getElementById('similar-modal').classList.remove('open')">
+        <div class="sim-score">${pct}%</div>
+        <div class="sim-body">
+          <div class="sim-title">${esc(ref.title)}</div>
+          <div class="sim-meta">${esc(auth)}${ref.year ? ' · ' + ref.year : ''}${ref.journal ? ' · ' + esc(ref.journal) : ''}</div>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    hint.textContent = `Error: ${e.message}`;
+    list.innerHTML = '';
+  }
+}
+function simSelect(id) {
+  // Find in current list or reload detail
+  const ref = refs.find(r => r.id === id);
+  if (ref) {
+    selectRef(id);
+  } else {
+    // Ref is in library but not in current filtered view — navigate to it
+    activeColl = null;
+    document.querySelectorAll('.f-btn').forEach(b => b.classList.toggle('active', !b.dataset.type && b.dataset.oa === '0'));
+    filter = { type: '', oa: false };
+    loadRefs().then(() => selectRef(id));
+  }
 }
 
 // ── Tag management ─────────────────────────────────────────────────────────
