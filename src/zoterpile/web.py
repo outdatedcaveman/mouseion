@@ -774,9 +774,10 @@ def export_refs():
     ref_ids_param = request.args.get("ref_ids", "")
     try:
         from .db import RefDatabase
-        from .exporters.bibtex   import to_bibtex_string
-        from .exporters.ris      import to_ris_string
-        from .exporters.markdown import to_markdown_string
+        from .exporters.bibtex     import to_bibtex_string
+        from .exporters.ris        import to_ris_string
+        from .exporters.markdown   import to_markdown_string
+        from .exporters.zotero_rdf import to_zotero_rdf_string
         with RefDatabase() as db:
             if ref_ids_param:
                 ids  = [i.strip() for i in ref_ids_param.split(",") if i.strip()]
@@ -798,6 +799,9 @@ def export_refs():
         elif fmt == "markdown":
             content, mime = to_markdown_string(refs), "text/markdown"
             fname = fname_base + ".md"
+        elif fmt == "zotero_rdf":
+            content, mime = to_zotero_rdf_string(refs), "application/rdf+xml"
+            fname = fname_base + ".rdf"
         else:
             content, mime = to_bibtex_string(refs), "application/x-bibtex"
             fname = fname_base + ".bib"
@@ -1096,6 +1100,59 @@ def enrich_incomplete():
             with _jobs_lock:
                 _jobs[job_id] = {"status": "done", "count": n,
                                  "message": f"Enriched {n} reference{'s' if n != 1 else ''}"}
+        except Exception as e:
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "error", "message": str(e)}
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"job_id": job_id}), 202
+
+
+@app.route("/api/refs/enrich-selected", methods=["POST"])
+def enrich_selected():
+    """
+    Background job: re-enrich a specific list of ref IDs.
+    Body: { "ids": ["id1", "id2", ...] }
+    """
+    body   = request.json or {}
+    ids    = list(body.get("ids", []))[:200]
+    if not ids:
+        return jsonify({"error": "ids is required"}), 400
+    job_id = uuid.uuid4().hex[:10]
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "running", "message": f"Enriching {len(ids)} ref(s)…", "count": 0}
+
+    def _worker():
+        try:
+            import anyio
+            from .db     import RefDatabase
+            from .lookup import enrich_batch
+            from .tagger import auto_tag, tag_from_keywords
+            from .config import get_config
+
+            with RefDatabase() as db:
+                all_refs = db.list_all(limit=10_000)
+                targets  = [r for r in all_refs if r.id in set(ids)]
+
+            if not targets:
+                with _jobs_lock:
+                    _jobs[job_id] = {"status": "done", "count": 0, "message": "No matching refs found"}
+                return
+
+            async def _run():
+                return await enrich_batch(targets)
+
+            enriched = anyio.run(_run)
+            cfg      = get_config()
+            with RefDatabase() as db:
+                for ref in enriched:
+                    tags = list(set(auto_tag(ref, cfg) + tag_from_keywords(ref)))
+                    db.upsert(ref, tags=tags)
+
+            n = len(enriched)
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "done", "count": n,
+                                 "message": f"Re-enriched {n} reference{'s' if n != 1 else ''}"}
         except Exception as e:
             with _jobs_lock:
                 _jobs[job_id] = {"status": "error", "message": str(e)}
@@ -2318,6 +2375,7 @@ kbd {
         <div class="dd-item" data-fmt="ris">RIS (.ris)</div>
         <div class="dd-item" data-fmt="markdown">Markdown (.md)</div>
         <div class="dd-item" data-fmt="csv">CSV (.csv)</div>
+        <div class="dd-item" data-fmt="zotero_rdf">Zotero RDF (.rdf)</div>
         <div class="dd-item" id="dd-export-coll" data-fmt="bibtex" style="display:none">📁 Export Collection (.bib)</div>
       </div>
     </div>
@@ -2410,6 +2468,7 @@ kbd {
       <button class="sel-btn" onclick="batchCollPrompt()">📁 Collection</button>
       <button class="sel-btn sel-btn-del" onclick="batchDelete()">🗑 Delete</button>
       <button class="sel-btn" onclick="exportSelected()">⬇ Export</button>
+      <button class="sel-btn" onclick="enrichSelected()" title="Re-fetch metadata from all providers">🔄 Re-enrich</button>
       <button class="sel-btn" style="margin-left:auto" onclick="clearSel()">✕ Clear</button>
     </div>
     <div class="ref-list" id="ref-list" style="flex:1;border-right:none">
@@ -3224,6 +3283,30 @@ function exportSelected() {
   window.location.href = key ? url + `${sep}api_key=${encodeURIComponent(key)}` : url;
 }
 
+// ── Re-enrich selected refs ──────────────────────────────────────────────────
+async function enrichSelected() {
+  if (!selectedIds.size) return;
+  const ids = [...selectedIds];
+  showToast(`Starting re-enrichment of ${ids.length} ref(s)…`);
+  try {
+    const r = await apiFetch('/api/refs/enrich-selected', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    });
+    const { job_id } = await r.json();
+    const timer = setInterval(async () => {
+      const jr  = await apiFetch(`/api/jobs/${job_id}`);
+      const job = await jr.json();
+      if (job.status !== 'running') {
+        clearInterval(timer);
+        showToast(job.message || 'Done');
+        await loadRefs();
+      }
+    }, 1200);
+  } catch(e) { showToast('Re-enrichment failed', {}); }
+}
+
+// ── Find duplicates ──────────────────────────────────────────────────────────
 // ── Enrich incomplete ────────────────────────────────────────────────────────
 document.getElementById('btn-enrich-all').addEventListener('click', async () => {
   const threshold = parseFloat(prompt('Enrich refs below completeness (0.0–1.0):', '0.5') || '0.5');
@@ -3762,6 +3845,7 @@ function renderDetail(ref) {
 
     <div class="d-actions">
       ${openUrl ? `<a class="btn btn-ghost btn-sm" href="${openUrl}" target="_blank" rel="noopener">🔗 Open URL</a>` : ''}
+      ${ref.oa_url ? `<a class="btn btn-ghost btn-sm" href="${ref.oa_url}" target="_blank" rel="noopener" title="Open free full-text PDF via Unpaywall/OpenAlex">🔓 Free PDF</a>` : ''}
       ${ref.has_pdf ? `<a class="btn btn-ghost btn-sm"
           href="${apiBase()}/api/refs/${ref.id}/pdf${getCfg().key ? '?api_key=' + encodeURIComponent(getCfg().key) : ''}"
           target="_blank" rel="noopener">📄 PDF</a>` : ''}
