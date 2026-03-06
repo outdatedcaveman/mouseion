@@ -638,20 +638,51 @@ class RefDatabase:
         ref_id: str,
         notes: Optional[str] = None,
         status: Optional[str] = None,
+        # Bibliographic metadata edits
+        title: Optional[str] = None,
+        year: Optional[int] = None,
+        journal: Optional[str] = None,
+        volume: Optional[str] = None,
+        issue: Optional[str] = None,
+        pages: Optional[str] = None,
+        abstract: Optional[str] = None,
+        cite_key: Optional[str] = None,
+        authors_json: Optional[str] = None,
     ) -> None:
-        """Update user-editable fields (notes, status) on a reference."""
+        """Update user-editable fields on a reference.
+
+        Pass only the fields you want to change; None means «leave unchanged».
+        The FTS5 index is updated automatically via the refs_au trigger.
+        """
         _VALID_STATUS = {"unread", "reading", "read"}
         sets: List[str] = []
         params: Dict[str, Any] = {"id": ref_id}
-        if notes is not None:
-            sets.append("notes = :notes")
-            params["notes"] = notes
+
+        def _add(col: str, val) -> None:
+            if val is not None:
+                sets.append(f"{col} = :{col}")
+                params[col] = val
+
+        _add("notes",    notes)
+        _add("title",    title)
+        _add("year",     year)
+        _add("journal",  journal)
+        _add("volume",   volume)
+        _add("issue",    issue)
+        _add("pages",    pages)
+        _add("abstract", abstract)
+        _add("cite_key", cite_key)
+        _add("authors",  authors_json)
+
         if status is not None:
             if status not in _VALID_STATUS:
                 raise ValueError(f"status must be one of {_VALID_STATUS}")
             sets.append("status = :status")
             params["status"] = status
+
         if sets:
+            sets.append("updated_at = :updated_at")
+            params["updated_at"] = _now()
             with self._db() as conn:
                 conn.execute(
                     f"UPDATE refs SET {', '.join(sets)} WHERE id = :id", params

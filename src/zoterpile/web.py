@@ -297,16 +297,50 @@ def delete_ref(ref_id: str):
 
 @app.route("/api/refs/<ref_id>", methods=["PATCH"])
 def patch_ref(ref_id: str):
-    """Update user-editable fields: notes and/or status."""
-    body   = request.json or {}
-    notes  = body.get("notes")   # None = don't update
-    status = body.get("status")
+    """Update editable fields: notes, status, or bibliographic metadata."""
+    import json as _json
+    body = request.json or {}
+
+    # User-facing metadata
+    notes    = body.get("notes")
+    status   = body.get("status")
+    title    = body.get("title")
+    journal  = body.get("journal")
+    volume   = body.get("volume")
+    issue    = body.get("issue")
+    pages    = body.get("pages")
+    abstract = body.get("abstract")
+    cite_key = body.get("cite_key")
+
+    year = body.get("year")
+    if year is not None:
+        try:
+            year = int(year) if year != "" else None
+        except (TypeError, ValueError):
+            return jsonify({"error": "year must be an integer"}), 400
+
+    # Authors: accept either a list of {family, given} dicts or None
+    authors_json = None
+    if "authors" in body:
+        raw = body["authors"]
+        if isinstance(raw, list):
+            authors_json = _json.dumps(raw)
+        elif isinstance(raw, str):
+            authors_json = raw  # pre-serialized
+
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
             if db.get(ref_id) is None:
                 abort(404)
-            db.update_ref_fields(ref_id, notes=notes, status=status)
+            db.update_ref_fields(
+                ref_id,
+                notes=notes, status=status,
+                title=title, year=year,
+                journal=journal, volume=volume, issue=issue,
+                pages=pages, abstract=abstract,
+                cite_key=cite_key, authors_json=authors_json,
+            )
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -1698,6 +1732,51 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
 }
 .cite-copy-row { display: flex; justify-content: flex-end; margin-top: 6px; }
 
+/* ── Edit-in-place ── */
+.edit-field-wrap { display: flex; align-items: flex-start; gap: 5px; }
+.edit-pencil {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 12px; padding: 1px 3px; border-radius: 3px; flex-shrink: 0;
+  opacity: 0; transition: opacity .1s;
+}
+.edit-field-wrap:hover .edit-pencil { opacity: 1; }
+.edit-pencil:hover { color: var(--primary); background: var(--panel); }
+.edit-inp {
+  background: var(--panel); border: 1px solid var(--primary);
+  border-radius: 4px; padding: 3px 7px;
+  color: var(--text); font-size: inherit; font-family: inherit;
+  outline: none; flex: 1;
+}
+.edit-inp-area {
+  width: 100%; background: var(--panel); border: 1px solid var(--primary);
+  border-radius: 4px; padding: 5px 8px;
+  color: var(--text); font-size: 13px; font-family: var(--font);
+  resize: vertical; outline: none; line-height: 1.6; min-height: 60px;
+}
+.edit-save-row { display: flex; gap: 5px; margin-top: 4px; }
+.edit-save-btn {
+  padding: 2px 10px; border-radius: 4px; font-size: 11px;
+  cursor: pointer; border: 1px solid var(--primary);
+  background: var(--primary-dim); color: var(--text);
+  font-family: var(--font);
+}
+.edit-cancel-btn {
+  padding: 2px 8px; border-radius: 4px; font-size: 11px;
+  cursor: pointer; border: 1px solid var(--border);
+  background: transparent; color: var(--muted);
+  font-family: var(--font);
+}
+
+/* ── Keyboard help modal ── */
+.kbd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
+.kbd-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+kbd {
+  background: var(--panel); border: 1px solid var(--border-hi);
+  border-radius: 4px; padding: 1px 6px; font-size: 11px;
+  font-family: var(--mono); color: var(--text); white-space: nowrap;
+}
+.kbd-desc { color: var(--muted); }
+
 /* ── Advanced filter panel ── */
 .adv-filter-panel {
   display: none; flex-direction: column; gap: 12px;
@@ -1813,6 +1892,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
     <button class="btn btn-ghost" id="btn-duplicates" title="Find duplicate references">⚡ Dupes</button>
     <button class="btn btn-ghost" id="btn-stats" title="Library analytics">📊 Stats</button>
     <button class="btn btn-ghost" id="btn-enrich-all" title="Re-enrich incomplete references">🔧 Enrich</button>
+    <button class="btn btn-ghost" id="btn-kbd-help" title="Keyboard shortcuts">?</button>
     <button class="btn btn-ghost" id="btn-settings" title="Settings">⚙</button>
   </div>
 </header>
@@ -1883,6 +1963,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
       <button class="sel-btn" onclick="batchStatusPrompt()">◑ Status</button>
       <button class="sel-btn" onclick="batchCollPrompt()">📁 Collection</button>
       <button class="sel-btn sel-btn-del" onclick="batchDelete()">🗑 Delete</button>
+      <button class="sel-btn" onclick="exportSelected()">⬇ Export</button>
       <button class="sel-btn" style="margin-left:auto" onclick="clearSel()">✕ Clear</button>
     </div>
     <div class="ref-list" id="ref-list" style="flex:1;border-right:none">
@@ -1946,6 +2027,31 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
     <div class="similar-list" id="similar-list"></div>
     <div class="modal-foot">
       <button class="btn btn-ghost" onclick="document.getElementById('similar-modal').classList.remove('open')">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Keyboard Help Modal ── -->
+<div class="overlay" id="kbd-modal">
+  <div class="modal-box" style="width:520px">
+    <h2>⌨ Keyboard Shortcuts</h2>
+    <br>
+    <div class="kbd-grid">
+      <div class="kbd-row"><kbd>/</kbd><span class="kbd-desc">Focus search</span></div>
+      <div class="kbd-row"><kbd>a</kbd><span class="kbd-desc">Add reference</span></div>
+      <div class="kbd-row"><kbd>i</kbd><span class="kbd-desc">Import file</span></div>
+      <div class="kbd-row"><kbd>s</kbd><span class="kbd-desc">Library stats</span></div>
+      <div class="kbd-row"><kbd>r</kbd><span class="kbd-desc">Refresh list</span></div>
+      <div class="kbd-row"><kbd>?</kbd><span class="kbd-desc">This help</span></div>
+      <div class="kbd-row"><kbd>j</kbd> / <kbd>↓</kbd><span class="kbd-desc">Next reference</span></div>
+      <div class="kbd-row"><kbd>k</kbd> / <kbd>↑</kbd><span class="kbd-desc">Previous reference</span></div>
+      <div class="kbd-row"><kbd>Del</kbd><span class="kbd-desc">Delete selected</span></div>
+      <div class="kbd-row"><kbd>Ctrl</kbd>+<kbd>↵</kbd><span class="kbd-desc">Submit Add modal</span></div>
+      <div class="kbd-row"><kbd>Esc</kbd><span class="kbd-desc">Close modals</span></div>
+      <div class="kbd-row"></div>
+    </div>
+    <div class="modal-foot" style="margin-top:18px">
+      <button class="btn btn-ghost" onclick="document.getElementById('kbd-modal').classList.remove('open')">Close</button>
     </div>
   </div>
 </div>
@@ -2201,9 +2307,10 @@ document.addEventListener('keydown', e => {
     closeAdd();
     closeSettings();
     $ddExport.classList.remove('open');
-    document.getElementById('dupes-modal').classList.remove('open');
-    document.getElementById('import-modal').classList.remove('open');
-    document.getElementById('similar-modal').classList.remove('open');
+    ['dupes-modal','import-modal','similar-modal','stats-modal','kbd-modal'].forEach(id => {
+      document.getElementById(id)?.classList.remove('open');
+    });
+    cancelEdit(selId);  // cancel any active edit
     return;
   }
   if (isEditing()) return;
@@ -2470,6 +2577,106 @@ function renderStats(d) {
       <div class="bar-chart">${topN(d.top_authors, 'count', 6)}</div>
     </div>
   </div>`;
+}
+
+// ── Keyboard help ─────────────────────────────────────────────────────────────
+document.getElementById('btn-kbd-help').addEventListener('click', () => {
+  document.getElementById('kbd-modal').classList.add('open');
+});
+
+// ── Edit-in-place ─────────────────────────────────────────────────────────────
+const EDIT_LABELS = {
+  title:    'Title',
+  year:     'Year',
+  journal:  'Journal / Venue',
+  abstract: 'Abstract',
+  pages:    'Pages',
+  volume:   'Volume',
+  issue:    'Issue',
+};
+
+function startEdit(refId, field) {
+  const ref = refs.find(r => r.id === refId);
+  if (!ref) return;
+
+  const hostId = `ef-${field}-${refId}`;
+  let host = document.getElementById(hostId);
+
+  // For abstract/journal, the host may not exist if value is empty
+  if (!host) {
+    host = document.getElementById('detail');
+  }
+
+  const current = field === 'year' ? (ref.year || '')
+    : field === 'title'    ? (ref.title || '')
+    : field === 'journal'  ? (ref.journal || ref.container_title || '')
+    : field === 'abstract' ? (ref.abstract || '')
+    : '';
+
+  const isMultiline = field === 'abstract';
+  const inputHtml = isMultiline
+    ? `<textarea class="edit-inp-area" id="edit-active-inp">${esc(current)}</textarea>`
+    : `<input class="edit-inp" id="edit-active-inp" type="${field==='year'?'number':'text'}" value="${esc(current)}">`;
+
+  const editHtml = `<div id="edit-active-wrap" style="width:100%;margin-bottom:8px">
+    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">${EDIT_LABELS[field] || field}</div>
+    ${inputHtml}
+    <div class="edit-save-row">
+      <button class="edit-save-btn" onclick="commitEdit('${refId}','${field}')">✓ Save</button>
+      <button class="edit-cancel-btn" onclick="cancelEdit('${refId}')">Cancel</button>
+    </div>
+  </div>`;
+
+  // Replace the host element with our editor
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = editHtml;
+  if (host && host.parentNode) {
+    host.parentNode.replaceChild(wrapper.firstElementChild, host);
+  }
+  document.getElementById('edit-active-inp')?.focus();
+}
+
+async function commitEdit(refId, field) {
+  const inp = document.getElementById('edit-active-inp');
+  if (!inp) return;
+  const value = inp.value.trim();
+  const body  = { [field]: field === 'year' ? (value ? parseInt(value) : null) : value };
+  try {
+    const r = await apiFetch(`/api/refs/${refId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const err = await r.json();
+      alert('Save failed: ' + (err.error || r.status));
+      return;
+    }
+    // Update local ref cache
+    const ref = refs.find(r => r.id === refId);
+    if (ref) {
+      if (field === 'year')     ref.year     = body.year;
+      if (field === 'title')    ref.title    = value;
+      if (field === 'journal')  ref.journal  = value;
+      if (field === 'abstract') ref.abstract = value;
+      renderDetail(ref);
+      renderList();
+    }
+  } catch(e) { alert('Save failed: ' + e.message); }
+}
+
+function cancelEdit(refId) {
+  const ref = refs.find(r => r.id === refId);
+  if (ref) renderDetail(ref);
+}
+
+// ── Export selected refs ───────────────────────────────────────────────────
+function exportSelected() {
+  if (!selectedIds.size) return;
+  const key = getCfg().key;
+  const ids = [...selectedIds].join(',');
+  const url = apiBase() + `/api/export?fmt=bibtex&ref_ids=${ids}`;
+  const sep = url.includes('?') ? '&' : '?';
+  window.location.href = key ? url + `${sep}api_key=${encodeURIComponent(key)}` : url;
 }
 
 // ── Enrich incomplete ────────────────────────────────────────────────────────
@@ -2836,9 +3043,20 @@ function renderDetail(ref) {
     .map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
 
   $detail.innerHTML = `
-    <div class="d-title">${esc(ref.title)}</div>
-    <div class="d-authors">${esc(authors)}${esc(year)}</div>
-    ${venue ? `<div class="d-venue">${esc(venue)}</div>` : ''}
+    <div class="edit-field-wrap">
+      <div class="d-title" id="ef-title-${ref.id}">${esc(ref.title)}</div>
+      <button class="edit-pencil" title="Edit title" onclick="startEdit('${ref.id}','title')">✏</button>
+    </div>
+    <div class="edit-field-wrap">
+      <div class="d-authors" id="ef-authors-${ref.id}">${esc(authors)}${esc(year)}</div>
+      <button class="edit-pencil" title="Edit year" onclick="startEdit('${ref.id}','year')">✏</button>
+    </div>
+    ${venue ? `<div class="edit-field-wrap">
+      <div class="d-venue" id="ef-journal-${ref.id}">${esc(venue)}</div>
+      <button class="edit-pencil" title="Edit journal" onclick="startEdit('${ref.id}','journal')">✏</button>
+    </div>` : `<div style="margin-bottom:14px">
+      <button class="btn btn-ghost btn-sm" onclick="startEdit('${ref.id}','journal')">+ Add journal/venue</button>
+    </div>`}
     <div class="d-badges">${badges}</div>
 
     <div class="section-label">Reading Status</div>
@@ -2861,10 +3079,13 @@ function renderDetail(ref) {
     <hr class="div">
 
     ${ref.abstract ? `
-      <div class="section-label">Abstract</div>
-      <div class="abstract">${esc(ref.abstract)}</div>
+      <div class="section-label" style="display:flex;align-items:center;justify-content:space-between">
+        Abstract
+        <button class="edit-pencil" style="opacity:.7" title="Edit abstract" onclick="startEdit('${ref.id}','abstract')">✏</button>
+      </div>
+      <div class="abstract" id="ef-abstract-${ref.id}">${esc(ref.abstract)}</div>
       <hr class="div">
-    ` : ''}
+    ` : `<button class="btn btn-ghost btn-sm" style="margin-bottom:14px" onclick="startEdit('${ref.id}','abstract')">+ Add abstract</button><hr class="div">`}
 
     <div class="section-label">Notes</div>
     <textarea class="notes-ta" id="notes-${ref.id}"
