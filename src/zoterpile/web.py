@@ -1470,6 +1470,22 @@ def update_settings():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/settings/rotate-key", methods=["POST"])
+def rotate_api_key():
+    """Generate a new API key, invalidating the current one."""
+    global _api_key_cache
+    try:
+        new_key = uuid.uuid4().hex + uuid.uuid4().hex
+        from .db import RefDatabase
+        with RefDatabase() as db:
+            db.set_setting("api_key", new_key)
+        with _api_key_lock:
+            _api_key_cache = new_key
+        return jsonify({"api_key": new_key})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/refs/check-cite-key")
 def check_cite_key():
     """Check if a cite key is already in use. Returns {available: bool, used_by: id|null}."""
@@ -2464,6 +2480,7 @@ kbd {
     <div class="sel-toolbar" id="sel-toolbar">
       <span class="sel-count" id="sel-count"></span>
       <button class="sel-btn" onclick="batchTagPrompt()">🏷 Tag</button>
+      <button class="sel-btn" onclick="batchRemoveTagPrompt()" title="Remove a tag from selected refs">🏷⊖</button>
       <button class="sel-btn" onclick="batchStatusPrompt()">◑ Status</button>
       <button class="sel-btn" onclick="batchCollPrompt()">📁 Collection</button>
       <button class="sel-btn sel-btn-del" onclick="batchDelete()">🗑 Delete</button>
@@ -2523,6 +2540,9 @@ kbd {
     <input type="password" class="modal-ta" id="cfg-key" placeholder="64-character hex key"
            style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono)">
     <div class="modal-status" id="cfg-st"></div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">🔐 Rotate API key (invalidates current key)</div>
+    <button class="btn btn-ghost" id="btn-rotate-key" style="font-size:12px;padding:5px 12px">↻ Generate new API key</button>
     <div class="modal-foot">
       <button class="btn btn-ghost" id="btn-cfg-cancel">Cancel</button>
       <button class="btn btn-ghost" id="btn-cfg-test">Test connection</button>
@@ -2590,6 +2610,7 @@ kbd {
       <div class="kbd-row"><kbd>dblclick</kbd><span class="kbd-desc">Rename collection</span></div>
       <div class="kbd-row"><kbd>Ctrl</kbd>+<kbd>k</kbd><span class="kbd-desc">Command palette</span></div>
       <div class="kbd-row"><kbd>n</kbd><span class="kbd-desc">Focus notes (selected ref)</span></div>
+      <div class="kbd-row"><kbd>e</kbd><span class="kbd-desc">Re-enrich selected ref</span></div>
     </div>
     <div class="modal-foot" style="margin-top:18px">
       <button class="btn btn-ghost" onclick="document.getElementById('kbd-modal').classList.remove('open')">Close</button>
@@ -2769,6 +2790,26 @@ document.getElementById('btn-cfg-cancel').addEventListener('click', closeSetting
 $cfgModal.addEventListener('click', e => { if (e.target === $cfgModal) closeSettings(); });
 document.getElementById('btn-cfg-save').addEventListener('click', saveSettings);
 document.getElementById('btn-cfg-test').addEventListener('click', testConnection);
+document.getElementById('btn-rotate-key').addEventListener('click', async () => {
+  if (!confirm('Generate a new API key? Your current key will stop working immediately.')) return;
+  const btn = document.getElementById('btn-rotate-key');
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await apiFetch('/api/settings/rotate-key', { method: 'POST' });
+    const { api_key } = await r.json();
+    $cfgKey.value = api_key;
+    localStorage.setItem('zp_key', api_key);
+    $cfgSt.className = 'modal-status s-ok';
+    $cfgSt.textContent = '✓ New API key saved';
+    btn.textContent = '↻ Generate new API key';
+    btn.disabled = false;
+  } catch(e) {
+    $cfgSt.className = 'modal-status s-err';
+    $cfgSt.textContent = '✗ Failed to rotate key';
+    btn.textContent = '↻ Generate new API key';
+    btn.disabled = false;
+  }
+});
 
 function openSettings(msg) {
   const cfg = getCfg();
@@ -2883,6 +2924,10 @@ document.addEventListener('keydown', e => {
     // Focus notes textarea
     const ta = document.getElementById(`notes-${selId}`);
     if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); return; }
+  }
+  if ((e.key === 'e' || e.key === 'E') && selId) {
+    // Re-enrich current ref
+    reenrich(selId); return;
   }
   // j/k navigation
   if (e.key === 'j' || e.key === 'ArrowDown') {
@@ -3850,6 +3895,7 @@ function renderDetail(ref) {
           href="${apiBase()}/api/refs/${ref.id}/pdf${getCfg().key ? '?api_key=' + encodeURIComponent(getCfg().key) : ''}"
           target="_blank" rel="noopener">📄 PDF</a>` : ''}
       <button class="btn btn-ghost btn-sm" onclick="copyDeepLink('${ref.id}')" title="Copy shareable link to this reference">⛓ Share</button>
+      ${ref.title ? `<a class="btn btn-ghost btn-sm" href="https://scholar.google.com/scholar?q=${encodeURIComponent(ref.title)}" target="_blank" rel="noopener" title="Search Google Scholar">🎓 Scholar</a>` : ''}
       <button class="btn btn-ghost btn-sm" onclick="showSimilar('${ref.id}')">🔮 Similar</button>
       <button class="btn btn-ghost btn-sm" onclick="reenrich('${ref.id}')">↻ Refresh</button>
       <button class="btn btn-ghost btn-sm"
@@ -4514,6 +4560,23 @@ async function batchTagPrompt() {
     method: 'POST',
     body: JSON.stringify({ ref_ids: [...selectedIds], action: 'tag', tag: tag.trim().toLowerCase() }),
   });
+  clearSel(); await loadRefs();
+}
+
+async function batchRemoveTagPrompt() {
+  const allTags = await apiFetch('/api/tags').then(r => r.json()).catch(() => []);
+  const tagNames = Array.isArray(allTags) ? allTags.map(t => t.name) : [];
+  const tag = prompt(`Tag to REMOVE from ${selectedIds.size} selected references:\nExisting tags: ${tagNames.slice(0,10).join(', ')}${tagNames.length>10?' …':''}`);
+  if (!tag?.trim()) return;
+  const ids = [...selectedIds];
+  let removed = 0;
+  await Promise.all(ids.map(async id => {
+    try {
+      await apiFetch(`/api/refs/${id}/tags/${encodeURIComponent(tag.trim().toLowerCase())}`, { method: 'DELETE' });
+      removed++;
+    } catch(e) { /* skip */ }
+  }));
+  showToast(`Removed tag "${tag.trim()}" from ${removed} ref(s)`);
   clearSel(); await loadRefs();
 }
 
