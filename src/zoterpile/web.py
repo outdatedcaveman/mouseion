@@ -32,6 +32,69 @@ app.json.sort_keys = False
 _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
+# Cached API key (loaded from DB on first use)
+_api_key_cache: Optional[str] = None
+_api_key_lock  = threading.Lock()
+
+
+def _get_or_create_api_key() -> str:
+    """Return the API key, generating and persisting one if absent."""
+    global _api_key_cache
+    with _api_key_lock:
+        if _api_key_cache:
+            return _api_key_cache
+        try:
+            from .db import RefDatabase
+            with RefDatabase() as db:
+                stored = db.get_setting("api_key")
+                if stored:
+                    _api_key_cache = stored
+                    return _api_key_cache
+                new_key = uuid.uuid4().hex + uuid.uuid4().hex  # 64-char hex
+                db.set_setting("api_key", new_key)
+                _api_key_cache = new_key
+                return _api_key_cache
+        except Exception:
+            # DB not available yet — generate ephemeral key
+            if not _api_key_cache:
+                _api_key_cache = uuid.uuid4().hex + uuid.uuid4().hex
+            return _api_key_cache
+
+
+@app.before_request
+def _require_api_key() -> Optional[Response]:
+    """Enforce API key authentication for all /api/* routes."""
+    if not request.path.startswith("/api/"):
+        return None  # public routes: /, /manifest.json, /sw.js, /webhooks/*
+    key = _get_or_create_api_key()
+    # Check Authorization: Bearer <key>, X-API-Key: <key>, or ?api_key= query param
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        provided = auth_header[7:].strip()
+    else:
+        provided = (request.headers.get("X-API-Key", "")
+                    or request.args.get("api_key", "")).strip()
+    if not hmac.compare_digest(provided, key):
+        return jsonify({"error": "Unauthorized — invalid or missing API key"}), 401
+    return None
+
+
+@app.after_request
+def _add_cors(response: Response) -> Response:
+    """Add CORS headers to all responses (needed for browser extension and remote clients)."""
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, X-API-Key"
+    )
+    return response
+
+
+@app.route("/api/auth/check")
+def auth_check():
+    """Lightweight endpoint to verify the API key is valid."""
+    return jsonify({"ok": True})
+
 # Zotero streaming state — managed by the streaming background thread
 _stream_thread: Optional[threading.Thread] = None
 _stream_status: Dict[str, Any] = {
@@ -415,6 +478,73 @@ def _notion_webhook_secret() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# PWA support — manifest, service worker, icon
+# ---------------------------------------------------------------------------
+
+@app.route("/manifest.json")
+def pwa_manifest():
+    return jsonify({
+        "name": "zoterpile",
+        "short_name": "zoterpile",
+        "description": "Reference manager — search, enrich, sync",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0d0d12",
+        "theme_color": "#5b8af5",
+        "icons": [
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"},
+        ],
+    })
+
+
+@app.route("/icon.svg")
+def pwa_icon():
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        '<rect width="64" height="64" rx="12" fill="#0d0d12"/>'
+        '<text x="32" y="46" font-size="38" text-anchor="middle" '
+        'font-family="system-ui" fill="#5b8af5">&#128194;</text>'
+        '</svg>'
+    )
+    return Response(svg, mimetype="image/svg+xml")
+
+
+@app.route("/sw.js")
+def service_worker():
+    """Minimal service worker for PWA installability and offline shell caching."""
+    js = r"""
+const CACHE = 'zoterpile-v1';
+const SHELL = ['/'];
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+// Network-first for API; cache-first for shell.
+self.addEventListener('fetch', e => {
+  if (e.request.url.includes('/api/')) {
+    e.respondWith(fetch(e.request));
+  } else {
+    e.respondWith(
+      caches.match(e.request).then(cached => cached || fetch(e.request))
+    );
+  }
+});
+"""
+    return Response(js, mimetype="application/javascript")
+
+
+# ---------------------------------------------------------------------------
 # Frontend
 # ---------------------------------------------------------------------------
 
@@ -475,6 +605,11 @@ _HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#5b8af5">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.svg">
 <title>zoterpile</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -756,6 +891,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
         <div class="dd-item" data-fmt="markdown">Markdown (.md)</div>
       </div>
     </div>
+    <button class="btn btn-ghost" id="btn-settings" title="Settings">⚙</button>
   </div>
 </header>
 
@@ -790,6 +926,29 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; }
   </div>
 </div>
 
+<!-- ── Settings Modal ── -->
+<div class="overlay" id="settings-modal">
+  <div class="modal-box">
+    <h2>⚙ Settings</h2>
+    <p class="modal-hint">
+      Connect to a remote zoterpile server. Leave blank to use the local server.<br>
+      The API key is shown in the server console on startup.
+    </p>
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Server URL</label>
+    <input type="url" class="modal-ta" id="cfg-url" placeholder="http://localhost:7274"
+           style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:12px">
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">API Key</label>
+    <input type="password" class="modal-ta" id="cfg-key" placeholder="64-character hex key"
+           style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono)">
+    <div class="modal-status" id="cfg-st"></div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="btn-cfg-cancel">Cancel</button>
+      <button class="btn btn-ghost" id="btn-cfg-test">Test connection</button>
+      <button class="btn btn-primary" id="btn-cfg-save">Save</button>
+    </div>
+  </div>
+</div>
+
 <script>
 'use strict';
 
@@ -809,9 +968,57 @@ const $addTa    = document.getElementById('add-ta');
 const $addSt    = document.getElementById('add-st');
 const $addBtn   = document.getElementById('btn-add-submit');
 const $ddExport = document.getElementById('dd-export');
+const $cfgModal = document.getElementById('settings-modal');
+const $cfgUrl   = document.getElementById('cfg-url');
+const $cfgKey   = document.getElementById('cfg-key');
+const $cfgSt    = document.getElementById('cfg-st');
+
+// ── Config / API key ───────────────────────────────────────────────────────
+function getCfg() {
+  return {
+    url: localStorage.getItem('zp_url') || '',
+    key: localStorage.getItem('zp_key') || '',
+  };
+}
+function apiBase() {
+  const u = getCfg().url.replace(/\/$/, '');
+  return u || '';
+}
+function apiHeaders(extra) {
+  const h = { 'Content-Type': 'application/json' };
+  const k = getCfg().key;
+  if (k) h['X-API-Key'] = k;
+  return Object.assign(h, extra || {});
+}
+
+// Wrapper for fetch that handles 401 by opening settings modal
+async function apiFetch(path, opts) {
+  const url = apiBase() + path;
+  const res = await fetch(url, Object.assign({}, opts, {
+    headers: apiHeaders((opts || {}).headers),
+  }));
+  if (res.status === 401) {
+    openSettings('⚠ Authentication failed — check your API key');
+    throw new Error('Unauthorized');
+  }
+  return res;
+}
 
 // ── Init ───────────────────────────────────────────────────────────────────
-loadRefs();
+(async () => {
+  // Register service worker for PWA
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
+  // If no key stored, try to detect we're on the same origin (key not needed)
+  const { key } = getCfg();
+  if (!key) {
+    // First load — open settings if we get a 401
+    loadRefs();
+  } else {
+    loadRefs();
+  }
+})();
 
 // ── Search (debounced) ─────────────────────────────────────────────────────
 let searchT = null;
@@ -837,6 +1044,50 @@ $addModal.addEventListener('click', e => { if (e.target === $addModal) closeAdd(
 $addBtn.addEventListener('click', submitAdd);
 $addTa.addEventListener('keydown', e => { if (e.key === 'Enter' && e.ctrlKey) submitAdd(); });
 
+// ── Settings modal ─────────────────────────────────────────────────────────
+document.getElementById('btn-settings').addEventListener('click', () => openSettings());
+document.getElementById('btn-cfg-cancel').addEventListener('click', closeSettings);
+$cfgModal.addEventListener('click', e => { if (e.target === $cfgModal) closeSettings(); });
+document.getElementById('btn-cfg-save').addEventListener('click', saveSettings);
+document.getElementById('btn-cfg-test').addEventListener('click', testConnection);
+
+function openSettings(msg) {
+  const cfg = getCfg();
+  $cfgUrl.value = cfg.url;
+  $cfgKey.value = cfg.key;
+  $cfgSt.textContent = msg || '';
+  $cfgSt.className = msg ? 'modal-status s-err' : 'modal-status';
+  $cfgModal.classList.add('open');
+}
+function closeSettings() { $cfgModal.classList.remove('open'); }
+function saveSettings() {
+  localStorage.setItem('zp_url', $cfgUrl.value.trim());
+  localStorage.setItem('zp_key', $cfgKey.value.trim());
+  closeSettings();
+  loadRefs();
+}
+async function testConnection() {
+  $cfgSt.className = 'modal-status s-run';
+  $cfgSt.innerHTML = '<span class="spin"></span>Testing…';
+  const base = ($cfgUrl.value.trim()).replace(/\/$/, '');
+  const key  = $cfgKey.value.trim();
+  try {
+    const res = await fetch((base || '') + '/api/auth/check', {
+      headers: key ? { 'X-API-Key': key } : {},
+    });
+    if (res.ok) {
+      $cfgSt.className = 'modal-status s-ok';
+      $cfgSt.textContent = '✓ Connected successfully';
+    } else {
+      $cfgSt.className = 'modal-status s-err';
+      $cfgSt.textContent = `✗ Server returned ${res.status}`;
+    }
+  } catch(e) {
+    $cfgSt.className = 'modal-status s-err';
+    $cfgSt.textContent = '✗ Could not reach server';
+  }
+}
+
 // ── Export dropdown ────────────────────────────────────────────────────────
 document.getElementById('btn-export-toggle').addEventListener('click', e => {
   e.stopPropagation();
@@ -846,14 +1097,17 @@ document.addEventListener('click', () => $ddExport.classList.remove('open'));
 $ddExport.addEventListener('click', e => e.stopPropagation());
 document.querySelectorAll('.dd-item').forEach(el => {
   el.addEventListener('click', () => {
-    window.location.href = `/api/export?fmt=${el.dataset.fmt}`;
+    const key = getCfg().key;
+    const url = apiBase() + `/api/export?fmt=${el.dataset.fmt}`;
+    // Exports need auth — append key as query param for direct download
+    window.location.href = key ? url + `&api_key=${encodeURIComponent(key)}` : url;
     $ddExport.classList.remove('open');
   });
 });
 
 // ── Keyboard shortcuts ─────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { closeAdd(); $ddExport.classList.remove('open'); }
+  if (e.key === 'Escape') { closeAdd(); closeSettings(); $ddExport.classList.remove('open'); }
   if (e.key === 'a' && !isEditing()) openAdd();
   if (e.key === '/' && !isEditing()) { e.preventDefault(); $search.focus(); }
 });
@@ -869,7 +1123,7 @@ async function loadRefs() {
   if (filter.type) params.set('type', filter.type);
   if (filter.oa)   params.set('oa', 'true');
   try {
-    const r = await fetch('/api/refs?' + params);
+    const r = await apiFetch('/api/refs?' + params);
     refs = await r.json();
     if (!Array.isArray(refs)) { refs = []; }
     renderList();
@@ -984,9 +1238,8 @@ async function addTagBtn(refId) {
   const inp = document.getElementById(`ti-${refId}`);
   const tag = inp.value.trim().toLowerCase();
   if (!tag) return;
-  await fetch(`/api/refs/${refId}/tags`, {
+  await apiFetch(`/api/refs/${refId}/tags`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tag }),
   });
   inp.value = '';
@@ -995,7 +1248,7 @@ async function addTagBtn(refId) {
 }
 
 async function rmTag(refId, tag) {
-  await fetch(`/api/refs/${refId}/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' });
+  await apiFetch(`/api/refs/${refId}/tags/${encodeURIComponent(tag)}`, { method: 'DELETE' });
   const ref = refs.find(r => r.id === refId);
   if (ref) { ref.tags = ref.tags.filter(t => t !== tag); renderDetail(ref); renderList(); }
 }
@@ -1004,7 +1257,7 @@ async function rmTag(refId, tag) {
 async function delRef(refId) {
   const ref = refs.find(r => r.id === refId);
   if (!confirm(`Delete "${ref?.title || 'this reference'}"?\nThis cannot be undone.`)) return;
-  await fetch(`/api/refs/${refId}`, { method: 'DELETE' });
+  await apiFetch(`/api/refs/${refId}`, { method: 'DELETE' });
   selId = null;
   $detail.innerHTML = '<div class="detail-ph">Select a reference to see details</div>';
   await loadRefs();
@@ -1028,9 +1281,8 @@ async function submitAdd() {
   $addSt.className = 'modal-status s-run';
   $addSt.innerHTML = '<span class="spin"></span>Looking up…';
   try {
-    const r = await fetch('/api/refs', {
+    const r = await apiFetch('/api/refs', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
     });
     const { job_id } = await r.json();
@@ -1043,7 +1295,7 @@ async function submitAdd() {
 }
 
 async function pollJob(jobId) {
-  const r   = await fetch(`/api/jobs/${jobId}`);
+  const r   = await apiFetch(`/api/jobs/${jobId}`);
   const job = await r.json();
   if (job.status === 'running') {
     $addSt.innerHTML = `<span class="spin"></span>${esc(job.message)}`;
@@ -1100,8 +1352,14 @@ function typeLabel(t) { return TYPE_LABELS[t] || t; }
 
 def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
     """Start the web UI. Called by `zoterpile web` and `zoterpile-web` script."""
-    print(f"\n  ✦ zoterpile web UI  →  http://{host}:{port}\n"
-          f"    Press Ctrl+C to stop.\n")
+    api_key = _get_or_create_api_key()
+    scheme = "http"
+    print(
+        f"\n  ✦ zoterpile web UI  →  {scheme}://{host}:{port}"
+        f"\n  API Key             →  {api_key}"
+        f"\n  (Set X-API-Key header or save key in the ⚙ Settings modal)"
+        f"\n\n  Press Ctrl+C to stop.\n"
+    )
     app.run(host=host, port=port, debug=debug, threaded=True)
 
 

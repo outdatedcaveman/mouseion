@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zoterpile</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 340px;
+    min-height: 200px;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    background: #0d0d12;
+    color: #e0e0ec;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px 10px;
+    border-bottom: 1px solid #2a2a3a;
+  }
+  .logo { font-weight: 700; font-size: 16px; color: #5b8af5; letter-spacing: -0.5px; }
+  .btn-gear { background: none; border: none; cursor: pointer; color: #888; font-size: 18px; padding: 2px 4px; }
+  .btn-gear:hover { color: #e0e0ec; }
+  .body { padding: 14px; }
+  .detected {
+    background: #1a1a2e;
+    border: 1px solid #2a2a3a;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    font-size: 12px;
+  }
+  .detected-label { color: #888; font-size: 11px; margin-bottom: 4px; }
+  .detected-value { color: #5b8af5; font-family: monospace; word-break: break-all; }
+  .input-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  input[type="text"] {
+    flex: 1;
+    background: #1a1a2e;
+    border: 1px solid #2a2a3a;
+    border-radius: 6px;
+    color: #e0e0ec;
+    padding: 8px 10px;
+    font-size: 13px;
+    outline: none;
+  }
+  input[type="text"]:focus { border-color: #5b8af5; }
+  input[type="text"]::placeholder { color: #555; }
+  .btn {
+    background: #5b8af5;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn:hover { background: #4a78e0; }
+  .btn:disabled { background: #2a2a5a; color: #555; cursor: not-allowed; }
+  .btn-full { width: 100%; display: block; text-align: center; }
+  .status {
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin-top: 8px;
+    display: none;
+  }
+  .status.show { display: block; }
+  .status.ok   { background: #0d2a1a; color: #4caf7d; border: 1px solid #1a4a2a; }
+  .status.err  { background: #2a0d0d; color: #e57373; border: 1px solid #4a1a1a; }
+  .status.run  { background: #1a1a2e; color: #888; border: 1px solid #2a2a3a; }
+  .footer {
+    padding: 8px 14px;
+    border-top: 1px solid #2a2a3a;
+    display: flex;
+    gap: 8px;
+  }
+  .btn-ghost {
+    background: #1a1a2e;
+    color: #aaa;
+    border: 1px solid #2a2a3a;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    flex: 1;
+    text-align: center;
+  }
+  .btn-ghost:hover { background: #2a2a3e; color: #e0e0ec; }
+  .not-configured {
+    text-align: center;
+    padding: 20px 14px;
+    color: #888;
+  }
+  .not-configured p { margin-bottom: 12px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <span class="logo">📚 zoterpile</span>
+  <button class="btn-gear" id="btn-options" title="Options">⚙</button>
+</div>
+
+<div id="not-configured" class="not-configured" style="display:none">
+  <p>Configure your zoterpile server to get started.</p>
+  <button class="btn btn-full" id="btn-go-options">Open Settings</button>
+</div>
+
+<div id="main-ui">
+  <div class="body">
+    <div id="detected-box" class="detected" style="display:none">
+      <div class="detected-label" id="detected-label">Detected on page</div>
+      <div class="detected-value" id="detected-value"></div>
+    </div>
+    <div class="input-row">
+      <input type="text" id="inp-ref"
+             placeholder="DOI, arXiv ID, URL, or title…">
+      <button class="btn" id="btn-save">Save</button>
+    </div>
+    <div class="status" id="status"></div>
+  </div>
+  <div class="footer">
+    <button class="btn-ghost" id="btn-open-web">Open Library</button>
+    <button class="btn-ghost" id="btn-page-ref">Save This Page</button>
+  </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
