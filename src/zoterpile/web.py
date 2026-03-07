@@ -327,16 +327,11 @@ def recent_refs():
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
-            conn = db._conn
-            rows = conn.execute(
-                "SELECT * FROM refs ORDER BY rowid DESC LIMIT ?", (n,)
-            ).fetchall()
-            from .db import _row_to_ref
-            refs_list = [_row_to_ref(r) for r in rows]
-            ref_ids = [r.id for r in refs_list if r.id]
-            tags_map = db.get_tags_batch(ref_ids)
+            refs_list = db.list_recent(n)
+            ref_ids   = [_ref_id(r) for r in refs_list]
+            tags_map  = db.get_tags_batch(ref_ids)
         result = [
-            _ref_to_dict(ref, tags_map.get(ref.id or "", []), ref.id or "")
+            _ref_to_dict(ref, tags_map.get(_ref_id(ref), []), _ref_id(ref))
             for ref in refs_list
         ]
         return jsonify(result)
@@ -811,9 +806,7 @@ def merge_refs():
             if not keep_extra.get("notes") and drop_extra.get("notes"):
                 db.update_ref_fields(keep_id, notes=drop_extra["notes"])
             # Delete the weaker ref
-            conn = db._conn
-            conn.execute("DELETE FROM refs WHERE id = ?", (drop_id,))
-            conn.commit()
+            db.delete_ref(drop_id)
         return jsonify({"ok": True, "kept": keep_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1685,12 +1678,9 @@ def check_cite_key():
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
-            conn = db._conn
-            row = conn.execute(
-                "SELECT id FROM refs WHERE cite_key = ? LIMIT 1", (key,)
-            ).fetchone()
-        if row:
-            return jsonify({"available": False, "used_by": row["id"]})
+            used_by = db.find_by_cite_key(key)
+        if used_by:
+            return jsonify({"available": False, "used_by": used_by})
         return jsonify({"available": True, "used_by": None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

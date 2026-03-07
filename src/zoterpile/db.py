@@ -1223,6 +1223,29 @@ class RefDatabase:
             )
             return cur.fetchone()[0]
 
+    def list_recent(self, n: int = 20) -> List[Reference]:
+        """Return the N most recently inserted references (by rowid DESC)."""
+        with self._db() as conn:
+            cur = conn.execute(
+                "SELECT * FROM refs ORDER BY rowid DESC LIMIT ?", (min(n, 1000),)
+            )
+            return [_row_to_ref(r) for r in cur.fetchall()]
+
+    def delete_ref(self, ref_id: str) -> bool:
+        """Delete a reference by ID. Returns True if a row was deleted."""
+        with self._db() as conn:
+            cur = conn.execute("DELETE FROM refs WHERE id = ?", (ref_id,))
+            return cur.rowcount > 0
+
+    def find_by_cite_key(self, cite_key: str) -> Optional[str]:
+        """Return the ref_id that uses the given cite_key, or None."""
+        with self._db() as conn:
+            cur = conn.execute(
+                "SELECT id FROM refs WHERE cite_key = ? LIMIT 1", (cite_key,)
+            )
+            row = cur.fetchone()
+            return row["id"] if row else None
+
 
 # ---------------------------------------------------------------------------
 # FTS query helper

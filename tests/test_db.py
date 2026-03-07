@@ -661,3 +661,39 @@ class TestAnalytics:
         tmp_db.update_ref_fields(r1, status="read")
         count = tmp_db.count_read_since("2000-01-01")
         assert count >= 1
+
+    def test_list_recent(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.ana/7", title="First"))
+        r2 = tmp_db.upsert(_make_ref(doi="10.ana/8", title="Second"))
+        recent = tmp_db.list_recent(2)
+        # Second was inserted last, so it should appear first
+        assert recent[0].doi == "10.ana/8"
+        assert recent[1].doi == "10.ana/7"
+
+    def test_list_recent_respects_limit(self, tmp_db):
+        for i in range(5):
+            tmp_db.upsert(_make_ref(doi=f"10.ana/r{i}"))
+        recent = tmp_db.list_recent(3)
+        assert len(recent) == 3
+
+    def test_delete_ref(self, tmp_db):
+        rid = tmp_db.upsert(_make_ref(doi="10.ana/del1"))
+        deleted = tmp_db.delete_ref(rid)
+        assert deleted is True
+        assert tmp_db.get(rid) is None
+
+    def test_delete_ref_nonexistent_returns_false(self, tmp_db):
+        deleted = tmp_db.delete_ref("doi:nonexistent")
+        assert deleted is False
+
+    def test_find_by_cite_key_found(self, tmp_db):
+        ref = _make_ref(doi="10.ana/ck1")
+        rid = tmp_db.upsert(ref)
+        # Manually set a cite_key
+        tmp_db.update_ref_fields(rid, cite_key="smith2024test")
+        result = tmp_db.find_by_cite_key("smith2024test")
+        assert result == rid
+
+    def test_find_by_cite_key_not_found(self, tmp_db):
+        result = tmp_db.find_by_cite_key("nonexistent_key")
+        assert result is None
