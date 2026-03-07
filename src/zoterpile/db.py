@@ -305,6 +305,7 @@ class RefDatabase:
     CREATE INDEX IF NOT EXISTS idx_complete   ON refs (completeness);
     CREATE INDEX IF NOT EXISTS idx_created_at ON refs (created_at);
     CREATE INDEX IF NOT EXISTS idx_updated_at ON refs (updated_at);
+    CREATE INDEX IF NOT EXISTS idx_oa         ON refs (open_access) WHERE open_access = 1;
 
     CREATE TABLE IF NOT EXISTS tags (
         id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -381,6 +382,7 @@ class RefDatabase:
     _MIGRATIONS = [
         "ALTER TABLE refs ADD COLUMN notes  TEXT",
         "ALTER TABLE refs ADD COLUMN status TEXT DEFAULT 'unread'",
+        "CREATE INDEX IF NOT EXISTS idx_status ON refs (status)",
         """CREATE TABLE IF NOT EXISTS saved_searches (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             name       TEXT NOT NULL,
