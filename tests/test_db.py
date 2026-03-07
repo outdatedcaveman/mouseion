@@ -400,3 +400,185 @@ class TestFtsQuery:
     def test_empty_query(self):
         q = _fts_query("")
         assert q == ""
+
+
+# ---------------------------------------------------------------------------
+# Collection CRUD
+# ---------------------------------------------------------------------------
+
+class TestCollections:
+    def test_create_and_list(self, tmp_db):
+        cid = tmp_db.create_collection("My Papers")
+        assert isinstance(cid, int)
+        colls = tmp_db.get_collections()
+        names = [c["name"] for c in colls]
+        assert "My Papers" in names
+
+    def test_create_strips_whitespace(self, tmp_db):
+        cid = tmp_db.create_collection("  Trimmed  ")
+        colls = tmp_db.get_collections()
+        c = next(c for c in colls if c["id"] == cid)
+        assert c["name"] == "Trimmed"
+
+    def test_rename(self, tmp_db):
+        cid = tmp_db.create_collection("Old Name")
+        tmp_db.rename_collection(cid, "New Name")
+        colls = tmp_db.get_collections()
+        c = next(c for c in colls if c["id"] == cid)
+        assert c["name"] == "New Name"
+
+    def test_delete(self, tmp_db):
+        cid = tmp_db.create_collection("Delete Me")
+        tmp_db.delete_collection(cid)
+        ids = [c["id"] for c in tmp_db.get_collections()]
+        assert cid not in ids
+
+    def test_add_ref_and_list(self, tmp_db):
+        ref = _make_ref(doi="10.coll/1")
+        rid = tmp_db.upsert(ref)
+        cid = tmp_db.create_collection("Science")
+        tmp_db.add_to_collection(rid, cid)
+        refs = tmp_db.list_collection_refs(cid)
+        assert any(r.doi == "10.coll/1" for r in refs)
+
+    def test_remove_from_collection(self, tmp_db):
+        ref = _make_ref(doi="10.coll/2")
+        rid = tmp_db.upsert(ref)
+        cid = tmp_db.create_collection("Temp Coll")
+        tmp_db.add_to_collection(rid, cid)
+        tmp_db.remove_from_collection(rid, cid)
+        refs = tmp_db.list_collection_refs(cid)
+        assert not any(r.doi == "10.coll/2" for r in refs)
+
+    def test_get_ref_collections(self, tmp_db):
+        ref = _make_ref(doi="10.coll/3")
+        rid = tmp_db.upsert(ref)
+        cid1 = tmp_db.create_collection("A")
+        cid2 = tmp_db.create_collection("B")
+        tmp_db.add_to_collection(rid, cid1)
+        tmp_db.add_to_collection(rid, cid2)
+        colls = tmp_db.get_ref_collections(rid)
+        names = [c["name"] for c in colls]
+        assert "A" in names and "B" in names
+
+    def test_add_duplicate_is_idempotent(self, tmp_db):
+        ref = _make_ref(doi="10.coll/4")
+        rid = tmp_db.upsert(ref)
+        cid = tmp_db.create_collection("No Dupe")
+        tmp_db.add_to_collection(rid, cid)
+        tmp_db.add_to_collection(rid, cid)  # should not raise
+        refs = tmp_db.list_collection_refs(cid)
+        assert len([r for r in refs if r.doi == "10.coll/4"]) == 1
+
+    def test_ref_count_in_collection(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.coll/5"))
+        r2 = tmp_db.upsert(_make_ref(doi="10.coll/6"))
+        cid = tmp_db.create_collection("Counted")
+        tmp_db.add_to_collection(r1, cid)
+        tmp_db.add_to_collection(r2, cid)
+        colls = tmp_db.get_collections()
+        c = next(c for c in colls if c["id"] == cid)
+        assert c["ref_count"] == 2
+
+    def test_subcollection_parent_id(self, tmp_db):
+        parent = tmp_db.create_collection("Parent")
+        child  = tmp_db.create_collection("Child", parent_id=parent)
+        colls  = tmp_db.get_collections()
+        child_row = next(c for c in colls if c["id"] == child)
+        assert child_row["parent_id"] == parent
+
+    def test_empty_collection_ref_count_zero(self, tmp_db):
+        cid = tmp_db.create_collection("Empty")
+        colls = tmp_db.get_collections()
+        c = next(c for c in colls if c["id"] == cid)
+        assert c["ref_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tag CRUD
+# ---------------------------------------------------------------------------
+
+class TestTags:
+    def test_add_and_get_tags(self, tmp_db):
+        ref = _make_ref(doi="10.tag/1")
+        rid = tmp_db.upsert(ref)
+        tmp_db.add_tags(rid, ["ml", "nlp"])
+        tags = tmp_db.get_tags(rid)
+        assert "ml" in tags
+        assert "nlp" in tags
+
+    def test_remove_tag(self, tmp_db):
+        ref = _make_ref(doi="10.tag/2")
+        rid = tmp_db.upsert(ref)
+        tmp_db.add_tags(rid, ["keep", "drop"])
+        tmp_db.remove_tag(rid, "drop")
+        tags = tmp_db.get_tags(rid)
+        assert "keep" in tags
+        assert "drop" not in tags
+
+    def test_all_tags_lists_all(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.tag/3"))
+        r2 = tmp_db.upsert(_make_ref(doi="10.tag/4"))
+        tmp_db.add_tags(r1, ["alpha"])
+        tmp_db.add_tags(r2, ["beta"])
+        tag_names = [t["name"] for t in tmp_db.all_tags()]
+        assert "alpha" in tag_names
+        assert "beta" in tag_names
+
+    def test_duplicate_tag_is_idempotent(self, tmp_db):
+        ref = _make_ref(doi="10.tag/5")
+        rid = tmp_db.upsert(ref)
+        tmp_db.add_tags(rid, ["dup"])
+        tmp_db.add_tags(rid, ["dup"])  # should not raise or duplicate
+        tags = tmp_db.get_tags(rid)
+        assert tags.count("dup") == 1
+
+    def test_tags_batch(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.tag/6"))
+        r2 = tmp_db.upsert(_make_ref(doi="10.tag/7"))
+        tmp_db.add_tags(r1, ["x"])
+        tmp_db.add_tags(r2, ["y"])
+        result = tmp_db.get_tags_batch([r1, r2])
+        assert "x" in result[r1]
+        assert "y" in result[r2]
+
+    def test_upsert_with_tags(self, tmp_db):
+        ref = _make_ref(doi="10.tag/8")
+        rid = tmp_db.upsert(ref, tags=["auto1", "auto2"])
+        tags = tmp_db.get_tags(rid)
+        assert "auto1" in tags
+        assert "auto2" in tags
+
+
+# ---------------------------------------------------------------------------
+# Saved searches
+# ---------------------------------------------------------------------------
+
+class TestSavedSearches:
+    def test_create_and_list(self, tmp_db):
+        sid = tmp_db.create_saved_search("My Search", "neural networks", "{}")
+        assert isinstance(sid, int)
+        searches = tmp_db.list_saved_searches()
+        names = [s["name"] for s in searches]
+        assert "My Search" in names
+
+    def test_list_is_ordered_by_name(self, tmp_db):
+        tmp_db.create_saved_search("Zebra", "z", "{}")
+        tmp_db.create_saved_search("Apple", "a", "{}")
+        names = [s["name"] for s in tmp_db.list_saved_searches()]
+        assert names.index("Apple") < names.index("Zebra")
+
+    def test_delete_saved_search(self, tmp_db):
+        sid = tmp_db.create_saved_search("To Delete", "delete", "{}")
+        tmp_db.delete_saved_search(sid)
+        ids = [s["id"] for s in tmp_db.list_saved_searches()]
+        assert sid not in ids
+
+    def test_query_and_filters_stored(self, tmp_db):
+        sid = tmp_db.create_saved_search("Complex", "deep learning", '{"year": 2020}')
+        s = next(s for s in tmp_db.list_saved_searches() if s["id"] == sid)
+        assert s["query"] == "deep learning"
+        assert s["filters"] == '{"year": 2020}'
+
+    def test_empty_list_initially(self, tmp_db):
+        assert tmp_db.list_saved_searches() == []
