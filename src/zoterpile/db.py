@@ -857,6 +857,39 @@ class RefDatabase:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def rename_tag(self, old_name: str, new_name: str) -> bool:
+        """Rename a tag. Returns False if new_name already exists, True on success."""
+        with self._db() as conn:
+            existing = conn.execute(
+                "SELECT id FROM tags WHERE name = ?", (new_name,)
+            ).fetchone()
+            if existing:
+                return False
+            conn.execute(
+                "UPDATE tags SET name = ? WHERE name = ?", (new_name, old_name)
+            )
+        return True
+
+    def set_tag_color(self, tag_name: str, color: str) -> None:
+        """Update the color of a tag (hex string, e.g. '#ff6b6b')."""
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE tags SET color = ? WHERE name = ?", (color, tag_name)
+            )
+
+    def delete_tag_by_name(self, tag_name: str) -> bool:
+        """Delete a tag and all its associations. Returns False if not found."""
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT id FROM tags WHERE name = ?", (tag_name,)
+            ).fetchone()
+            if not row:
+                return False
+            tag_id = row["id"]
+            conn.execute("DELETE FROM ref_tags WHERE tag_id = ?", (tag_id,))
+            conn.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+        return True
+
     # -----------------------------------------------------------------------
     # Read operations
     # -----------------------------------------------------------------------

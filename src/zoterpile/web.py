@@ -1007,16 +1007,12 @@ def update_tag(tag_name: str):
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
-            conn = db._conn
             if new_name and new_name != tag_name:
-                # Rename: check no collision first
-                existing = conn.execute("SELECT id FROM tags WHERE name = ?", (new_name,)).fetchone()
-                if existing:
+                if not db.rename_tag(tag_name, new_name):
                     return jsonify({"error": f"Tag '{new_name}' already exists"}), 409
-                conn.execute("UPDATE tags SET name = ? WHERE name = ?", (new_name, tag_name))
-                tag_name = new_name  # for the color update below
+                tag_name = new_name
             if color:
-                conn.execute("UPDATE tags SET color = ? WHERE name = ?", (color, tag_name))
+                db.set_tag_color(tag_name, color)
         return jsonify({"ok": True, "name": tag_name})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1028,12 +1024,8 @@ def delete_tag(tag_name: str):
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
-            conn = db._conn
-            tag_row = conn.execute("SELECT id FROM tags WHERE name = ?", (tag_name,)).fetchone()
-            if not tag_row:
+            if not db.delete_tag_by_name(tag_name):
                 return jsonify({"error": "Tag not found"}), 404
-            conn.execute("DELETE FROM ref_tags WHERE tag_id = ?", (tag_row["id"],))
-            conn.execute("DELETE FROM tags WHERE id = ?", (tag_row["id"],))
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -549,6 +549,48 @@ class TestTags:
         assert "auto1" in tags
         assert "auto2" in tags
 
+    def test_rename_tag(self, tmp_db):
+        ref = _make_ref(doi="10.tag/9")
+        rid = tmp_db.upsert(ref)
+        tmp_db.add_tags(rid, ["oldname"])
+        result = tmp_db.rename_tag("oldname", "newname")
+        assert result is True
+        tags = tmp_db.get_tags(rid)
+        assert "newname" in tags
+        assert "oldname" not in tags
+
+    def test_rename_tag_collision_returns_false(self, tmp_db):
+        ref = _make_ref(doi="10.tag/10")
+        rid = tmp_db.upsert(ref)
+        tmp_db.add_tags(rid, ["tagA", "tagB"])
+        result = tmp_db.rename_tag("tagA", "tagB")  # tagB exists
+        assert result is False
+        tags = tmp_db.get_tags(rid)
+        assert "tagA" in tags  # unchanged
+
+    def test_set_tag_color(self, tmp_db):
+        ref = _make_ref(doi="10.tag/11")
+        rid = tmp_db.upsert(ref)
+        tmp_db.add_tags(rid, ["colored"])
+        tmp_db.set_tag_color("colored", "#ff6b6b")
+        all_t = {t["name"]: t for t in tmp_db.all_tags()}
+        assert all_t["colored"]["color"] == "#ff6b6b"
+
+    def test_delete_tag_by_name(self, tmp_db):
+        ref = _make_ref(doi="10.tag/12")
+        rid = tmp_db.upsert(ref)
+        tmp_db.add_tags(rid, ["gone"])
+        result = tmp_db.delete_tag_by_name("gone")
+        assert result is True
+        tags = tmp_db.get_tags(rid)
+        assert "gone" not in tags
+        tag_names = [t["name"] for t in tmp_db.all_tags()]
+        assert "gone" not in tag_names
+
+    def test_delete_tag_not_found_returns_false(self, tmp_db):
+        result = tmp_db.delete_tag_by_name("nonexistent")
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # Saved searches
