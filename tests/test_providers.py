@@ -13,6 +13,7 @@ from zoterpile.models import Author, Reference, RefType
 from zoterpile.providers.crossref import CrossRefProvider
 from zoterpile.providers.arxiv import ArXivProvider
 from zoterpile.providers.semantic_scholar import SemanticScholarProvider
+from zoterpile.providers.openalex import OpenAlexProvider, _reconstruct_abstract
 from zoterpile.providers.base import BaseProvider
 
 
@@ -354,3 +355,211 @@ class TestBaseProvider:
 
     def test_repr(self, provider):
         assert "test_provider" in repr(provider) or "priority" in repr(provider)
+
+
+# ---------------------------------------------------------------------------
+# CrossRef: new-field parsing tests
+# ---------------------------------------------------------------------------
+
+class TestCrossRefNewFields:
+    @pytest.fixture
+    def provider(self):
+        return CrossRefProvider()
+
+    def _conference_work(self) -> dict:
+        return {
+            "DOI": "10.1109/CVPR.2016.90",
+            "type": "proceedings-article",
+            "title": ["Deep Residual Learning"],
+            "author": [{"given": "Kaiming", "family": "He"}],
+            "editor": [{"given": "Alice", "family": "Smith"}],
+            "published": {"date-parts": [[2016, 6]]},
+            "event": {"name": "IEEE CVPR 2016"},
+            "article-number": "7780459",
+            "ISSN": ["1063-6919", "2575-7075"],
+            "issn-type": [
+                {"value": "1063-6919", "type": "print"},
+                {"value": "2575-7075", "type": "electronic"},
+            ],
+            "license": [{"URL": "https://creativecommons.org/licenses/by/4.0/"}],
+        }
+
+    def test_event_name_parsed(self, provider):
+        ref = provider._parse_work(self._conference_work())
+        assert ref.event_name == "IEEE CVPR 2016"
+
+    def test_article_number_parsed(self, provider):
+        ref = provider._parse_work(self._conference_work())
+        assert ref.article_number == "7780459"
+
+    def test_eissn_parsed(self, provider):
+        ref = provider._parse_work(self._conference_work())
+        assert ref.eissn == "2575-7075"
+
+    def test_issn_print_parsed(self, provider):
+        ref = provider._parse_work(self._conference_work())
+        assert ref.issn == "1063-6919"
+
+    def test_license_url_parsed(self, provider):
+        ref = provider._parse_work(self._conference_work())
+        assert "creativecommons" in (ref.license or "")
+
+    def test_open_access_inferred_from_cc_license(self, provider):
+        ref = provider._parse_work(self._conference_work())
+        assert ref.open_access is True
+
+    def test_editors_parsed(self, provider):
+        ref = provider._parse_work(self._conference_work())
+        assert len(ref.editors) == 1
+        assert ref.editors[0].family == "Smith"
+
+    def test_ref_type_conference(self, provider):
+        ref = provider._parse_work(self._conference_work())
+        assert ref.ref_type == RefType.CONFERENCE
+
+
+# ---------------------------------------------------------------------------
+# OpenAlex provider tests
+# ---------------------------------------------------------------------------
+
+def _openalex_work(
+    title="OpenAlex Paper",
+    doi="10.1234/oa",
+    year=2023,
+    citation_count=15,
+    is_oa=False,
+    oa_url=None,
+    issns=None,
+) -> dict:
+    issns = issns or ["1234-5678"]
+    return {
+        "title": title,
+        "doi": f"https://doi.org/{doi}",
+        "publication_year": year,
+        "type": "journal-article",
+        "cited_by_count": citation_count,
+        "ids": {"pmid": "https://pubmed.ncbi.nlm.nih.gov/12345678/"},
+        "authorships": [
+            {"author": {"display_name": "Alice Smith", "orcid": None}, "institutions": []},
+        ],
+        "abstract_inverted_index": {"Hello": [0], "world": [1]},
+        "primary_location": {
+            "source": {
+                "display_name": "Journal of Fake Science",
+                "issn_l": issns[0],
+                "issn": issns,
+                "host_organization_name": "Elsevier",
+            }
+        },
+        "biblio": {"volume": "10", "issue": "2", "first_page": "100", "last_page": "110"},
+        "open_access": {"is_oa": is_oa, "oa_url": oa_url},
+        "keywords": [{"display_name": "machine learning"}],
+        "language": "en",
+        "locations": [],
+    }
+
+
+class TestOpenAlexProvider:
+    @pytest.fixture
+    def provider(self):
+        return OpenAlexProvider()
+
+    def test_parse_title(self, provider):
+        ref = provider._parse_work(_openalex_work(title="Test Title"))
+        assert ref.title == "Test Title"
+
+    def test_parse_doi_normalized(self, provider):
+        ref = provider._parse_work(_openalex_work(doi="10.1234/oa"))
+        assert ref.doi == "10.1234/oa"
+        assert not (ref.doi or "").startswith("http")
+
+    def test_parse_year(self, provider):
+        ref = provider._parse_work(_openalex_work(year=2021))
+        assert ref.year == 2021
+
+    def test_parse_citation_count(self, provider):
+        ref = provider._parse_work(_openalex_work(citation_count=77))
+        assert ref.citation_count == 77
+
+    def test_parse_open_access(self, provider):
+        ref = provider._parse_work(_openalex_work(is_oa=True, oa_url="https://example.com/pdf"))
+        assert ref.open_access is True
+        assert ref.oa_url == "https://example.com/pdf"
+
+    def test_parse_authors(self, provider):
+        ref = provider._parse_work(_openalex_work())
+        assert len(ref.authors) == 1
+        assert "Smith" in ref.authors[0].family or "Smith" in ref.authors[0].given
+
+    def test_parse_journal(self, provider):
+        ref = provider._parse_work(_openalex_work())
+        assert ref.journal == "Journal of Fake Science"
+
+    def test_parse_volume_issue_pages(self, provider):
+        ref = provider._parse_work(_openalex_work())
+        assert ref.volume == "10"
+        assert ref.issue == "2"
+        assert ref.pages == "100-110"
+
+    def test_parse_abstract_from_inverted_index(self, provider):
+        ref = provider._parse_work(_openalex_work())
+        assert ref.abstract == "Hello world"
+
+    def test_parse_issn(self, provider):
+        ref = provider._parse_work(_openalex_work(issns=["1234-5678"]))
+        assert ref.issn == "1234-5678"
+
+    def test_parse_eissn_second_issn(self, provider):
+        ref = provider._parse_work(_openalex_work(issns=["1234-5678", "8765-4321"]))
+        assert ref.eissn == "8765-4321"
+
+    def test_parse_pmid(self, provider):
+        ref = provider._parse_work(_openalex_work())
+        assert ref.pmid == "12345678"
+
+    def test_provider_name(self, provider):
+        assert provider.name == "openalex"
+
+    def test_provider_priority(self, provider):
+        assert provider.priority == 2
+
+    @pytest.mark.asyncio
+    async def test_lookup_by_doi_calls_api(self, provider):
+        fake_resp = _mock_resp(_openalex_work())
+        with patch.object(provider, "_get", new=AsyncMock(return_value=fake_resp)):
+            async with provider._make_client() as client:
+                ref = await provider.lookup_by_doi("10.1234/oa", client)
+        assert ref is not None
+        assert ref.title == "OpenAlex Paper"
+
+    @pytest.mark.asyncio
+    async def test_lookup_by_doi_returns_none_on_404(self, provider):
+        with patch.object(provider, "_get", new=AsyncMock(return_value=None)):
+            async with provider._make_client() as client:
+                ref = await provider.lookup_by_doi("10.xxx/missing", client)
+        assert ref is None
+
+
+# ---------------------------------------------------------------------------
+# _reconstruct_abstract helper
+# ---------------------------------------------------------------------------
+
+class TestReconstructAbstract:
+    def test_basic(self):
+        inv = {"Hello": [0], "world": [1]}
+        assert _reconstruct_abstract(inv) == "Hello world"
+
+    def test_out_of_order_positions(self):
+        inv = {"second": [1], "first": [0]}
+        assert _reconstruct_abstract(inv) == "first second"
+
+    def test_multiple_positions_same_word(self):
+        inv = {"the": [0, 2], "cat": [1]}
+        result = _reconstruct_abstract(inv)
+        words = result.split()
+        assert words[0] == "the"
+        assert words[1] == "cat"
+        assert words[2] == "the"
+
+    def test_empty(self):
+        assert _reconstruct_abstract({}) == ""
