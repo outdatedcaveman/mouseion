@@ -2674,6 +2674,7 @@ kbd {
         <option value="title-asc">Title A–Z</option>
         <option value="citations-desc">Most Cited</option>
         <option value="completeness-desc">Completeness</option>
+        <option value="status-asc">Status</option>
       </select>
       <button class="filter-toggle-btn" id="btn-adv-filter" title="Advanced filters">⚗ Filter</button>
       <button class="filter-toggle-btn" id="btn-view-toggle" title="Toggle list density" onclick="toggleViewMode()">☰</button>
@@ -2920,7 +2921,7 @@ let addTimer    = null;
 let collections = [];
 let activeColl  = null;   // null = all refs, int = collection id
 let selectedIds = new Set(); // batch-selected ref IDs
-let sortMode    = 'date-desc';  // current sort order
+let sortMode    = localStorage.getItem('zt-sort') || 'date-desc';  // current sort order
 let allTags     = [];           // fetched from /api/tags for autocomplete
 
 // ── DOM refs ───────────────────────────────────────────────────────────────
@@ -3144,9 +3145,15 @@ document.querySelectorAll('.dd-item').forEach(el => {
 // ── Sort ────────────────────────────────────────────────────────────────────
 document.getElementById('sort-sel').addEventListener('change', e => {
   sortMode = e.target.value;
+  localStorage.setItem('zt-sort', sortMode);
   applySort();
   renderList();
 });
+// Restore saved sort on load
+(function() {
+  const sel = document.getElementById('sort-sel');
+  if (sel && sortMode !== 'date-desc') sel.value = sortMode;
+})();
 
 function applySort() {
   refs.sort((a, b) => {
@@ -3156,6 +3163,10 @@ function applySort() {
       case 'title-asc': return (a.title||'').localeCompare(b.title||'');
       case 'citations-desc': return (b.citation_count||0) - (a.citation_count||0);
       case 'completeness-desc': return (b.completeness||0) - (a.completeness||0);
+      case 'status-asc': {
+        const order = {read:0, 'in-progress':1, unread:2, '':3};
+        return (order[a.status||'']??3) - (order[b.status||'']??3);
+      }
       default: return 0; // date-desc: server order preserved
     }
   });
@@ -4154,6 +4165,7 @@ function renderDetail(ref) {
     <div class="section-label">Notes</div>
     <textarea class="notes-ta" id="notes-${ref.id}"
       placeholder="Your notes, comments, key takeaways…"
+      oninput="debounceSaveNotes('${ref.id}')"
       onblur="saveNotes('${ref.id}')">${esc(ref.notes || '')}</textarea>
     <div class="notes-saved" id="notes-st-${ref.id}"></div>
 
@@ -4355,7 +4367,14 @@ async function setStatus(refId, status) {
 
 // ── Notes ───────────────────────────────────────────────────────────────────
 let _notesTimer = {};
+function debounceSaveNotes(refId) {
+  const st = document.getElementById(`notes-st-${refId}`);
+  if (st) st.textContent = '…';
+  clearTimeout(_notesTimer[refId]);
+  _notesTimer[refId] = setTimeout(() => saveNotes(refId), 1200);
+}
 async function saveNotes(refId) {
+  clearTimeout(_notesTimer[refId]);
   const ta = document.getElementById(`notes-${refId}`);
   const st = document.getElementById(`notes-st-${refId}`);
   if (!ta) return;
