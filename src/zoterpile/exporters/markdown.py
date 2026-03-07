@@ -60,12 +60,21 @@ def _ref_to_markdown(ref: Reference, index: int | None = None) -> str:
         )
         lines.append(f"**Authors:** {author_str}")
 
+    # Editors
+    if ref.editors:
+        editor_str = "; ".join(e.full_name for e in ref.editors)
+        lines.append(f"**Editors:** {editor_str}")
+
     # Year
     if ref.year:
         lines.append(f"**Year:** {ref.year}")
 
     # Type
     lines.append(f"**Type:** {ref.ref_type.value}")
+
+    # Conference / event
+    if ref.event_name:
+        lines.append(f"**Conference:** {ref.event_name}")
 
     # Journal / container
     journal = ref.journal or ref.container_title
@@ -126,6 +135,10 @@ def _ref_to_markdown(ref: Reference, index: int | None = None) -> str:
     # Language
     if ref.language:
         lines.append(f"**Language:** {ref.language}")
+
+    # License
+    if ref.license:
+        lines.append(f"**License:** {ref.license}")
 
     lines.append("")
 

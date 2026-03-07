@@ -105,7 +105,9 @@ class OpenAlexProvider(BaseProvider):
         ref.journal = src.get("display_name") or None
         if ref.journal:
             ref.container_title = ref.journal
-        ref.issn = (src.get("issn_l") or (src.get("issn") or [None])[0]) or None
+        issns = src.get("issn") or []
+        ref.issn  = src.get("issn_l") or (issns[0] if issns else None) or None
+        ref.eissn = issns[1] if len(issns) > 1 else None
 
         # --- Bibliographic details ---
         bib = data.get("biblio") or {}

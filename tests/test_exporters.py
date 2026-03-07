@@ -358,6 +358,21 @@ class TestMarkdown:
         md = to_markdown_string([])
         assert md == ""
 
+    def test_conference_event_name_shown(self):
+        md = to_markdown_string(_conference_ref())
+        assert "Conference:" in md
+        assert "IEEE Conference on Computer Vision" in md
+
+    def test_editors_shown(self):
+        md = to_markdown_string(_conference_ref())
+        assert "Editors:" in md
+        assert "Smith" in md
+
+    def test_license_shown(self):
+        md = to_markdown_string(_conference_ref())
+        assert "License:" in md
+        assert "CC BY 4.0" in md
+
 
 # ---------------------------------------------------------------------------
 # Zotero RDF tests
