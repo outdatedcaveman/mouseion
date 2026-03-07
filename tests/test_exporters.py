@@ -1,4 +1,4 @@
-"""Tests for BibTeX, RIS and Markdown exporters."""
+"""Tests for BibTeX, RIS, Markdown and Zotero RDF exporters."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import pytest
 from zoterpile.exporters.bibtex import to_bibtex_string, export_bibtex_file
 from zoterpile.exporters.ris import to_ris_string, export_ris_file
 from zoterpile.exporters.markdown import to_markdown_string, export_markdown_file
+from zoterpile.exporters.zotero_rdf import to_zotero_rdf_string
 from zoterpile.models import Author, Reference, RefType
 
 
@@ -304,3 +305,113 @@ class TestMarkdown:
     def test_no_crash_empty_list(self):
         md = to_markdown_string([])
         assert md == ""
+
+
+# ---------------------------------------------------------------------------
+# Zotero RDF tests
+# ---------------------------------------------------------------------------
+
+class TestZoteroRDF:
+    def test_xml_declaration(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert rdf.startswith('<?xml version="1.0" encoding="UTF-8"?>')
+
+    def test_rdf_root_element(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<rdf:RDF" in rdf
+        assert "</rdf:RDF>" in rdf
+
+    def test_namespace_declarations(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert 'xmlns:rdf=' in rdf
+        assert 'xmlns:dc=' in rdf
+        assert 'xmlns:bib=' in rdf
+        assert 'xmlns:foaf=' in rdf
+
+    def test_article_type(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<bib:Article" in rdf
+        assert "</bib:Article>" in rdf
+
+    def test_book_type(self):
+        rdf = to_zotero_rdf_string([_book_ref()])
+        assert "<bib:Book" in rdf
+
+    def test_title_element(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<dc:title>Attention Is All You Need</dc:title>" in rdf
+
+    def test_authors_present(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<foaf:surname>Vaswani</foaf:surname>" in rdf
+        assert "<foaf:firstName>Ashish</foaf:firstName>" in rdf
+
+    def test_doi_uri_used_as_rdf_about(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert 'rdf:about="https://doi.org/10.48550/arXiv.1706.03762"' in rdf
+
+    def test_doi_identifier_element(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<dc:identifier>DOI 10.48550" in rdf
+
+    def test_isbn_identifier(self):
+        rdf = to_zotero_rdf_string([_book_ref()])
+        assert "<dc:identifier>ISBN 978-0262035613</dc:identifier>" in rdf
+
+    def test_year_date_element(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<dc:date>2017-06</dc:date>" in rdf
+
+    def test_year_only_date(self):
+        ref = Reference(title="T", ref_type=RefType.JOURNAL, year=2020)
+        rdf = to_zotero_rdf_string([ref])
+        assert "<dc:date>2020</dc:date>" in rdf
+
+    def test_journal_is_part_of(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<dcterms:isPartOf>" in rdf
+        assert "Advances in Neural Information Processing Systems" in rdf
+
+    def test_abstract_element(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<dcterms:abstract>" in rdf
+        assert "dominant sequence transduction" in rdf
+
+    def test_keywords_as_dc_subject(self):
+        rdf = to_zotero_rdf_string([_journal_ref()])
+        assert "<dc:subject>transformer</dc:subject>" in rdf
+        assert "<dc:subject>attention</dc:subject>" in rdf
+
+    def test_multiple_refs(self):
+        rdf = to_zotero_rdf_string([_journal_ref(), _book_ref()])
+        assert rdf.count("<bib:Article") == 1
+        assert rdf.count("<bib:Book") == 1
+
+    def test_empty_list(self):
+        rdf = to_zotero_rdf_string([])
+        assert "<rdf:RDF" in rdf
+        assert "</rdf:RDF>" in rdf
+
+    def test_xml_escaping_in_title(self):
+        ref = Reference(title="A & B <test>", ref_type=RefType.JOURNAL)
+        rdf = to_zotero_rdf_string([ref])
+        assert "A &amp; B &lt;test&gt;" in rdf
+
+    def test_minimal_ref_no_crash(self):
+        rdf = to_zotero_rdf_string([_minimal_ref()])
+        assert "<bib:Document" in rdf
+
+    def test_urn_fallback_uri(self):
+        """Refs without DOI or URL get a urn:zoterpile: URI."""
+        ref = Reference(title="No ID Ref", ref_type=RefType.JOURNAL, year=2020)
+        rdf = to_zotero_rdf_string([ref])
+        assert 'rdf:about="urn:zoterpile:' in rdf
+
+    def test_url_used_as_uri_when_no_doi(self):
+        ref = Reference(
+            title="Web Only",
+            ref_type=RefType.WEBSITE,
+            url="https://example.com/page",
+        )
+        rdf = to_zotero_rdf_string([ref])
+        assert 'rdf:about="https://example.com/page"' in rdf

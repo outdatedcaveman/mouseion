@@ -42,7 +42,7 @@ def _item_uri(ref: Reference) -> str:
         return f"https://doi.org/{ref.doi}"
     if ref.url:
         return ref.url
-    return f"urn:zoterpile:{ref.id or id(ref)}"
+    return f"urn:zoterpile:{id(ref)}"
 
 
 def _author_elements(authors, role: str = "z:Author") -> str:
