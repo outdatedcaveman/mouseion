@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zoterpile"
+version = "0.1.0"
+description = "Comprehensive reference lookup and enrichment tool — lean, fast, and thorough"
+readme = "README.md"
+license = { text = "AGPL-3.0" }
+requires-python = ">=3.10"
+dependencies = [
+    # HTTP (async, HTTP/2 support)
+    "httpx[http2]>=0.27",
+    # CLI + terminal output
+    "click>=8.1",
+    "rich>=13.0",
+    # Input parsing
+    "rispy>=0.9",           # RIS format parser
+    "bibtexparser>=1.4,<2", # BibTeX v1 API (stable, well-known)
+    "beautifulsoup4>=4.12", # HTML scraping
+    "lxml>=5.0",            # Fast XML/HTML parser backend
+    # Fuzzy matching (title deduplication and search ranking)
+    "rapidfuzz>=3.0",
+    # Disk cache (avoids re-hitting APIs for bulk processing)
+    "diskcache>=5.6",
+    # Async support
+    "anyio>=4.0",
+    # PDF metadata extraction (soft dependency, gracefully absent)
+    "pypdf>=4.0",
+    # TOML config file support
+    "tomlkit>=0.12",
+    # .env file support
+    "python-dotenv>=1.0",
+    # Terminal UI
+    "textual>=0.50",
+    # Web UI
+    "flask>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-httpx>=0.30",
+    "respx>=0.21",
+]
+drive = [
+    "google-api-python-client>=2.100",
+    "google-auth>=2.20",
+]
+
+[project.scripts]
+zoterpile     = "zoterpile.cli:main"
+zoterpile-gui = "zoterpile.tui:run"
+zoterpile-web = "zoterpile.web:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zoterpile"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.hatch.envs.default]
+dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]

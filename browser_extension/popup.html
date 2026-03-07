@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zoterpile</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 360px;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    background: #0d0d12;
+    color: #e0e0ec;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px 9px;
+    border-bottom: 1px solid #2a2a3a;
+  }
+  .logo { font-weight: 700; font-size: 16px; color: #5b8af5; letter-spacing: -0.5px; }
+  .logo-sub { font-size: 11px; color: #555; font-weight: 400; margin-left: 5px; }
+  .header-btns { display: flex; gap: 4px; }
+  .btn-icon { background: none; border: none; cursor: pointer; color: #777;
+    font-size: 16px; padding: 2px 5px; border-radius: 4px; }
+  .btn-icon:hover { background: #1a1a2e; color: #e0e0ec; }
+
+  /* Tabs */
+  .tabs { display: flex; border-bottom: 1px solid #2a2a3a; }
+  .tab {
+    flex: 1; padding: 7px 0; text-align: center; font-size: 12px;
+    cursor: pointer; color: #777; border-bottom: 2px solid transparent;
+    transition: all .15s;
+  }
+  .tab:hover { color: #e0e0ec; }
+  .tab.active { color: #5b8af5; border-bottom-color: #5b8af5; font-weight: 600; }
+
+  /* Tab panels */
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* Save tab */
+  .body { padding: 12px 14px 10px; }
+  .detected {
+    background: #1a1a2e; border: 1px solid #2a2a3a; border-radius: 7px;
+    padding: 8px 11px; margin-bottom: 10px; font-size: 12px;
+  }
+  .detected-label { color: #888; font-size: 10px; margin-bottom: 3px; text-transform: uppercase; letter-spacing: .4px; }
+  .detected-value { color: #5b8af5; font-family: monospace; word-break: break-all; font-size: 11px; }
+
+  .input-row { display: flex; gap: 7px; margin-bottom: 8px; }
+  input[type="text"], select {
+    flex: 1;
+    background: #1a1a2e; border: 1px solid #2a2a3a; border-radius: 6px;
+    color: #e0e0ec; padding: 7px 10px; font-size: 13px; outline: none;
+  }
+  input[type="text"]:focus, select:focus { border-color: #5b8af5; }
+  input[type="text"]::placeholder { color: #444; }
+  select { appearance: none; cursor: pointer; color: #aaa; font-size: 12px; padding: 6px 8px; }
+  select option { background: #1a1a2e; }
+
+  .coll-row { margin-bottom: 8px; }
+  .coll-row label { font-size: 11px; color: #777; display: block; margin-bottom: 4px; }
+  .coll-row select { width: 100%; }
+
+  .btn {
+    background: #5b8af5; color: #fff; border: none; border-radius: 6px;
+    padding: 7px 13px; font-size: 13px; font-weight: 600; cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn:hover { background: #4a78e0; }
+  .btn:disabled { background: #2a2a5a; color: #555; cursor: not-allowed; }
+  .btn-full { width: 100%; margin-bottom: 6px; }
+  .btn-ghost {
+    background: #1a1a2e; color: #aaa; border: 1px solid #2a2a3a;
+    border-radius: 6px; padding: 6px 10px; font-size: 12px; cursor: pointer;
+    flex: 1; text-align: center;
+  }
+  .btn-ghost:hover { background: #2a2a3e; color: #e0e0ec; }
+
+  .status {
+    font-size: 12px; padding: 7px 10px; border-radius: 6px;
+    margin-bottom: 6px; display: none;
+  }
+  .status.show { display: block; }
+  .status.ok  { background: #0d2a1a; color: #4caf7d; border: 1px solid #1a4a2a; }
+  .status.err { background: #2a0d0d; color: #e57373; border: 1px solid #4a1a1a; }
+  .status.run { background: #1a1a2e; color: #888; border: 1px solid #2a2a3a; }
+
+  .footer { padding: 8px 14px; border-top: 1px solid #2a2a3a; display: flex; gap: 8px; }
+  .not-configured { text-align: center; padding: 20px 14px; color: #888; }
+  .not-configured p { margin-bottom: 12px; font-size: 13px; }
+
+  /* Recent tab */
+  .recent-list { padding: 6px 0; max-height: 320px; overflow-y: auto; }
+  .recent-item {
+    padding: 8px 14px; border-bottom: 1px solid #1a1a28; cursor: pointer;
+    transition: background .1s;
+  }
+  .recent-item:hover { background: #1a1a2e; }
+  .ri-title { font-size: 12px; font-weight: 500; color: #e0e0ec;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px; }
+  .ri-meta  { font-size: 10px; color: #666; }
+  .ri-status { display: inline-block; font-size: 9px; padding: 1px 5px;
+    border-radius: 3px; margin-left: 5px; }
+  .ri-unread  { background: #301a2a; color: #ee88bb; }
+  .ri-reading { background: #1a2a40; color: #88aaee; }
+  .ri-read    { background: #0d2a1a; color: #3ecf8e; }
+  .recent-empty { padding: 20px; text-align: center; color: #555; font-size: 12px; }
+
+  /* Search tab */
+  .search-tab { padding: 10px 14px; }
+  .search-inp-row { display: flex; gap: 7px; margin-bottom: 10px; }
+  .search-results { max-height: 260px; overflow-y: auto; }
+  .sr-item {
+    padding: 8px 12px; border: 1px solid #2a2a3a; border-radius: 6px;
+    margin-bottom: 6px; cursor: pointer; transition: background .1s;
+  }
+  .sr-item:hover { background: #1a1a2e; }
+  .sr-title { font-size: 12px; font-weight: 500; color: #e0e0ec; margin-bottom: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sr-meta  { font-size: 10px; color: #666; }
+  .sr-empty { padding: 16px; text-align: center; color: #555; font-size: 12px; }
+
+  .spin {
+    display: inline-block; width: 10px; height: 10px;
+    border: 2px solid #333; border-top-color: #5b8af5;
+    border-radius: 50%; animation: spin .7s linear infinite; margin-right: 5px;
+    vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <span class="logo">📚 zoterpile <span class="logo-sub">Reference Manager</span></span>
+  <div class="header-btns">
+    <button class="btn-icon" id="btn-open-web" title="Open Library">🌐</button>
+    <button class="btn-icon" id="btn-options" title="Settings">⚙</button>
+  </div>
+</div>
+
+<div id="not-configured" class="not-configured" style="display:none">
+  <p>Configure your zoterpile server to get started.</p>
+  <button class="btn btn-full" id="btn-go-options">Open Settings</button>
+</div>
+
+<div id="main-ui" style="display:none">
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" data-tab="save">＋ Save</div>
+    <div class="tab" data-tab="recent">Recent</div>
+    <div class="tab" data-tab="search">🔍 Search</div>
+  </div>
+
+  <!-- Save tab -->
+  <div class="tab-panel active" id="tab-save">
+    <div class="body">
+      <div id="detected-box" class="detected" style="display:none">
+        <div class="detected-label" id="detected-label">Detected on page</div>
+        <div class="detected-value" id="detected-value"></div>
+      </div>
+      <div class="input-row">
+        <input type="text" id="inp-ref" placeholder="DOI, arXiv ID, URL, or title…">
+        <button class="btn" id="btn-save">Save</button>
+      </div>
+      <div class="coll-row" id="coll-row" style="display:none">
+        <label>Add to collection:</label>
+        <select id="coll-select">
+          <option value="">None (My Library)</option>
+        </select>
+      </div>
+      <div class="status" id="status"></div>
+    </div>
+    <div class="footer">
+      <button class="btn-ghost" id="btn-page-ref">Save This Page</button>
+      <button class="btn-ghost" id="btn-page-save-read">Save + Mark Read</button>
+    </div>
+  </div>
+
+  <!-- Recent tab -->
+  <div class="tab-panel" id="tab-recent">
+    <div class="recent-list" id="recent-list">
+      <div class="recent-empty"><span class="spin"></span> Loading…</div>
+    </div>
+  </div>
+
+  <!-- Search tab -->
+  <div class="tab-panel" id="tab-search">
+    <div class="search-tab">
+      <div class="search-inp-row">
+        <input type="text" id="inp-search" placeholder="Search your library…">
+        <button class="btn" id="btn-search">Go</button>
+      </div>
+      <div class="search-results" id="search-results">
+        <div class="sr-empty">Type to search your library</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
