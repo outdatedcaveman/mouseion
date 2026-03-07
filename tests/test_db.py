@@ -624,3 +624,40 @@ class TestSavedSearches:
 
     def test_empty_list_initially(self, tmp_db):
         assert tmp_db.list_saved_searches() == []
+
+
+# ---------------------------------------------------------------------------
+# Analytics helpers
+# ---------------------------------------------------------------------------
+
+class TestAnalytics:
+    def test_status_counts_empty(self, tmp_db):
+        counts = tmp_db.status_counts()
+        assert counts == {}
+
+    def test_status_counts_default_unread(self, tmp_db):
+        tmp_db.upsert(_make_ref(doi="10.ana/1"))
+        counts = tmp_db.status_counts()
+        assert counts.get("unread", 0) == 1
+
+    def test_status_counts_mixed(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.ana/2"))
+        r2 = tmp_db.upsert(_make_ref(doi="10.ana/3"))
+        r3 = tmp_db.upsert(_make_ref(doi="10.ana/4"))
+        tmp_db.update_ref_fields(r2, status="reading")
+        tmp_db.update_ref_fields(r3, status="read")
+        counts = tmp_db.status_counts()
+        assert counts.get("reading", 0) >= 1
+        assert counts.get("read", 0) >= 1
+
+    def test_count_read_since_future_date(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.ana/5"))
+        tmp_db.update_ref_fields(r1, status="read")
+        count = tmp_db.count_read_since("2099-01-01")
+        assert count == 0
+
+    def test_count_read_since_past_date(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.ana/6"))
+        tmp_db.update_ref_fields(r1, status="read")
+        count = tmp_db.count_read_since("2000-01-01")
+        assert count >= 1

@@ -905,11 +905,7 @@ def stats():
         with RefDatabase() as db:
             all_refs = db.list_all(limit=10_000)
             all_tags = db.all_tags()
-            # Read counts from extras
-            conn = db._conn
-            status_rows = conn.execute(
-                "SELECT COALESCE(status,'unread') as s, COUNT(*) as c FROM refs GROUP BY s"
-            ).fetchall()
+            status_map = db.status_counts()
 
         n   = len(all_refs)
         avg = sum(r.completeness for r in all_refs) / n if n else 0.0
@@ -953,23 +949,16 @@ def stats():
 
         # Reading goal progress (from settings)
         from .db import RefDatabase as _RDB2
+        import datetime as _dt
+        _now2 = _dt.datetime.utcnow()
+        _month_start = _now2.replace(day=1, hour=0, minute=0, second=0).strftime('%Y-%m-%d')
+        _week_start  = (_now2 - _dt.timedelta(days=_now2.weekday())).replace(
+            hour=0, minute=0, second=0).strftime('%Y-%m-%d')
         with _RDB2() as _db2:
             goal_monthly = int(_db2.get_setting("reading_goal_monthly", "0") or 0)
             goal_weekly  = int(_db2.get_setting("reading_goal_weekly", "0") or 0)
-            # Count refs marked 'read' in current month and week
-            import datetime as _dt
-            _now2 = _dt.datetime.utcnow()
-            _month_start = _now2.replace(day=1, hour=0, minute=0, second=0).strftime('%Y-%m-%d')
-            _week_start  = (_now2 - _dt.timedelta(days=_now2.weekday())).replace(
-                hour=0, minute=0, second=0).strftime('%Y-%m-%d')
-            read_month = _db2._conn.execute(
-                "SELECT COUNT(*) FROM refs WHERE status='read' AND updated_at >= ?",
-                (_month_start,)
-            ).fetchone()[0]
-            read_week = _db2._conn.execute(
-                "SELECT COUNT(*) FROM refs WHERE status='read' AND updated_at >= ?",
-                (_week_start,)
-            ).fetchone()[0]
+            read_month   = _db2.count_read_since(_month_start)
+            read_week    = _db2.count_read_since(_week_start)
 
         return jsonify({
             "count":            n,
@@ -3156,7 +3145,7 @@ function applySort() {
       case 'citations-desc': return (b.citation_count||0) - (a.citation_count||0);
       case 'completeness-desc': return (b.completeness||0) - (a.completeness||0);
       case 'status-asc': {
-        const order = {read:0, 'in-progress':1, unread:2, '':3};
+        const order = {read:0, reading:1, unread:2, '':3};
         return (order[a.status||'']??3) - (order[b.status||'']??3);
       }
       default: return 0; // date-desc: server order preserved

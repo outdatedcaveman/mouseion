@@ -1206,6 +1206,23 @@ class RefDatabase:
         with self._db() as conn:
             conn.execute("DELETE FROM saved_searches WHERE id = ?", (search_id,))
 
+    def status_counts(self) -> Dict[str, int]:
+        """Return a mapping of status → count for all references."""
+        with self._db() as conn:
+            cur = conn.execute(
+                "SELECT COALESCE(status,'unread') AS s, COUNT(*) AS c FROM refs GROUP BY s"
+            )
+            return {row["s"]: row["c"] for row in cur.fetchall()}
+
+    def count_read_since(self, since_date: str) -> int:
+        """Return count of refs with status='read' and updated_at >= since_date (YYYY-MM-DD)."""
+        with self._db() as conn:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM refs WHERE status='read' AND updated_at >= ?",
+                (since_date,),
+            )
+            return cur.fetchone()[0]
+
 
 # ---------------------------------------------------------------------------
 # FTS query helper
