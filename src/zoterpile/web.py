@@ -213,12 +213,13 @@ def list_refs():
     ref_type      = request.args.get("type") or None
     oa_only       = request.args.get("oa", "").lower() == "true"
     limit         = min(int(request.args.get("limit", 500)), 2000)
+    offset        = max(int(request.args.get("offset", 0)), 0)
     collection_id = request.args.get("collection_id")
+    paginated     = request.args.get("paginated", "").lower() == "true"
     try:
         with RefDatabase() as db:
             if collection_id:
-                coll_refs = db.list_collection_refs(int(collection_id), limit=limit)
-                # Apply additional filters
+                coll_refs = db.list_collection_refs(int(collection_id), limit=limit + offset)
                 if q:
                     q_low = q.lower()
                     coll_refs = [
@@ -226,9 +227,16 @@ def list_refs():
                         if q_low in (r.title or "").lower()
                         or q_low in " ".join(a.family for a in r.authors).lower()
                     ]
-                raw = [(r, 0.5) for r in coll_refs]
+                total = len(coll_refs)
+                raw = [(r, 0.5) for r in coll_refs[offset:offset + limit]]
             else:
-                raw = db.search(q or "", ref_type=ref_type, oa_only=oa_only, limit=limit)
+                raw = db.search(q or "", ref_type=ref_type, oa_only=oa_only,
+                                limit=limit, offset=offset)
+                # For paginated mode get total count
+                total = None
+                if paginated:
+                    total = len(db.search(q or "", ref_type=ref_type, oa_only=oa_only,
+                                          limit=10_000, offset=0))
             ref_ids    = [_ref_id(ref) for ref, _ in raw]
             tags_map   = db.get_tags_batch(ref_ids)
             extras_map = db.get_extras_bulk(ref_ids)
@@ -247,6 +255,8 @@ def list_refs():
                 )
                 for ref, _ in raw
             ]
+        if paginated:
+            return jsonify({"refs": result, "total": total, "offset": offset, "limit": limit})
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3792,24 +3802,41 @@ async function loadCollections() {
 
 function renderCollections() {
   const $cl = document.getElementById('coll-list');
-  const allCount = refs.length;
-  document.getElementById('all-count').textContent = allCount || '';
-  const rows = collections.map(c => {
-    const act = activeColl === c.id ? ' active' : '';
+  document.getElementById('all-count').textContent = refs.length || '';
+
+  // Build parent→children map
+  const children = {};
+  collections.forEach(c => {
+    const pid = c.parent_id ?? null;
+    if (!children[pid]) children[pid] = [];
+    children[pid].push(c);
+  });
+
+  function renderNode(c, depth) {
+    const act     = activeColl === c.id ? ' active' : '';
+    const indent  = depth * 14;
+    const kids    = children[c.id] || [];
+    const icon    = kids.length ? '📂' : '📁';
     return `<div class="coll-item${act}" data-id="${c.id}" onclick="selectCollection(${c.id})"
         ondblclick="event.stopPropagation();startCollRename(${c.id},${JSON.stringify(c.name)},this)"
         ondragover="event.preventDefault();this.classList.add('drag-over')"
         ondragleave="this.classList.remove('drag-over')"
-        ondrop="event.preventDefault();this.classList.remove('drag-over');dropRefToCollection(event,${c.id})">
-      <span class="coll-item-name">📁 ${esc(c.name)}</span>
+        ondrop="event.preventDefault();this.classList.remove('drag-over');dropRefToCollection(event,${c.id})"
+        style="padding-left:${8 + indent}px">
+      <span class="coll-item-name">${icon} ${esc(c.name)}</span>
       <span class="coll-count">${c.ref_count || ''}</span>
       <button class="coll-stats-btn" title="Collection stats"
         onclick="event.stopPropagation();showCollStats(${c.id},${JSON.stringify(c.name)})">📊</button>
+      <button class="coll-del" title="Add sub-collection"
+        onclick="event.stopPropagation();createSubcollection(${c.id})" style="font-size:13px">⊕</button>
       <button class="coll-del" title="Delete collection"
         onclick="event.stopPropagation();deleteCollection(${c.id})">×</button>
-    </div>`;
-  }).join('');
-  // Preserve "All References" item and append collections
+    </div>` + kids.map(k => renderNode(k, depth + 1)).join('');
+  }
+
+  const topLevel = children[null] || [];
+  const rows = topLevel.map(c => renderNode(c, 0)).join('');
+
   $cl.innerHTML = `<div class="coll-item${activeColl === null ? ' active' : ''}" data-id=""
       onclick="selectCollection(null)">
     <span class="coll-item-name">📚 All References</span>
@@ -3834,6 +3861,19 @@ document.getElementById('btn-coll-new').addEventListener('click', async () => {
     await loadCollections();
   } catch(e) { console.error(e); }
 });
+
+async function createSubcollection(parentId) {
+  const parent = collections.find(c => c.id === parentId);
+  const name = prompt(`New sub-collection under "${parent?.name || parentId}":`);
+  if (!name?.trim()) return;
+  try {
+    await apiFetch('/api/collections', {
+      method: 'POST',
+      body: JSON.stringify({ name: name.trim(), parent_id: parentId }),
+    });
+    await loadCollections();
+  } catch(e) { showToast('Failed to create sub-collection'); }
+}
 
 async function deleteCollection(id) {
   const c = collections.find(x => x.id === id);
@@ -3886,9 +3926,12 @@ async function showCollStats(collId, collName) {
 }
 
 // ── Load & render list ─────────────────────────────────────────────────────
-async function loadRefs() {
+let _refsLimit = 500;   // current fetch limit; bumped by "Load more"
+
+async function loadRefs(resetLimit = true) {
+  if (resetLimit) _refsLimit = 500;
   const q = $search.value.trim();
-  const params = new URLSearchParams({ q, limit: 500 });
+  const params = new URLSearchParams({ q, limit: _refsLimit });
   if (filter.type)  params.set('type', filter.type);
   if (filter.oa)    params.set('oa', 'true');
   if (activeColl != null) params.set('collection_id', activeColl);
@@ -3899,12 +3942,16 @@ async function loadRefs() {
     _fullRefs = null; // invalidate advanced filter cache
     applyAdvFilter(); // re-applies any active filters; calls applySort+renderList internally
     renderStatus();
-    // Update "All References" count in sidebar
     if (activeColl === null) {
       const el = document.getElementById('all-count');
       if (el) el.textContent = refs.length || '';
     }
   } catch(e) { console.error(e); }
+}
+
+async function loadMoreRefs() {
+  _refsLimit += 500;
+  await loadRefs(false);
 }
 
 function renderList() {
@@ -3960,6 +4007,14 @@ function renderList() {
       ${pinBtn}
     </div>`;
   }).join('');
+  // Append "Load more" if we may have hit the limit
+  if (refs.length >= _refsLimit) {
+    $list.innerHTML += `<div style="padding:14px;text-align:center">
+      <button class="btn btn-ghost" onclick="loadMoreRefs()" style="font-size:12px">
+        ⬇ Load more (showing ${refs.length})
+      </button>
+    </div>`;
+  }
 }
 
 function cardClick(e, id) {
