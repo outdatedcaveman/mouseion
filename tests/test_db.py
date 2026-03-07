@@ -697,3 +697,28 @@ class TestAnalytics:
     def test_find_by_cite_key_not_found(self, tmp_db):
         result = tmp_db.find_by_cite_key("nonexistent_key")
         assert result is None
+    def test_get_many_returns_all(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.gm/1", title="First"))
+        r2 = tmp_db.upsert(_make_ref(doi="10.gm/2", title="Second"))
+        r3 = tmp_db.upsert(_make_ref(doi="10.gm/3", title="Third"))
+        refs = tmp_db.get_many([r1, r2, r3])
+        dois = {r.doi for r in refs}
+        assert "10.gm/1" in dois
+        assert "10.gm/2" in dois
+        assert "10.gm/3" in dois
+
+    def test_get_many_preserves_order(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.gm/4", title="Alpha"))
+        r2 = tmp_db.upsert(_make_ref(doi="10.gm/5", title="Beta"))
+        refs = tmp_db.get_many([r2, r1])
+        assert refs[0].doi == "10.gm/5"
+        assert refs[1].doi == "10.gm/4"
+
+    def test_get_many_skips_missing(self, tmp_db):
+        r1 = tmp_db.upsert(_make_ref(doi="10.gm/6"))
+        refs = tmp_db.get_many([r1, "doi:nonexistent"])
+        assert len(refs) == 1
+
+    def test_get_many_empty_list(self, tmp_db):
+        refs = tmp_db.get_many([])
+        assert refs == []

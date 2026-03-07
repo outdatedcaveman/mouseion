@@ -559,13 +559,14 @@ def get_similar(ref_id: str):
         pairs = idx.find_similar(ref_id, n=n)
         if not pairs:
             return jsonify([])
+        sim_ids = [sid for sid, _ in pairs]
         with RefDatabase() as db:
+            tags_map = db.get_tags_batch(sim_ids)
             results = []
             for sid, score in pairs:
                 ref = db.get(sid)
                 if ref:
-                    tags = db.get_tags(sid)
-                    d = _ref_to_dict(ref, tags, sid)
+                    d = _ref_to_dict(ref, tags_map.get(sid, []), sid)
                     d["similarity"] = round(score, 3)
                     results.append(d)
         return jsonify(results)
@@ -859,7 +860,7 @@ def export_refs():
         with RefDatabase() as db:
             if ref_ids_param:
                 ids  = [i.strip() for i in ref_ids_param.split(",") if i.strip()]
-                refs = [r for r in (db.get(i) for i in ids) if r is not None]
+                refs = db.get_many(ids)
                 fname_base = "selection"
             elif collection_id:
                 refs       = db.list_collection_refs(int(collection_id), limit=10_000)
@@ -1025,7 +1026,7 @@ def export_csv():
         with RefDatabase() as db:
             if ref_ids_param:
                 ids  = [i.strip() for i in ref_ids_param.split(",") if i.strip()]
-                refs = [r for r in (db.get(i) for i in ids) if r is not None]
+                refs = db.get_many(ids)
             elif collection_id:
                 refs = db.list_collection_refs(int(collection_id), limit=10_000)
             else:
@@ -1286,13 +1287,14 @@ def find_similar_to_text():
         pairs = idx.search(text, n=n)
         if not pairs:
             return jsonify([])
+        sim_ids = [sid for sid, _ in pairs]
         with RefDatabase() as db:
+            tags_map = db.get_tags_batch(sim_ids)
             results = []
             for sid, score in pairs:
                 ref = db.get(sid)
                 if ref:
-                    tags = db.get_tags(sid)
-                    d = _ref_to_dict(ref, tags, sid)
+                    d = _ref_to_dict(ref, tags_map.get(sid, []), sid)
                     d["similarity"] = round(score, 3)
                     results.append(d)
         return jsonify(results)

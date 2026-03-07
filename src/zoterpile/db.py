@@ -900,6 +900,21 @@ class RefDatabase:
             row = cur.fetchone()
             return _row_to_ref(row) if row else None
 
+    def get_many(self, ref_ids: List[str]) -> List[Reference]:
+        """Return references for a list of IDs in a single query.
+
+        Preserves the order of ref_ids; missing IDs are silently skipped.
+        """
+        if not ref_ids:
+            return []
+        ph = ",".join("?" * len(ref_ids))
+        with self._db() as conn:
+            cur = conn.execute(
+                f"SELECT * FROM refs WHERE id IN ({ph})", ref_ids
+            )
+            by_id = {row["id"]: _row_to_ref(row) for row in cur.fetchall()}
+        return [by_id[i] for i in ref_ids if i in by_id]
+
     def get_by_doi(self, doi: str) -> Optional[Reference]:
         with self._db() as conn:
             cur = conn.execute("SELECT * FROM refs WHERE doi = ?", (doi.strip(),))
