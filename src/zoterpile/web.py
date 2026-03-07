@@ -1083,26 +1083,48 @@ def export_csv():
 @app.route("/api/export/notes")
 def export_notes():
     """Export all notes from the library as a Markdown document."""
+    import datetime
     try:
         from .db import RefDatabase
         with RefDatabase() as db:
             all_refs = db.list_all(limit=10_000)
-            lines = ["# Zoterpile — Notes Export\n"]
+            ref_ids   = [_ref_id(r) for r in all_refs]
+            tags_map  = db.get_tags_batch(ref_ids)
+            extras_map = db.get_extras_bulk(ref_ids)
+            lines = [
+                "# Zoterpile — Notes Export",
+                f"\n*Generated {datetime.date.today().isoformat()} · {len(all_refs)} references in library*\n",
+            ]
             has_notes = False
             for ref in all_refs:
-                extra = db.get_extra(_ref_id(ref))
+                rid   = _ref_id(ref)
+                extra = extras_map.get(rid, {})
                 notes = extra.get("notes", "")
                 if not notes:
                     continue
                 has_notes = True
                 authors = ", ".join(
-                    a.family + (f", {a.given[0]}." if a.given else "")
+                    a.family + (f" {a.given[0]}." if a.given else "")
                     for a in ref.authors[:3] if a.family
                 )
+                status  = extra.get("status", "unread")
+                tags    = tags_map.get(rid, [])
                 lines.append(f"\n## {ref.title or '(untitled)'}")
+                meta_parts = []
                 if authors:
-                    lines.append(f"*{authors}{'et al.' if len(ref.authors) > 3 else ''}*"
-                                 + (f", {ref.year}" if ref.year else ""))
+                    meta_parts.append(f"{authors}{'et al.' if len(ref.authors) > 3 else ''}")
+                if ref.year:
+                    meta_parts.append(str(ref.year))
+                if ref.journal or ref.container_title:
+                    meta_parts.append(f"*{ref.journal or ref.container_title}*")
+                if meta_parts:
+                    lines.append(" · ".join(meta_parts))
+                info_parts = [f"Status: **{status}**"]
+                if ref.doi:
+                    info_parts.append(f"DOI: [{ref.doi}](https://doi.org/{ref.doi})")
+                if tags:
+                    info_parts.append("Tags: " + ", ".join(f"`{t}`" for t in tags[:8]))
+                lines.append(" · ".join(info_parts))
                 lines.append(f"\n{notes}\n")
                 lines.append("---")
             if not has_notes:
