@@ -191,48 +191,71 @@ def _ref_to_row(ref: Reference) -> Dict[str, Any]:
         "place":          ref.place,
         "edition":        ref.edition,
         "series":         ref.series,
-        "keywords":       json.dumps(ref.keywords),
-        "language":       ref.language,
-        "open_access":    int(ref.open_access) if ref.open_access is not None else None,
-        "citation_count": ref.citation_count,
-        "sources":        json.dumps(ref.sources),
-        "completeness":   ref.completeness,
-        "cite_key":       ref.cite_key or ref.auto_cite_key(),
-        "updated_at":     _now(),
+        "keywords":        json.dumps(ref.keywords),
+        "language":        ref.language,
+        "open_access":     int(ref.open_access) if ref.open_access is not None else None,
+        "citation_count":  ref.citation_count,
+        "sources":         json.dumps(ref.sources),
+        "completeness":    ref.completeness,
+        "cite_key":        ref.cite_key or ref.auto_cite_key(),
+        "updated_at":      _now(),
+        # Extended fields (added via migrations)
+        "eissn":           ref.eissn,
+        "container_title": ref.container_title,
+        "article_number":  ref.article_number,
+        "event_name":      ref.event_name,
+        "editors":         _authors_json(ref.editors) if ref.editors else None,
+        "num_pages":       ref.num_pages,
+        "license":         ref.license,
     }
+
+
+def _row_col(row: sqlite3.Row, col: str, default=None):
+    """Safely read a column that may not exist in older DB versions."""
+    try:
+        return row[col]
+    except (IndexError, KeyError):
+        return default
 
 
 def _row_to_ref(row: sqlite3.Row) -> Reference:
     ref = Reference(
-        doi            = row["doi"],
-        pmid           = row["pmid"],
-        pmcid          = row["pmcid"],
-        arxiv_id       = row["arxiv_id"],
-        isbn           = row["isbn"],
-        issn           = row["issn"],
-        url            = row["url"],
-        oa_url         = row["oa_url"],
-        title          = row["title"] or None,
-        authors        = _authors_from_json(row["authors"] or ""),
-        year           = row["year"],
-        month          = row["month"],
-        abstract       = row["abstract"],
-        ref_type       = RefType(row["ref_type"]) if row["ref_type"] else RefType.UNKNOWN,
-        journal        = row["journal"],
-        journal_abbrev = row["journal_abbrev"],
-        volume         = row["volume"],
-        issue          = row["issue"],
-        pages          = row["pages"],
-        publisher      = row["publisher"],
-        place          = row["place"],
-        edition        = row["edition"],
-        series         = row["series"],
-        keywords       = _safe_json_list(row["keywords"]),
-        language       = row["language"],
-        open_access    = bool(row["open_access"]) if row["open_access"] is not None else None,
-        citation_count = row["citation_count"],
-        sources        = _safe_json_dict(row["sources"]),
-        cite_key       = row["cite_key"],
+        doi             = row["doi"],
+        pmid            = row["pmid"],
+        pmcid           = row["pmcid"],
+        arxiv_id        = row["arxiv_id"],
+        isbn            = row["isbn"],
+        issn            = row["issn"],
+        eissn           = _row_col(row, "eissn"),
+        url             = row["url"],
+        oa_url          = row["oa_url"],
+        title           = row["title"] or None,
+        authors         = _authors_from_json(row["authors"] or ""),
+        year            = row["year"],
+        month           = row["month"],
+        abstract        = row["abstract"],
+        ref_type        = RefType(row["ref_type"]) if row["ref_type"] else RefType.UNKNOWN,
+        journal         = row["journal"],
+        journal_abbrev  = row["journal_abbrev"],
+        container_title = _row_col(row, "container_title"),
+        volume          = row["volume"],
+        issue           = row["issue"],
+        pages           = row["pages"],
+        article_number  = _row_col(row, "article_number"),
+        event_name      = _row_col(row, "event_name"),
+        publisher       = row["publisher"],
+        place           = row["place"],
+        edition         = row["edition"],
+        editors         = _authors_from_json(_row_col(row, "editors") or ""),
+        series          = row["series"],
+        num_pages       = _row_col(row, "num_pages"),
+        keywords        = _safe_json_list(row["keywords"]),
+        language        = row["language"],
+        open_access     = bool(row["open_access"]) if row["open_access"] is not None else None,
+        license         = _row_col(row, "license"),
+        citation_count  = row["citation_count"],
+        sources         = _safe_json_dict(row["sources"]),
+        cite_key        = row["cite_key"],
     )
     return ref
 
@@ -390,6 +413,14 @@ class RefDatabase:
             filters    TEXT NOT NULL DEFAULT '{}',
             created_at TEXT DEFAULT (datetime('now'))
         )""",
+        # Reference model fields missing from initial schema
+        "ALTER TABLE refs ADD COLUMN eissn           TEXT",
+        "ALTER TABLE refs ADD COLUMN container_title  TEXT",
+        "ALTER TABLE refs ADD COLUMN article_number   TEXT",
+        "ALTER TABLE refs ADD COLUMN event_name       TEXT",
+        "ALTER TABLE refs ADD COLUMN editors          TEXT",  # JSON list
+        "ALTER TABLE refs ADD COLUMN num_pages        INTEGER",
+        "ALTER TABLE refs ADD COLUMN license          TEXT",
     ]
 
     def __init__(self, path: Optional[str | Path] = None) -> None:

@@ -722,3 +722,94 @@ class TestAnalytics:
     def test_get_many_empty_list(self, tmp_db):
         refs = tmp_db.get_many([])
         assert refs == []
+
+
+# ---------------------------------------------------------------------------
+# Extended field round-trip tests
+# ---------------------------------------------------------------------------
+
+class TestExtendedFields:
+    def test_article_number_roundtrip(self, tmp_db):
+        from zoterpile.models import Reference, RefType
+        ref = Reference(
+            title="Journal Article",
+            doi="10.ext/1",
+            article_number="e12345",
+            ref_type=RefType.JOURNAL,
+        )
+        rid = tmp_db.upsert(ref)
+        stored = tmp_db.get(rid)
+        assert stored.article_number == "e12345"
+
+    def test_event_name_roundtrip(self, tmp_db):
+        from zoterpile.models import Reference, RefType
+        ref = Reference(
+            title="Conference Paper",
+            doi="10.ext/2",
+            event_name="NeurIPS 2024",
+            ref_type=RefType.CONFERENCE,
+        )
+        rid = tmp_db.upsert(ref)
+        stored = tmp_db.get(rid)
+        assert stored.event_name == "NeurIPS 2024"
+
+    def test_editors_roundtrip(self, tmp_db):
+        from zoterpile.models import Author, Reference, RefType
+        ref = Reference(
+            title="Edited Book",
+            doi="10.ext/3",
+            editors=[Author(family="Editor", given="Ed")],
+            ref_type=RefType.BOOK,
+        )
+        rid = tmp_db.upsert(ref)
+        stored = tmp_db.get(rid)
+        assert len(stored.editors) == 1
+        assert stored.editors[0].family == "Editor"
+
+    def test_container_title_roundtrip(self, tmp_db):
+        from zoterpile.models import Reference, RefType
+        ref = Reference(
+            title="Book Chapter",
+            doi="10.ext/4",
+            container_title="Handbook of AI",
+            ref_type=RefType.BOOK_CHAPTER,
+        )
+        rid = tmp_db.upsert(ref)
+        stored = tmp_db.get(rid)
+        assert stored.container_title == "Handbook of AI"
+
+    def test_eissn_roundtrip(self, tmp_db):
+        from zoterpile.models import Reference, RefType
+        ref = Reference(
+            title="Journal",
+            doi="10.ext/5",
+            eissn="1234-5679",
+            ref_type=RefType.JOURNAL,
+        )
+        rid = tmp_db.upsert(ref)
+        stored = tmp_db.get(rid)
+        assert stored.eissn == "1234-5679"
+
+    def test_license_roundtrip(self, tmp_db):
+        from zoterpile.models import Reference, RefType
+        ref = Reference(
+            title="OA Paper",
+            doi="10.ext/6",
+            license="https://creativecommons.org/licenses/by/4.0/",
+            ref_type=RefType.JOURNAL,
+        )
+        rid = tmp_db.upsert(ref)
+        stored = tmp_db.get(rid)
+        assert stored.license == "https://creativecommons.org/licenses/by/4.0/"
+
+    def test_num_pages_roundtrip(self, tmp_db):
+        from zoterpile.models import Reference, RefType
+        ref = Reference(
+            title="Long Book",
+            isbn="978-0-123-456789",
+            num_pages=450,
+            ref_type=RefType.BOOK,
+        )
+        rid = tmp_db.upsert(ref)
+        stored = tmp_db.get(rid)
+        assert stored.num_pages == 450
