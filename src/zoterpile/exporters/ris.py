@@ -33,7 +33,9 @@ def _ref_to_ris(ref: Reference) -> str:
         tag("AN", ref.pmid)
     if ref.arxiv_id:
         tag("UR", f"https://arxiv.org/abs/{ref.arxiv_id}")
-    tag("SN", ref.issn or ref.isbn)
+    tag("SN", ref.issn or ref.eissn or ref.isbn)
+    if ref.eissn and ref.issn:
+        tag("SN", ref.eissn)
     tag("UR", ref.url or ref.oa_url)
 
     # Core
@@ -52,8 +54,6 @@ def _ref_to_ris(ref: Reference) -> str:
         year_str = str(ref.year)
         month_str = f"{ref.month:02d}" if ref.month else "00"
         tag("PY", f"{year_str}/{month_str}//")
-    elif ref.year:
-        tag("PY", str(ref.year))
 
     tag("AB", ref.abstract)
 
@@ -64,17 +64,25 @@ def _ref_to_ris(ref: Reference) -> str:
     tag("IS", ref.issue)
     tag("SP", _start_page(ref.pages))
     tag("EP", _end_page(ref.pages))
+    if not ref.pages and ref.article_number:
+        tag("M1", ref.article_number)
+
+    # Secondary title: conference name or book title for chapters
+    if ref.event_name:
+        tag("T2", ref.event_name)
+    elif ref.ref_type.value in ("book-chapter",):
+        tag("T2", ref.container_title)
 
     # Book / publisher
     tag("PB", ref.publisher)
     tag("CY", ref.place)
-    tag("T2", ref.container_title if ref.ref_type.value in ("book-chapter",) else None)
 
     # Keywords
     for kw in ref.keywords:
         tag("KW", kw)
 
     tag("LA", ref.language)
+    tag("M3", ref.license)
 
     # End record (required)
     lines.append("ER  - ")

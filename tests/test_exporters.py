@@ -67,6 +67,27 @@ def _minimal_ref() -> Reference:
     return Reference(title="Minimal Paper", ref_type=RefType.UNKNOWN)
 
 
+def _conference_ref() -> Reference:
+    return Reference(
+        title="Deep Residual Learning for Image Recognition",
+        doi="10.1109/CVPR.2016.90",
+        year=2016,
+        ref_type=RefType.CONFERENCE,
+        event_name="IEEE Conference on Computer Vision and Pattern Recognition",
+        article_number="7780459",
+        eissn="2575-7075",
+        issn="1063-6919",
+        license="CC BY 4.0",
+        authors=[
+            _make_author("He", "Kaiming"),
+            _make_author("Zhang", "Xiangyu"),
+        ],
+        editors=[
+            _make_author("Smith", "Alice"),
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # BibTeX tests
 # ---------------------------------------------------------------------------
@@ -162,6 +183,20 @@ class TestBibTeX:
         bib_list   = to_bibtex_string([ref])
         assert bib_single == bib_list
 
+    def test_conference_booktitle_uses_event_name(self):
+        bib = to_bibtex_string(_conference_ref())
+        assert "IEEE Conference on Computer Vision" in bib
+        assert "booktitle" in bib
+
+    def test_article_number_as_pages_fallback(self):
+        bib = to_bibtex_string(_conference_ref())
+        assert "7780459" in bib
+
+    def test_editors_field(self):
+        bib = to_bibtex_string(_conference_ref())
+        assert "editor" in bib
+        assert "Smith" in bib
+
 
 # ---------------------------------------------------------------------------
 # RIS tests
@@ -234,6 +269,23 @@ class TestRIS:
     def test_single_ref_accepted(self):
         ref = _journal_ref()
         assert to_ris_string(ref) == to_ris_string([ref])
+
+    def test_conference_t2_is_event_name(self):
+        ris = to_ris_string(_conference_ref())
+        assert "T2  - IEEE Conference on Computer Vision" in ris
+
+    def test_article_number_in_m1(self):
+        ris = to_ris_string(_conference_ref())
+        assert "M1  - 7780459" in ris
+
+    def test_eissn_in_sn(self):
+        ris = to_ris_string(_conference_ref())
+        sn_lines = [l for l in ris.splitlines() if l.startswith("SN  -")]
+        assert any("2575-7075" in l for l in sn_lines)
+
+    def test_license_in_m3(self):
+        ris = to_ris_string(_conference_ref())
+        assert "M3  - CC BY 4.0" in ris
 
 
 # ---------------------------------------------------------------------------
@@ -415,3 +467,25 @@ class TestZoteroRDF:
         )
         rdf = to_zotero_rdf_string([ref])
         assert 'rdf:about="https://example.com/page"' in rdf
+
+    def test_conference_event_name(self):
+        rdf = to_zotero_rdf_string([_conference_ref()])
+        assert "<bib:Conference>" in rdf
+        assert "IEEE Conference on Computer Vision" in rdf
+
+    def test_article_number_as_pages_fallback(self):
+        rdf = to_zotero_rdf_string([_conference_ref()])
+        assert "<bib:pages>7780459</bib:pages>" in rdf
+
+    def test_editors_in_rdf(self):
+        rdf = to_zotero_rdf_string([_conference_ref()])
+        assert "<bib:editors>" in rdf
+        assert "<foaf:surname>Smith</foaf:surname>" in rdf
+
+    def test_license_as_dc_rights(self):
+        rdf = to_zotero_rdf_string([_conference_ref()])
+        assert "<dc:rights>CC BY 4.0</dc:rights>" in rdf
+
+    def test_eissn_as_dc_identifier(self):
+        rdf = to_zotero_rdf_string([_conference_ref()])
+        assert "ISSN 2575-7075" in rdf
