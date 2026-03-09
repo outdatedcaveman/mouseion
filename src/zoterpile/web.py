@@ -1758,7 +1758,12 @@ def index():
     key = _get_or_create_api_key()
     # Inject the key so the frontend auto-configures on first load,
     # avoiding the manual copy-paste step.
-    bootstrap = f'<script>localStorage.setItem("zp_key","{key}");</script>'
+    bootstrap = (
+        f'<script>'
+        f'localStorage.setItem("zp_key","{key}");'
+        f'localStorage.removeItem("zp_url");'  # always use same-origin when served directly
+        f'</script>'
+    )
     return _HTML.replace("</head>", bootstrap + "</head>", 1)
 
 
