@@ -14,6 +14,8 @@ from zoterpile.providers.crossref import CrossRefProvider
 from zoterpile.providers.arxiv import ArXivProvider
 from zoterpile.providers.semantic_scholar import SemanticScholarProvider
 from zoterpile.providers.openalex import OpenAlexProvider, _reconstruct_abstract
+from zoterpile.providers.pubmed import PubMedProvider
+from zoterpile.providers.dblp import DBLPProvider
 from zoterpile.providers.base import BaseProvider
 
 
@@ -563,3 +565,230 @@ class TestReconstructAbstract:
 
     def test_empty(self):
         assert _reconstruct_abstract({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# PubMed provider tests
+# ---------------------------------------------------------------------------
+
+_PUBMED_XML = """\
+<PubmedArticleSet>
+<PubmedArticle>
+  <MedlineCitation>
+    <PMID>12345678</PMID>
+    <Article>
+      <ArticleTitle>A PubMed Paper</ArticleTitle>
+      <Abstract>
+        <AbstractText>This is the abstract.</AbstractText>
+      </Abstract>
+      <AuthorList>
+        <Author>
+          <LastName>Brown</LastName>
+          <ForeName>Alice</ForeName>
+          <Identifier Source="ORCID">https://orcid.org/0000-0001-2345-6789</Identifier>
+        </Author>
+        <Author>
+          <LastName>Jones</LastName>
+          <ForeName>Bob</ForeName>
+        </Author>
+      </AuthorList>
+      <Journal>
+        <Title>Journal of Science</Title>
+        <ISOAbbreviation>J. Sci.</ISOAbbreviation>
+        <ISSN IssnType="Print">1234-5678</ISSN>
+        <ISSN IssnType="Electronic">8765-4321</ISSN>
+        <JournalIssue>
+          <Volume>10</Volume>
+          <Issue>2</Issue>
+          <PubDate><Year>2022</Year><Month>Mar</Month></PubDate>
+        </JournalIssue>
+      </Journal>
+      <Pagination><MedlinePgn>100-110</MedlinePgn></Pagination>
+      <Language>eng</Language>
+    </Article>
+    <KeywordList>
+      <Keyword>neuroscience</Keyword>
+      <Keyword>brain</Keyword>
+    </KeywordList>
+  </MedlineCitation>
+  <PubmedData>
+    <ArticleIdList>
+      <ArticleId IdType="doi">10.1234/fake.doi</ArticleId>
+      <ArticleId IdType="pmc">PMC1234567</ArticleId>
+    </ArticleIdList>
+  </PubmedData>
+</PubmedArticle>
+</PubmedArticleSet>
+"""
+
+
+class TestPubMedProvider:
+    @pytest.fixture
+    def provider(self):
+        return PubMedProvider()
+
+    def test_parse_title(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref is not None
+        assert ref.title == "A PubMed Paper"
+
+    def test_parse_pmid(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.pmid == "12345678"
+
+    def test_parse_doi(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.doi == "10.1234/fake.doi"
+
+    def test_parse_pmcid(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.pmcid == "PMC1234567"
+
+    def test_parse_authors(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert len(ref.authors) == 2
+        assert ref.authors[0].family == "Brown"
+        assert ref.authors[0].given == "Alice"
+
+    def test_parse_orcid(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.authors[0].orcid == "0000-0001-2345-6789"
+
+    def test_parse_year_month(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.year == 2022
+        assert ref.month == 3
+
+    def test_parse_journal(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.journal == "Journal of Science"
+        assert ref.journal_abbrev == "J. Sci."
+
+    def test_parse_volume_issue(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.volume == "10"
+        assert ref.issue == "2"
+
+    def test_parse_pages(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.pages == "100-110"
+
+    def test_parse_issn_print(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.issn == "1234-5678"
+
+    def test_parse_eissn_electronic(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.eissn == "8765-4321"
+
+    def test_parse_keywords(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert "neuroscience" in ref.keywords
+
+    def test_parse_language(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert ref.language == "eng"
+
+    def test_parse_abstract(self, provider):
+        ref = provider._parse_xml(_PUBMED_XML)
+        assert "abstract" in (ref.abstract or "").lower()
+
+    def test_invalid_xml_returns_none(self, provider):
+        ref = provider._parse_xml("<not valid xml>")
+        assert ref is None
+
+    def test_provider_name(self, provider):
+        assert provider.name == "pubmed"
+
+    def test_provider_priority(self, provider):
+        assert provider.priority == 4
+
+
+# ---------------------------------------------------------------------------
+# DBLP provider tests
+# ---------------------------------------------------------------------------
+
+def _dblp_hit(
+    title="DBLP Paper",
+    doi="10.9999/dblp.1",
+    year="2021",
+    venue="ICML",
+    pub_type="Conference and Workshop Papers",
+) -> dict:
+    return {
+        "info": {
+            "title": title,
+            "doi": doi,
+            "year": year,
+            "venue": venue,
+            "type": pub_type,
+            "volume": "5",
+            "pages": "200-210",
+            "authors": {
+                "author": [
+                    {"text": "Alice Smith"},
+                    {"text": "Bob Jones"},
+                ]
+            },
+            "url": "https://dblp.org/rec/conf/icml/2021",
+            "access": "open",
+        }
+    }
+
+
+class TestDBLPProvider:
+    @pytest.fixture
+    def provider(self):
+        return DBLPProvider()
+
+    def test_parse_title(self, provider):
+        ref = provider._parse_hit(_dblp_hit())
+        assert ref is not None
+        assert ref.title == "DBLP Paper"
+
+    def test_parse_doi(self, provider):
+        ref = provider._parse_hit(_dblp_hit())
+        assert ref.doi == "10.9999/dblp.1"
+
+    def test_parse_year(self, provider):
+        ref = provider._parse_hit(_dblp_hit())
+        assert ref.year == 2021
+
+    def test_parse_authors(self, provider):
+        ref = provider._parse_hit(_dblp_hit())
+        assert len(ref.authors) == 2
+
+    def test_parse_journal_type(self, provider):
+        ref = provider._parse_hit(_dblp_hit(pub_type="Journal Articles"))
+        assert ref.ref_type == RefType.JOURNAL
+
+    def test_parse_conference_type(self, provider):
+        ref = provider._parse_hit(_dblp_hit())
+        assert ref.ref_type == RefType.CONFERENCE
+
+    def test_parse_venue(self, provider):
+        ref = provider._parse_hit(_dblp_hit())
+        assert ref.journal == "ICML"
+
+    def test_parse_volume_pages(self, provider):
+        ref = provider._parse_hit(_dblp_hit())
+        assert ref.volume == "5"
+        assert ref.pages == "200-210"
+
+    def test_parse_open_access(self, provider):
+        ref = provider._parse_hit(_dblp_hit())
+        assert ref.open_access is True
+
+    def test_title_trailing_dot_stripped(self, provider):
+        ref = provider._parse_hit(_dblp_hit(title="A Paper."))
+        assert ref.title == "A Paper"
+
+    def test_empty_info_returns_none(self, provider):
+        ref = provider._parse_hit({})
+        assert ref is None
+
+    def test_provider_name(self, provider):
+        assert provider.name == "dblp"
+
+    def test_provider_priority(self, provider):
+        assert provider.priority == 5
