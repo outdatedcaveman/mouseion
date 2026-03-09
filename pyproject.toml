@@ -36,6 +36,8 @@ dependencies = [
     "textual>=0.50",
     # Web UI
     "flask>=3.0",
+    # Production WSGI server (used automatically when not in debug mode)
+    "gunicorn>=22.0",
 ]
 
 [project.optional-dependencies]

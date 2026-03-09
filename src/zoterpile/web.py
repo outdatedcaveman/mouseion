@@ -5731,13 +5731,40 @@ def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
     """Start the web UI. Called by `zoterpile web` and `zoterpile-web` script."""
     api_key = _get_or_create_api_key()
     scheme = "http"
+
+    _use_gunicorn = False
+    if not debug:
+        try:
+            import gunicorn  # noqa: F401
+            _use_gunicorn = True
+        except ImportError:
+            pass
+
+    server_name = "gunicorn" if _use_gunicorn else "flask-dev"
     print(
         f"\n  ✦ zoterpile web UI  →  {scheme}://{host}:{port}"
         f"\n  API Key             →  {api_key}"
+        f"\n  Server              →  {server_name}"
         f"\n  (Set X-API-Key header or save key in the ⚙ Settings modal)"
         f"\n\n  Press Ctrl+C to stop.\n"
     )
-    app.run(host=host, port=port, debug=debug, threaded=True)
+
+    if _use_gunicorn:
+        from gunicorn.app.base import BaseApplication
+
+        class _GunicornApp(BaseApplication):
+            def load_config(self) -> None:
+                self.cfg.set("bind",     f"{host}:{port}")
+                self.cfg.set("workers",  2)
+                self.cfg.set("timeout",  120)
+                self.cfg.set("loglevel", "info")
+
+            def load(self):
+                return app
+
+        _GunicornApp().run()
+    else:
+        app.run(host=host, port=port, debug=debug, threaded=True)
 
 
 if __name__ == "__main__":
