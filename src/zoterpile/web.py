@@ -938,9 +938,6 @@ def stats():
             "median": sorted(cited)[len(cited)//2] if cited else 0,
         }
 
-        # Reading status
-        status_map = {row["s"]: row["c"] for row in status_rows}
-
         # Reading goal progress (from settings)
         from .db import RefDatabase as _RDB2
         import datetime as _dt
@@ -1573,7 +1570,7 @@ def update_settings():
             if "reading_goal_weekly" in body:
                 db.set_setting("reading_goal_weekly", str(int(body["reading_goal_weekly"])))
         return jsonify({"ok": True})
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError):
         return jsonify({"error": "Goal values must be integers"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1651,7 +1648,8 @@ def _fire_webhooks(event: str, data: dict) -> None:
     """Fire configured webhooks in a background thread (best-effort, non-blocking)."""
     def _worker():
         try:
-            import json as _json, httpx as _httpx
+            import json as _json
+            import httpx as _httpx
             from .db import RefDatabase
             with RefDatabase() as db:
                 raw = db.get_setting("webhooks", "[]")
@@ -1757,7 +1755,14 @@ self.addEventListener('fetch', e => {
 
 @app.route("/")
 def index():
-    return _HTML
+    key = _get_or_create_api_key()
+    # Inject the key so the frontend auto-configures on first load,
+    # avoiding the manual copy-paste step.
+    bootstrap = (
+        f'<script>if(!localStorage.getItem("zp_key"))'
+        f'localStorage.setItem("zp_key","{key}");</script>'
+    )
+    return _HTML.replace("</head>", bootstrap + "</head>", 1)
 
 
 # ---------------------------------------------------------------------------

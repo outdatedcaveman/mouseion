@@ -143,9 +143,12 @@ def _ref_to_markdown(ref: Reference) -> str:
         lines.append(f"**Published in:** *{ref.journal or ref.container_title}*")
 
     bib_parts = []
-    if ref.volume: bib_parts.append(f"Vol. {ref.volume}")
-    if ref.issue:  bib_parts.append(f"No. {ref.issue}")
-    if ref.pages:  bib_parts.append(f"pp. {ref.pages}")
+    if ref.volume:
+        bib_parts.append(f"Vol. {ref.volume}")
+    if ref.issue:
+        bib_parts.append(f"No. {ref.issue}")
+    if ref.pages:
+        bib_parts.append(f"pp. {ref.pages}")
     if bib_parts:
         lines.append(f"**Bibliographic:** {', '.join(bib_parts)}")
 

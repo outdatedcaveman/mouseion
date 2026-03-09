@@ -49,7 +49,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import click
 from rich.console import Console
@@ -151,7 +151,7 @@ def add(
     from .db import RefDatabase
 
     # --- Parse ---
-    console.print(f"[blue]→[/blue] Parsing input…")
+    console.print("[blue]→[/blue] Parsing input…")
     seeds = parse_input(input_data)
     if not seeds:
         console.print("[red]✗ Could not parse any references from input[/red]")

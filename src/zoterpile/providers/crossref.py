@@ -39,7 +39,7 @@ class CrossRefProvider(BaseProvider):
 
     def _make_client(self, **kwargs) -> httpx.AsyncClient:
         ua = (
-            f"zoterpile/0.1 (https://github.com/outdatedcaveman/zoterpile"
+            "zoterpile/0.1 (https://github.com/outdatedcaveman/zoterpile"
             + (f"; mailto:{self._email}" if self._email else "")
             + ")"
         )

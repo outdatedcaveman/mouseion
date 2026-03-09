@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -124,8 +125,7 @@ def _ref_id(ref: Reference) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:24]
 
 
-# lazy import re for isbn normalisation
-import re
+
 
 
 def _authors_json(authors: List[Author]) -> str:
@@ -1051,7 +1051,7 @@ class RefDatabase:
         # Optionally fetch FTS5 snippet for abstract column (index 1)
         snippet_sql = ""
         if use_fts:
-            snippet_sql = f"""
+            snippet_sql = """
                 SELECT refs_fts.ref_id,
                        snippet(refs_fts, 1, '<mark>', '</mark>', '…', 20) AS snip
                 FROM refs_fts

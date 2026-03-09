@@ -60,8 +60,6 @@ class OpenAlexProvider(BaseProvider):
         ref.pmid    = str(ids["pmid"]).replace("https://pubmed.ncbi.nlm.nih.gov/", "").strip("/").strip() \
                         if ids.get("pmid") else None
         ref.pmcid   = str(ids.get("pmcid", "")).replace("https://www.ncbi.nlm.nih.gov/pmc/articles/", "").strip() or None
-        arxiv_raw   = ids.get("openalex", "")  # not directly, check source
-
         # arXiv IDs sometimes in locations
         for loc in data.get("locations", []):
             src = loc.get("source") or {}

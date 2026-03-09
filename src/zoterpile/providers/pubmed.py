@@ -239,10 +239,6 @@ class PubMedProvider(BaseProvider):
             try:
                 root = ET.fromstring(fetch_resp.text)
                 for article_el in root.findall("PubmedArticle"):
-                    sub_xml = ET.tostring(
-                        ET.Element("PubmedArticleSet"),
-                        encoding="unicode"
-                    )
                     # Wrap single article in a root element and parse
                     wrapped = f"<PubmedArticleSet>{ET.tostring(article_el, encoding='unicode')}</PubmedArticleSet>"
                     r = self._parse_xml(wrapped)
