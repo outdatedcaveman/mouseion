@@ -88,7 +88,7 @@ class _ProviderState:
         while self._day and self._day[0] < now - 86400:
             self._day.popleft()
 
-    def wait_seconds(self, now: float) -> float:
+    def wait_seconds(self, now: float, provider: str = "") -> float:
         """Return how many seconds to sleep before the next request is allowed."""
         self._prune(now)
         L = self.limits
@@ -102,9 +102,7 @@ class _ProviderState:
             # Daily quota exhausted — this is the QuotaExceeded signal
             remaining = self._day[0] + 86400 - now
             if remaining > 600:   # more than 10 min: raise rather than sleep
-                raise QuotaExceeded(
-                    "?", "day", L.requests_per_day
-                )
+                raise QuotaExceeded(provider, "day", L.requests_per_day)
             waits.append(remaining)
         if L.min_interval_seconds:
             gap = self._last_request + L.min_interval_seconds - now
@@ -182,11 +180,7 @@ class QuotaManager:
         async with state._lock:
             while True:
                 now = time.time()
-                try:
-                    wait = state.wait_seconds(now)
-                except QuotaExceeded as exc:
-                    exc.provider = provider
-                    raise
+                wait = state.wait_seconds(now, provider=provider)
                 if wait <= 0:
                     break
                 # Sleep in small chunks so we stay responsive to cancellation.
