@@ -96,7 +96,7 @@ def parse_pdf_file(path: str | Path) -> Reference:
 
         # If no title from metadata, try first non-trivial line of text
         if not ref.title:
-            lines = [l.strip() for l in first_pages_text.splitlines() if l.strip()]
+            lines = [ln.strip() for ln in first_pages_text.splitlines() if ln.strip()]
             for line in lines[:10]:
                 if len(line) > 10 and not line.startswith("http"):
                     ref.title = line[:200]
