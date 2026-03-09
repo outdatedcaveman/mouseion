@@ -46,7 +46,7 @@ class DBLPProvider(BaseProvider):
         if isinstance(authors_raw, dict):
             authors_raw = [authors_raw]
         for a in authors_raw:
-            name = a.get("text") or a if isinstance(a, str) else ""
+            name = a if isinstance(a, str) else (a.get("text") or "")
             if name:
                 ref.authors.append(Author.from_bibtex_str(name))
 

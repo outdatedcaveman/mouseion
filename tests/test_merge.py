@@ -1,7 +1,7 @@
 """Tests for the merge engine."""
 
 import pytest
-from src.zoterpile.merge import merge, match_score, _title_similarity
+from src.zoterpile.merge import merge, match_score, _title_similarity, _priority
 from src.zoterpile.models import Author, RefType, Reference
 
 
@@ -169,3 +169,100 @@ class TestTitleSimilarity:
     def test_none_returns_zero(self):
         assert _title_similarity(None, "Some Title") == 0.0
         assert _title_similarity("Some Title", None) == 0.0
+
+
+class TestMergeNewFields:
+    """Tests for merge behaviour with the extended Reference fields."""
+
+    def _conf_ref(self, event_name=None, article_number=None, eissn=None,
+                  license=None, editors=None, num_pages=None, source="crossref"):
+        ref = Reference(
+            title="Test Conference Paper",
+            year=2022,
+            ref_type=RefType.CONFERENCE,
+            event_name=event_name,
+            article_number=article_number,
+            eissn=eissn,
+            license=license,
+            editors=editors or [],
+            num_pages=num_pages,
+        )
+        ref.sources[source] = 1.0
+        return ref
+
+    def test_event_name_first_wins(self):
+        seed = Reference(title="Test Conference Paper")
+        c1 = self._conf_ref(event_name="CVPR 2022", source="crossref")
+        c2 = self._conf_ref(event_name="Some Other Conf", source="openalex")
+        result = merge(seed, [(c1, 1.0), (c2, 0.9)])
+        assert result.event_name == "CVPR 2022"
+
+    def test_article_number_merged(self):
+        seed = Reference(title="Test Conference Paper")
+        c1 = self._conf_ref(article_number="e123456", source="crossref")
+        result = merge(seed, [(c1, 1.0)])
+        assert result.article_number == "e123456"
+
+    def test_eissn_merged(self):
+        seed = Reference(title="Test Conference Paper")
+        c1 = self._conf_ref(eissn="1234-5678", source="crossref")
+        result = merge(seed, [(c1, 1.0)])
+        assert result.eissn == "1234-5678"
+
+    def test_license_merged(self):
+        seed = Reference(title="Test Conference Paper")
+        c1 = self._conf_ref(license="CC BY 4.0", source="crossref")
+        result = merge(seed, [(c1, 1.0)])
+        assert result.license == "CC BY 4.0"
+
+    def test_editors_merged(self):
+        seed = Reference(title="Test Conference Paper")
+        editors = [Author(family="Jones", given="A.")]
+        c1 = self._conf_ref(editors=editors, source="crossref")
+        result = merge(seed, [(c1, 1.0)])
+        assert len(result.editors) == 1
+        assert result.editors[0].family == "Jones"
+
+    def test_oa_url_selected(self):
+        seed = Reference(title="Test Paper")
+        c1 = Reference(title="Test Paper", open_access=True,
+                       oa_url="https://example.com/pdf")
+        c1.sources["openalex"] = 1.0
+        result = merge(seed, [(c1, 1.0)])
+        assert result.oa_url == "https://example.com/pdf"
+
+    def test_seed_fallback_for_missing_fields(self):
+        """Seed's cite_key is preserved even when candidates have no cite_key."""
+        seed = Reference(title="Test Paper", cite_key="mykey2023")
+        c1 = Reference(title="Test Paper", doi="10.1234/x")
+        c1.sources["crossref"] = 1.0
+        result = merge(seed, [(c1, 1.0)])
+        assert result.cite_key == "mykey2023"
+        assert result.doi == "10.1234/x"
+
+
+class TestPriority:
+    def test_crossref_is_highest(self):
+        ref = Reference()
+        ref.sources["crossref"] = 1.0
+        assert _priority(ref) == 1
+
+    def test_unknown_source_mid_priority(self):
+        ref = Reference()
+        ref.sources["unknown_provider"] = 1.0
+        assert _priority(ref) == 50
+
+    def test_input_source_lowest(self):
+        ref = Reference()
+        ref.sources["bibtex_input"] = 0.5
+        assert _priority(ref) == 90
+
+    def test_multi_source_picks_best(self):
+        ref = Reference()
+        ref.sources["bibtex_input"] = 0.5
+        ref.sources["crossref"] = 1.0
+        assert _priority(ref) == 1
+
+    def test_no_sources_returns_99(self):
+        ref = Reference()
+        assert _priority(ref) == 99

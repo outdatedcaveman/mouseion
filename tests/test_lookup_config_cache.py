@@ -326,3 +326,105 @@ class TestReferenceCache:
         stats = cache.stats()
         assert "size_bytes" in stats
         assert stats["size_bytes"] >= 0
+
+
+# ===========================================================================
+# Quota manager tests
+# ===========================================================================
+
+class TestQuota:
+    @pytest.fixture
+    def qm(self, tmp_path):
+        from zoterpile.quota import QuotaManager, ProviderLimits
+        return QuotaManager(
+            limits={"fast": ProviderLimits(requests_per_minute=100)},
+            state_file=tmp_path / "quota.json",
+        )
+
+    @pytest.mark.asyncio
+    async def test_acquire_permits_request(self, qm):
+        """acquire() completes without error for a fresh provider."""
+        async with qm.acquire("fast"):
+            pass  # should not block or raise
+
+    @pytest.mark.asyncio
+    async def test_acquire_records_request(self, qm):
+        import time
+        async with qm.acquire("fast"):
+            pass
+        state = qm._get_state("fast")
+        assert len(state._minute) == 1
+
+    @pytest.mark.asyncio
+    async def test_daily_quota_exceeded_raises(self, tmp_path):
+        """QuotaExceeded is raised when daily limit is exhausted and reset is far."""
+        from zoterpile.quota import QuotaManager, ProviderLimits, QuotaExceeded
+        qm = QuotaManager(
+            limits={"tiny": ProviderLimits(requests_per_day=1)},
+            state_file=tmp_path / "q2.json",
+        )
+        # First request succeeds
+        async with qm.acquire("tiny"):
+            pass
+        # Manually inject far-future timestamps to simulate exhaustion
+        import time
+        state = qm._get_state("tiny")
+        state._day.clear()
+        state._day.append(time.time() - 1)   # 1 second old but daily limit is 1
+        # Second request should see quota exhausted and remaining > 600s doesn't apply
+        # since the timestamp is 1s old (remaining ≈ 86399s > 600s → raise)
+        with pytest.raises(QuotaExceeded) as exc_info:
+            async with qm.acquire("tiny"):
+                pass
+        assert exc_info.value.provider == "tiny"
+        assert exc_info.value.window == "day"
+
+    @pytest.mark.asyncio
+    async def test_quota_exceeded_message_has_provider(self, tmp_path):
+        """The exception message includes the correct provider name (bug fix)."""
+        from zoterpile.quota import QuotaManager, ProviderLimits, QuotaExceeded
+        qm = QuotaManager(
+            limits={"myprovider": ProviderLimits(requests_per_day=1)},
+            state_file=tmp_path / "q3.json",
+        )
+        async with qm.acquire("myprovider"):
+            pass
+        import time
+        state = qm._get_state("myprovider")
+        state._day.clear()
+        state._day.append(time.time() - 1)
+        with pytest.raises(QuotaExceeded) as exc_info:
+            async with qm.acquire("myprovider"):
+                pass
+        # Before the fix, this was "?" in the exception message
+        assert "myprovider" in str(exc_info.value)
+
+    def test_get_status_returns_counts(self, qm):
+        status = qm.get_status()
+        assert isinstance(status, dict)
+
+    def test_save_and_reload_state(self, tmp_path):
+        """State persisted to disk is restored on next instantiation."""
+        import asyncio, time
+        from zoterpile.quota import QuotaManager, ProviderLimits
+
+        state_file = tmp_path / "qstate.json"
+        qm1 = QuotaManager(
+            limits={"crossref": ProviderLimits(requests_per_minute=50)},
+            state_file=state_file,
+        )
+
+        async def _run():
+            async with qm1.acquire("crossref"):
+                pass
+
+        asyncio.run(_run())
+        qm1.save_state()
+
+        # New instance with same file
+        qm2 = QuotaManager(
+            limits={"crossref": ProviderLimits(requests_per_minute=50)},
+            state_file=state_file,
+        )
+        state = qm2._get_state("crossref")
+        assert len(state._day) >= 1

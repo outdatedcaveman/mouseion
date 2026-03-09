@@ -135,11 +135,18 @@ class PubMedProvider(BaseProvider):
         if pagination is not None and pagination.text:
             ref.pages = pagination.text.strip()
 
-        # ISSN
-        issn_el = article.find(".//ISSN[@IssnType='Electronic']") \
-                  or article.find(".//ISSN")
-        if issn_el is not None:
-            ref.issn = issn_el.text
+        # ISSN (print → issn, electronic → eissn)
+        print_el     = article.find(".//ISSN[@IssnType='Print']")
+        electronic_el = article.find(".//ISSN[@IssnType='Electronic']")
+        if print_el is not None and print_el.text:
+            ref.issn = print_el.text.strip()
+        if electronic_el is not None and electronic_el.text:
+            ref.eissn = electronic_el.text.strip()
+        # Fallback: any ISSN goes to issn
+        if not ref.issn and not ref.eissn:
+            fallback = article.find(".//ISSN")
+            if fallback is not None and fallback.text:
+                ref.issn = fallback.text.strip()
 
         # Keywords
         kws = [_text(kw, ".") or kw.text or "" for kw in article.findall(".//Keyword")]

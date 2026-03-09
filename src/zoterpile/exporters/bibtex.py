@@ -92,10 +92,10 @@ def _ref_to_bibtex_entry(ref: Reference) -> str:
 
     # Journal/conference
     add("journal",   ref.journal    or ref.container_title)
-    add("booktitle", ref.container_title if entry_type in ("incollection", "inproceedings") else None)
+    add("booktitle", ref.event_name or (ref.container_title if entry_type in ("incollection", "inproceedings") else None))
     add("volume",  ref.volume)
     add("number",  ref.issue)
-    add("pages",   ref.pages)
+    add("pages",   ref.pages or ref.article_number)
 
     # Book
     add("publisher", ref.publisher)

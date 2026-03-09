@@ -57,7 +57,7 @@ class OpenAlexProvider(BaseProvider):
 
         # --- IDs ---
         ids = data.get("ids") or {}
-        ref.pmid    = str(ids["pmid"]).replace("https://pubmed.ncbi.nlm.nih.gov/", "").strip() \
+        ref.pmid    = str(ids["pmid"]).replace("https://pubmed.ncbi.nlm.nih.gov/", "").strip("/").strip() \
                         if ids.get("pmid") else None
         ref.pmcid   = str(ids.get("pmcid", "")).replace("https://www.ncbi.nlm.nih.gov/pmc/articles/", "").strip() or None
         arxiv_raw   = ids.get("openalex", "")  # not directly, check source
@@ -105,7 +105,9 @@ class OpenAlexProvider(BaseProvider):
         ref.journal = src.get("display_name") or None
         if ref.journal:
             ref.container_title = ref.journal
-        ref.issn = (src.get("issn_l") or (src.get("issn") or [None])[0]) or None
+        issns = src.get("issn") or []
+        ref.issn  = src.get("issn_l") or (issns[0] if issns else None) or None
+        ref.eissn = issns[1] if len(issns) > 1 else None
 
         # --- Bibliographic details ---
         bib = data.get("biblio") or {}

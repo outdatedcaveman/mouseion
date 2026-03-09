@@ -45,16 +45,16 @@ def _item_uri(ref: Reference) -> str:
     return f"urn:zoterpile:{id(ref)}"
 
 
-def _author_elements(authors, role: str = "z:Author") -> str:
+def _person_elements(persons, tag: str) -> str:
     parts = []
-    for a in authors:
+    for a in persons:
         given  = _e(a.given or "")
         family = _e(a.family or "")
         parts.append(
-            f'    <bib:authors><rdf:Seq><rdf:li>'
+            f'    <{tag}><rdf:Seq><rdf:li>'
             f'<foaf:Person><foaf:surname>{family}</foaf:surname>'
             f'<foaf:firstName>{given}</foaf:firstName></foaf:Person>'
-            f'</rdf:li></rdf:Seq></bib:authors>'
+            f'</rdf:li></rdf:Seq></{tag}>'
         )
     return "\n".join(parts)
 
@@ -69,7 +69,9 @@ def _ref_to_rdf_item(ref: Reference) -> str:
         lines.append(f"    <dc:title>{_e(ref.title)}</dc:title>")
 
     if ref.authors:
-        lines.append(_author_elements(ref.authors))
+        lines.append(_person_elements(ref.authors, "bib:authors"))
+    if ref.editors:
+        lines.append(_person_elements(ref.editors, "bib:editors"))
 
     if ref.year:
         date_str = str(ref.year)
@@ -84,13 +86,20 @@ def _ref_to_rdf_item(ref: Reference) -> str:
             f"<dc:title>{_e(journal)}</dc:title>"
             f"</bib:Journal></dcterms:isPartOf>"
         )
+    if ref.event_name:
+        lines.append(
+            f"    <bib:presentedAt><bib:Conference>"
+            f"<dc:title>{_e(ref.event_name)}</dc:title>"
+            f"</bib:Conference></bib:presentedAt>"
+        )
 
     if ref.volume:
         lines.append(f"    <prism:volume>{_e(ref.volume)}</prism:volume>")
     if ref.issue:
         lines.append(f"    <prism:number>{_e(ref.issue)}</prism:number>")
-    if ref.pages:
-        lines.append(f"    <bib:pages>{_e(ref.pages)}</bib:pages>")
+    pages = ref.pages or ref.article_number
+    if pages:
+        lines.append(f"    <bib:pages>{_e(pages)}</bib:pages>")
     if ref.publisher:
         lines.append(f"    <dc:publisher>{_e(ref.publisher)}</dc:publisher>")
     if ref.abstract:
@@ -99,10 +108,16 @@ def _ref_to_rdf_item(ref: Reference) -> str:
         lines.append(f"    <dc:identifier>DOI {_e(ref.doi)}</dc:identifier>")
     if ref.isbn:
         lines.append(f"    <dc:identifier>ISBN {_e(ref.isbn)}</dc:identifier>")
+    if ref.issn:
+        lines.append(f"    <dc:identifier>ISSN {_e(ref.issn)}</dc:identifier>")
+    if ref.eissn:
+        lines.append(f"    <dc:identifier>ISSN {_e(ref.eissn)}</dc:identifier>")
     if ref.url:
         lines.append(f"    <dc:identifier>{_e(ref.url)}</dc:identifier>")
     if ref.language:
         lines.append(f"    <z:language>{_e(ref.language)}</z:language>")
+    if ref.license:
+        lines.append(f"    <dc:rights>{_e(ref.license)}</dc:rights>")
     for kw in (ref.keywords or []):
         lines.append(f"    <dc:subject>{_e(kw)}</dc:subject>")
 

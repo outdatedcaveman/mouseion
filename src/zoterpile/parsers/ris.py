@@ -77,15 +77,19 @@ def _ris_entry_to_reference(entry: dict) -> Reference:
     ref.abstract = entry.get("abstract", entry.get("N2", "")) or None
 
     # --- Journal / container ---
+    secondary = entry.get("secondary_title") or entry.get("T2") or None
     ref.journal = (
         entry.get("journal_name")
-        or entry.get("secondary_title")   # T2
         or entry.get("JO")
         or entry.get("JF")
+        or (secondary if ref.ref_type not in (RefType.CONFERENCE,) else None)
         or None
     )
     ref.journal_abbrev = entry.get("alternate_title1") or entry.get("J1") or None
     ref.container_title = ref.journal
+    # T2 for conference entries is the conference name
+    if secondary and ref.ref_type == RefType.CONFERENCE:
+        ref.event_name = secondary
 
     # --- Volume / issue / pages ---
     ref.volume = str(entry["volume"]) if entry.get("volume") else None
@@ -96,6 +100,10 @@ def _ris_entry_to_reference(entry: dict) -> Reference:
         ref.pages = f"{start}-{end}"
     elif start:
         ref.pages = start
+    # M1 is used for article number / report number (rispy maps M1 → "note")
+    m1 = entry.get("note") or entry.get("M1") or None
+    if m1 and not ref.pages:
+        ref.article_number = str(m1).strip() or None
 
     # --- Identifiers ---
     raw_doi = entry.get("doi") or entry.get("DO") or ""
@@ -125,6 +133,9 @@ def _ris_entry_to_reference(entry: dict) -> Reference:
 
     # --- Language ---
     ref.language = entry.get("language") or entry.get("LA") or None
+
+    # --- License --- (rispy maps M3 → "type_of_work")
+    ref.license = entry.get("type_of_work") or entry.get("M3") or None
 
     # --- Cite key ---
     ref.cite_key = entry.get("id") or None
