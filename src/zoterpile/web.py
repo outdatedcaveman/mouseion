@@ -3930,7 +3930,7 @@ async function loadRefs(resetLimit = true) {
       const el = document.getElementById('all-count');
       if (el) el.textContent = refs.length || '';
     }
-  } catch(e) { console.error(e); }
+  } catch(e) { console.error(e); refs = []; renderList(); renderStatus(); }
 }
 
 async function loadMoreRefs() {
