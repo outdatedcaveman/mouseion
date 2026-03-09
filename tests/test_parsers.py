@@ -74,6 +74,19 @@ class TestRISParser:
         refs = parse_ris_string(double)
         assert len(refs) == 2
 
+    def test_conference_t2_as_event_name(self):
+        refs = parse_ris_string(SAMPLE_RIS_CONFERENCE)
+        ref = refs[0]
+        assert ref.event_name == "IEEE Conference on Computer Vision and Pattern Recognition"
+
+    def test_conference_m1_as_article_number(self):
+        refs = parse_ris_string(SAMPLE_RIS_CONFERENCE)
+        assert refs[0].article_number == "7780459"
+
+    def test_conference_m3_as_license(self):
+        refs = parse_ris_string(SAMPLE_RIS_CONFERENCE)
+        assert refs[0].license == "CC BY 4.0"
+
 
 # ---------------------------------------------------------------------------
 # BibTeX parser
@@ -99,6 +112,32 @@ SAMPLE_BIB_INPROCEEDINGS = r"""
   year      = {2016},
   pages     = {770--778},
 }
+"""
+
+SAMPLE_BIB_CONFERENCE_FULL = r"""
+@inproceedings{he2016resnet,
+  title      = {Deep Residual Learning},
+  author     = {He, Kaiming},
+  editor     = {Smith, Alice},
+  booktitle  = {IEEE CVPR 2016},
+  year       = {2016},
+  eid        = {7780459},
+  issn       = {1063-6919},
+  eissn      = {2575-7075},
+  license    = {CC BY 4.0},
+}
+"""
+
+SAMPLE_RIS_CONFERENCE = """\
+TY  - CONF
+TI  - Deep Residual Learning
+AU  - He, Kaiming
+T2  - IEEE Conference on Computer Vision and Pattern Recognition
+PY  - 2016
+DO  - 10.1109/CVPR.2016.90
+M1  - 7780459
+M3  - CC BY 4.0
+ER  -
 """
 
 
@@ -129,6 +168,29 @@ class TestBibTeXParser:
         ref = refs[0]
         assert ref.ref_type == RefType.CONFERENCE
         assert "770" in (ref.pages or "")
+
+    def test_inproceedings_booktitle_as_event_name(self):
+        refs = parse_bibtex_string(SAMPLE_BIB_INPROCEEDINGS)
+        ref = refs[0]
+        assert ref.event_name == "Proceedings of CVPR"
+
+    def test_conference_full_editors(self):
+        refs = parse_bibtex_string(SAMPLE_BIB_CONFERENCE_FULL)
+        assert len(refs[0].editors) == 1
+        assert refs[0].editors[0].family == "Smith"
+
+    def test_conference_full_eid_as_article_number(self):
+        refs = parse_bibtex_string(SAMPLE_BIB_CONFERENCE_FULL)
+        assert refs[0].article_number == "7780459"
+
+    def test_conference_full_eissn(self):
+        refs = parse_bibtex_string(SAMPLE_BIB_CONFERENCE_FULL)
+        assert refs[0].eissn == "2575-7075"
+        assert refs[0].issn == "1063-6919"
+
+    def test_conference_full_license(self):
+        refs = parse_bibtex_string(SAMPLE_BIB_CONFERENCE_FULL)
+        assert refs[0].license == "CC BY 4.0"
 
     def test_multiple_entries(self):
         double = SAMPLE_BIB + SAMPLE_BIB_INPROCEEDINGS

@@ -110,16 +110,18 @@ def _bibtex_entry_to_reference(entry: dict) -> Reference:
     # --- Journal / container ---
     ref.journal = _clean(entry.get("journal", "") or entry.get("journaltitle", "")) or None
     ref.journal_abbrev = _clean(entry.get("shortjournal", "")) or None
-    ref.container_title = (
-        _clean(entry.get("booktitle", ""))
-        or ref.journal
-        or None
-    )
+    booktitle = _clean(entry.get("booktitle", "")) or None
+    ref.container_title = booktitle or ref.journal or None
+    # For conference entries, booktitle is the conference proceedings → event_name
+    if booktitle and etype in ("inproceedings", "conference"):
+        ref.event_name = booktitle
 
     # --- Volume / issue / pages ---
     ref.volume = _clean(entry.get("volume", "")) or None
     ref.issue  = _clean(entry.get("number", "") or entry.get("issue", "")) or None
     ref.pages  = _clean(entry.get("pages", "")) or None
+    # Article number: 'eid' is used by many publishers for electronic ID / article number
+    ref.article_number = _clean(entry.get("eid", "") or entry.get("articlenumber", "")) or None
 
     # --- Identifiers ---
     raw_doi = _clean(entry.get("doi", ""))
@@ -146,8 +148,12 @@ def _bibtex_entry_to_reference(entry: dict) -> Reference:
             ref.pmid = pmid_m.group(1)
 
     # --- ISBN / ISSN ---
-    ref.isbn = _clean(entry.get("isbn", "")) or None
-    ref.issn = _clean(entry.get("issn", "")) or None
+    ref.isbn  = _clean(entry.get("isbn", "")) or None
+    ref.issn  = _clean(entry.get("issn", "")) or None
+    ref.eissn = _clean(entry.get("eissn", "")) or None
+
+    # --- License ---
+    ref.license = _clean(entry.get("license", "")) or None
 
     # --- Publisher / series / edition / place ---
     ref.publisher = _clean(entry.get("publisher", "")) or None
