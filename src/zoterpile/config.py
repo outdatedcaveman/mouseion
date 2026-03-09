@@ -223,6 +223,7 @@ def _apply_toml(cfg: Config, raw: dict) -> None:
 
 _ENV_MAP: Dict[str, str] = {
     "ZOTERPILE_DB_PATH":                    "db_path",
+    "ZOTERPILE_PDF_STORAGE_PATH":           "pdf_storage_path",
     "ZOTERPILE_CROSSREF_EMAIL":             "crossref_email",
     "ZOTERPILE_S2_API_KEY":                 "semantic_scholar_api_key",
     "ZOTERPILE_NCBI_API_KEY":               "ncbi_api_key",
