@@ -1755,7 +1755,14 @@ self.addEventListener('fetch', e => {
 
 @app.route("/")
 def index():
-    return _HTML
+    key = _get_or_create_api_key()
+    # Inject the key so the frontend auto-configures on first load,
+    # avoiding the manual copy-paste step.
+    bootstrap = (
+        f'<script>if(!localStorage.getItem("zp_key"))'
+        f'localStorage.setItem("zp_key","{key}");</script>'
+    )
+    return _HTML.replace("</head>", bootstrap + "</head>", 1)
 
 
 # ---------------------------------------------------------------------------
