@@ -1718,7 +1718,7 @@ def pwa_icon():
 def service_worker():
     """Minimal service worker for PWA installability."""
     js = r"""
-const CACHE = 'zoterpile-v2';
+const CACHE = 'zoterpile-v3';
 
 self.addEventListener('install', e => {
   // Do not pre-cache the root page: it contains a dynamically injected API
@@ -1728,18 +1728,25 @@ self.addEventListener('install', e => {
 });
 
 self.addEventListener('activate', e => {
+  // Chain everything so the reload message fires only after the new SW
+  // has fully taken over: old caches deleted → clients claimed → reload.
   e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-    )
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+      .then(() => self.clients.matchAll({ includeUncontrolled: true }))
+      .then(clients => clients.forEach(c => c.postMessage({ type: 'SW_RELOAD' })))
   );
-  self.clients.claim();
 });
 
 // Network-first for everything — the root page must always be fresh so the
 // injected API key/zp_url bootstrap script is never served from a stale cache.
 self.addEventListener('fetch', e => {
-  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+  // Only handle http(s) requests; ignore chrome-extension:// etc.
+  if (!e.request.url.startsWith('http')) return;
+  e.respondWith(
+    fetch(e.request).catch(() => caches.match(e.request).then(r => r || Response.error()))
+  );
 });
 """
     return Response(js, mimetype="application/javascript")
@@ -2973,6 +2980,11 @@ async function apiFetch(path, opts) {
 (async () => {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
+    // When a new service worker activates it sends SW_RELOAD so the page
+    // reloads with fresh HTML — picking up the latest injected API key.
+    navigator.serviceWorker.addEventListener('message', e => {
+      if (e.data?.type === 'SW_RELOAD') window.location.reload();
+    });
   }
   loadCollections();
   loadRefs();
