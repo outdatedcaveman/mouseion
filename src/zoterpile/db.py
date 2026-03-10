@@ -25,12 +25,20 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from .models import Author, RefType, Reference
+
+# Per-process flag so the full schema/migration script runs exactly once.
+# Running executescript() (which includes PRAGMA journal_mode=WAL) on every
+# request caused the 4th+ connection in a process to hang indefinitely after
+# prior WAL writes accumulated.
+_db_initialized: bool = False
+_db_init_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -442,26 +450,31 @@ class RefDatabase:
         self.close()
 
     def open(self) -> None:
+        global _db_initialized
         self._conn = sqlite3.connect(str(self._path), timeout=30)
         self._conn.row_factory = sqlite3.Row
-        # Set busy_timeout first so any lock waits during schema init surface
-        # as errors (OperationalError) instead of blocking indefinitely.
         self._conn.execute("PRAGMA busy_timeout = 10000")  # 10 s max lock wait
-        self._conn.executescript(self._SCHEMA)
-        # Incremental column/table migrations (idempotent — errors = already applied).
-        for stmt in self._MIGRATIONS:
-            try:
-                self._conn.execute(stmt)
-            except sqlite3.OperationalError:
-                pass
-        # Performance tuning for large databases.
-        # These settings are safe: WAL mode makes NORMAL synchronous crash-safe.
+        if not _db_initialized:
+            with _db_init_lock:
+                if not _db_initialized:
+                    # Run full schema + migrations once per process.  Calling
+                    # executescript() (which issues PRAGMA journal_mode=WAL) on
+                    # every request caused the Nth connection to hang after
+                    # prior WAL writes had accumulated.
+                    self._conn.executescript(self._SCHEMA)
+                    for stmt in self._MIGRATIONS:
+                        try:
+                            self._conn.execute(stmt)
+                        except sqlite3.OperationalError:
+                            pass
+                    self._conn.commit()
+                    _db_initialized = True
+        # Per-connection performance settings (safe to re-apply each time).
         self._conn.execute("PRAGMA cache_size     = -65536")   # 64 MB page cache
         self._conn.execute("PRAGMA mmap_size      = 268435456")  # 256 MB mmap I/O
         self._conn.execute("PRAGMA synchronous    = NORMAL")   # safe with WAL
         self._conn.execute("PRAGMA temp_store     = MEMORY")   # temp tables in RAM
         self._conn.execute("PRAGMA wal_autocheckpoint = 1000")  # checkpoint every 1 000 pages
-        self._conn.commit()
 
     def close(self) -> None:
         if self._conn:
