@@ -5783,7 +5783,13 @@ def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
         class _GunicornApp(BaseApplication):
             def load_config(self) -> None:
                 self.cfg.set("bind",      f"{host}:{port}")
-                self.cfg.set("workers",   2)
+                # Single worker: zoterpile is a personal single-user app and
+                # SQLite WAL shared-memory (refs.db-shm) has a known init-race
+                # when two freshly-forked workers open the same database
+                # simultaneously — causing one worker to block indefinitely on
+                # /api/refs while the others complete fine.  One worker
+                # serialises all requests and eliminates the race entirely.
+                self.cfg.set("workers",   1)
                 self.cfg.set("timeout",   120)
                 self.cfg.set("loglevel",  "info")
                 self.cfg.set("accesslog", "-")  # log every request to stdout

@@ -442,8 +442,11 @@ class RefDatabase:
         self.close()
 
     def open(self) -> None:
-        self._conn = sqlite3.connect(str(self._path))
+        self._conn = sqlite3.connect(str(self._path), timeout=30)
         self._conn.row_factory = sqlite3.Row
+        # Set busy_timeout first so any lock waits during schema init surface
+        # as errors (OperationalError) instead of blocking indefinitely.
+        self._conn.execute("PRAGMA busy_timeout = 10000")  # 10 s max lock wait
         self._conn.executescript(self._SCHEMA)
         # Incremental column/table migrations (idempotent — errors = already applied).
         for stmt in self._MIGRATIONS:
