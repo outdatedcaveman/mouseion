@@ -1716,13 +1716,14 @@ def pwa_icon():
 
 @app.route("/sw.js")
 def service_worker():
-    """Minimal service worker for PWA installability and offline shell caching."""
+    """Minimal service worker for PWA installability."""
     js = r"""
-const CACHE = 'zoterpile-v1';
-const SHELL = ['/'];
+const CACHE = 'zoterpile-v2';
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
+  // Do not pre-cache the root page: it contains a dynamically injected API
+  // key that changes on server restart, so serving stale HTML would cause
+  // auth failures and "Failed to fetch" errors in Codespace environments.
   self.skipWaiting();
 });
 
@@ -1735,15 +1736,10 @@ self.addEventListener('activate', e => {
   self.clients.claim();
 });
 
-// Network-first for API; cache-first for shell.
+// Network-first for everything — the root page must always be fresh so the
+// injected API key/zp_url bootstrap script is never served from a stale cache.
 self.addEventListener('fetch', e => {
-  if (e.request.url.includes('/api/')) {
-    e.respondWith(fetch(e.request));
-  } else {
-    e.respondWith(
-      caches.match(e.request).then(cached => cached || fetch(e.request))
-    );
-  }
+  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
 });
 """
     return Response(js, mimetype="application/javascript")
@@ -3066,7 +3062,12 @@ async function openSettings(msg) {
 }
 function closeSettings() { $cfgModal.classList.remove('open'); }
 function saveSettings() {
-  localStorage.setItem('zp_url', $cfgUrl.value.trim());
+  const url = $cfgUrl.value.trim();
+  if (url) {
+    localStorage.setItem('zp_url', url);
+  } else {
+    localStorage.removeItem('zp_url');
+  }
   localStorage.setItem('zp_key', $cfgKey.value.trim());
   closeSettings();
   loadRefs();
