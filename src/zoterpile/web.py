@@ -2937,13 +2937,21 @@ function apiHeaders(extra) {
 async function apiFetch(path, opts) {
   const url = apiBase() + path;
   let res;
+  const controller = new AbortController();
+  const _tid = setTimeout(() => controller.abort(), 15000); // 15 s hard timeout
   try {
     res = await fetch(url, Object.assign({}, opts, {
       headers: apiHeaders((opts || {}).headers),
+      signal: controller.signal,
     }));
+    clearTimeout(_tid);
   } catch(err) {
-    // Network error
-    if (typeof showToast !== 'undefined') showToast('⚠ Network error: ' + err.message, { duration: 4000 });
+    clearTimeout(_tid);
+    // Network error or timeout
+    const msg = err.name === 'AbortError'
+      ? 'Request timed out — is the server running?'
+      : ('Network error: ' + err.message);
+    if (typeof showToast !== 'undefined') showToast('⚠ ' + msg, { duration: 6000 });
     throw err;
   }
   if (res.status === 401) {
@@ -5762,10 +5770,11 @@ def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
 
         class _GunicornApp(BaseApplication):
             def load_config(self) -> None:
-                self.cfg.set("bind",     f"{host}:{port}")
-                self.cfg.set("workers",  2)
-                self.cfg.set("timeout",  120)
-                self.cfg.set("loglevel", "info")
+                self.cfg.set("bind",      f"{host}:{port}")
+                self.cfg.set("workers",   2)
+                self.cfg.set("timeout",   120)
+                self.cfg.set("loglevel",  "info")
+                self.cfg.set("accesslog", "-")  # log every request to stdout
 
             def load(self):
                 return app
