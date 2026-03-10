@@ -1716,34 +1716,37 @@ def pwa_icon():
 
 @app.route("/sw.js")
 def service_worker():
-    """Minimal service worker for PWA installability and offline shell caching."""
+    """Minimal service worker for PWA installability."""
     js = r"""
-const CACHE = 'zoterpile-v1';
-const SHELL = ['/'];
+const CACHE = 'zoterpile-v3';
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)));
+  // Do not pre-cache the root page: it contains a dynamically injected API
+  // key that changes on server restart, so serving stale HTML would cause
+  // auth failures and "Failed to fetch" errors in Codespace environments.
   self.skipWaiting();
 });
 
 self.addEventListener('activate', e => {
+  // Chain everything so the reload message fires only after the new SW
+  // has fully taken over: old caches deleted → clients claimed → reload.
   e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-    )
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+      .then(() => self.clients.matchAll({ includeUncontrolled: true }))
+      .then(clients => clients.forEach(c => c.postMessage({ type: 'SW_RELOAD' })))
   );
-  self.clients.claim();
 });
 
-// Network-first for API; cache-first for shell.
+// Network-first for everything — the root page must always be fresh so the
+// injected API key/zp_url bootstrap script is never served from a stale cache.
 self.addEventListener('fetch', e => {
-  if (e.request.url.includes('/api/')) {
-    e.respondWith(fetch(e.request));
-  } else {
-    e.respondWith(
-      caches.match(e.request).then(cached => cached || fetch(e.request))
-    );
-  }
+  // Only handle http(s) requests; ignore chrome-extension:// etc.
+  if (!e.request.url.startsWith('http')) return;
+  e.respondWith(
+    fetch(e.request).catch(() => caches.match(e.request).then(r => r || Response.error()))
+  );
 });
 """
     return Response(js, mimetype="application/javascript")
@@ -1759,8 +1762,10 @@ def index():
     # Inject the key so the frontend auto-configures on first load,
     # avoiding the manual copy-paste step.
     bootstrap = (
-        f'<script>if(!localStorage.getItem("zp_key"))'
-        f'localStorage.setItem("zp_key","{key}");</script>'
+        f'<script>'
+        f'localStorage.setItem("zp_key","{key}");'
+        f'localStorage.removeItem("zp_url");'  # always use same-origin when served directly
+        f'</script>'
     )
     return _HTML.replace("</head>", bootstrap + "</head>", 1)
 
@@ -2939,13 +2944,21 @@ function apiHeaders(extra) {
 async function apiFetch(path, opts) {
   const url = apiBase() + path;
   let res;
+  const controller = new AbortController();
+  const _tid = setTimeout(() => controller.abort(), 15000); // 15 s hard timeout
   try {
     res = await fetch(url, Object.assign({}, opts, {
       headers: apiHeaders((opts || {}).headers),
+      signal: controller.signal,
     }));
+    clearTimeout(_tid);
   } catch(err) {
-    // Network error
-    if (typeof showToast !== 'undefined') showToast('⚠ Network error: ' + err.message, { duration: 4000 });
+    clearTimeout(_tid);
+    // Network error or timeout
+    const msg = err.name === 'AbortError'
+      ? 'Request timed out — is the server running?'
+      : ('Network error: ' + err.message);
+    if (typeof showToast !== 'undefined') showToast('⚠ ' + msg, { duration: 6000 });
     throw err;
   }
   if (res.status === 401) {
@@ -2967,6 +2980,11 @@ async function apiFetch(path, opts) {
 (async () => {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
+    // When a new service worker activates it sends SW_RELOAD so the page
+    // reloads with fresh HTML — picking up the latest injected API key.
+    navigator.serviceWorker.addEventListener('message', e => {
+      if (e.data?.type === 'SW_RELOAD') window.location.reload();
+    });
   }
   loadCollections();
   loadRefs();
@@ -3064,7 +3082,12 @@ async function openSettings(msg) {
 }
 function closeSettings() { $cfgModal.classList.remove('open'); }
 function saveSettings() {
-  localStorage.setItem('zp_url', $cfgUrl.value.trim());
+  const url = $cfgUrl.value.trim();
+  if (url) {
+    localStorage.setItem('zp_url', url);
+  } else {
+    localStorage.removeItem('zp_url');
+  }
   localStorage.setItem('zp_key', $cfgKey.value.trim());
   closeSettings();
   loadRefs();
@@ -5759,10 +5782,11 @@ def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
 
         class _GunicornApp(BaseApplication):
             def load_config(self) -> None:
-                self.cfg.set("bind",     f"{host}:{port}")
-                self.cfg.set("workers",  2)
-                self.cfg.set("timeout",  120)
-                self.cfg.set("loglevel", "info")
+                self.cfg.set("bind",      f"{host}:{port}")
+                self.cfg.set("workers",   2)
+                self.cfg.set("timeout",   120)
+                self.cfg.set("loglevel",  "info")
+                self.cfg.set("accesslog", "-")  # log every request to stdout
 
             def load(self):
                 return app
