@@ -5775,7 +5775,16 @@ async function commitEdit(refId, field) {
 
 def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
     """Start the web UI. Called by `zoterpile web` and `zoterpile-web` script."""
-    api_key = _get_or_create_api_key()
+    # Generate the API key WITHOUT opening SQLite in the master/arbiter process.
+    # Opening a WAL-mode database before gunicorn fork() causes the worker to
+    # inherit the parent's WAL shared-memory mmap — the WAL shm state from the
+    # parent's connection confuses the child's first sqlite3.connect(), which
+    # deadlocks indefinitely on /api/refs while lighter endpoints (tags,
+    # collections) happen to slip through before the lock propagates.
+    global _api_key_cache
+    if not _api_key_cache:
+        _api_key_cache = uuid.uuid4().hex + uuid.uuid4().hex
+    api_key = _api_key_cache
     scheme = "http"
 
     _use_gunicorn = False
