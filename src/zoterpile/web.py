@@ -1737,7 +1737,7 @@ def pwa_icon():
 def service_worker():
     """Minimal service worker for PWA installability."""
     js = r"""
-const CACHE = 'zoterpile-v3';
+const CACHE = 'zoterpile-v4';
 
 self.addEventListener('install', e => {
   // Do not pre-cache the root page: it contains a dynamically injected API
@@ -1763,6 +1763,10 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   // Only handle http(s) requests; ignore chrome-extension:// etc.
   if (!e.request.url.startsWith('http')) return;
+  // Don't intercept API requests — let the browser handle them directly.
+  // In reverse-proxy environments (e.g. Codespaces) the extra SW→proxy hop
+  // can cause /api/refs to hang while smaller endpoints complete normally.
+  if (new URL(e.request.url).pathname.startsWith('/api/')) return;
   e.respondWith(
     fetch(e.request).catch(() => caches.match(e.request).then(r => r || Response.error()))
   );
