@@ -66,6 +66,7 @@ def _get_or_create_api_key() -> str:
 @app.before_request
 def _require_api_key() -> Optional[Response]:
     """Enforce API key authentication for all /api/* routes."""
+    print(f"[before_request] {request.method} {request.path}", file=sys.stderr, flush=True)
     if not request.path.startswith("/api/"):
         return None  # public routes: /, /manifest.json, /sw.js, /webhooks/*
     key = _get_or_create_api_key()
@@ -5810,16 +5811,18 @@ def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
         class _GunicornApp(BaseApplication):
             def load_config(self) -> None:
                 self.cfg.set("bind",      f"{host}:{port}")
-                # Single worker: zoterpile is a personal single-user app and
-                # SQLite WAL shared-memory (refs.db-shm) has a known init-race
-                # when two freshly-forked workers open the same database
-                # simultaneously — causing one worker to block indefinitely on
-                # /api/refs while the others complete fine.  One worker
-                # serialises all requests and eliminates the race entirely.
                 self.cfg.set("workers",   1)
                 self.cfg.set("timeout",   120)
+                self.cfg.set("keepalive", 0)   # disable keep-alive; each request gets a fresh connection
                 self.cfg.set("loglevel",  "info")
                 self.cfg.set("accesslog", "-")  # log every request to stdout
+
+                def _post_fork(server, worker):
+                    import faulthandler
+                    faulthandler.enable(file=sys.stderr)
+                    print(f"[post_fork] worker pid={worker.pid} started", file=sys.stderr, flush=True)
+
+                self.cfg.set("post_fork", _post_fork)
 
             def load(self):
                 return app
