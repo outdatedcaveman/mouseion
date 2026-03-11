@@ -34,11 +34,12 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from .models import Author, RefType, Reference
 
-# Per-process flag so the full schema/migration script runs exactly once.
+# Per-process set of DB paths whose schema has already been initialised.
 # Running executescript() (which includes PRAGMA journal_mode=WAL) on every
 # request caused the 4th+ connection in a process to hang indefinitely after
-# prior WAL writes accumulated.
-_db_initialized: bool = False
+# prior WAL writes accumulated.  Tracking per-path (rather than a single bool)
+# lets tests use independent temporary databases without skipping schema init.
+_db_initialized: set[str] = set()
 _db_init_lock = threading.Lock()
 
 
@@ -457,13 +458,14 @@ class RefDatabase:
         self._conn.row_factory = sqlite3.Row
         print("[db.open] connected; setting busy_timeout", file=sys.stderr, flush=True)
         self._conn.execute("PRAGMA busy_timeout = 10000")  # 10 s max lock wait
-        if not _db_initialized:
+        db_key = str(self._path)
+        if db_key not in _db_initialized:
             print("[db.open] running schema init", file=sys.stderr, flush=True)
             with _db_init_lock:
-                if not _db_initialized:
-                    # Run full schema + migrations once per process.  Calling
-                    # executescript() (which issues PRAGMA journal_mode=WAL) on
-                    # every request caused the Nth connection to hang after
+                if db_key not in _db_initialized:
+                    # Run full schema + migrations once per process per path.
+                    # Calling executescript() (which issues PRAGMA journal_mode=WAL)
+                    # on every request caused the Nth connection to hang after
                     # prior WAL writes had accumulated.
                     print("[db.open] executescript start", file=sys.stderr, flush=True)
                     self._conn.executescript(self._SCHEMA)
@@ -474,7 +476,7 @@ class RefDatabase:
                         except sqlite3.OperationalError:
                             pass
                     self._conn.commit()
-                    _db_initialized = True
+                    _db_initialized.add(db_key)
                     print("[db.open] schema init complete", file=sys.stderr, flush=True)
         # Per-connection performance settings (safe to re-apply each time).
         self._conn.execute("PRAGMA cache_size     = -65536")   # 64 MB page cache
