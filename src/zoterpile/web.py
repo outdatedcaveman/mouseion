@@ -214,6 +214,8 @@ def _ref_to_dict(
 
 @app.route("/api/refs")
 def list_refs():
+    import sys
+    print("[list_refs] start", flush=True, file=sys.stderr)
     from .db import RefDatabase
     q             = request.args.get("q", "").strip()
     ref_type      = request.args.get("type") or None
@@ -222,8 +224,11 @@ def list_refs():
     offset        = max(int(request.args.get("offset", 0)), 0)
     collection_id = request.args.get("collection_id")
     paginated     = request.args.get("paginated", "").lower() == "true"
+    print(f"[list_refs] q={q!r} limit={limit} paginated={paginated}", flush=True, file=sys.stderr)
     try:
+        print("[list_refs] opening db", flush=True, file=sys.stderr)
         with RefDatabase() as db:
+            print("[list_refs] db open", flush=True, file=sys.stderr)
             if collection_id:
                 coll_refs = db.list_collection_refs(int(collection_id), limit=limit + offset)
                 if q:
@@ -236,16 +241,20 @@ def list_refs():
                 total = len(coll_refs)
                 raw = [(r, 0.5) for r in coll_refs[offset:offset + limit]]
             else:
+                print("[list_refs] calling db.search", flush=True, file=sys.stderr)
                 raw = db.search(q or "", ref_type=ref_type, oa_only=oa_only,
                                 limit=limit, offset=offset)
+                print(f"[list_refs] db.search done, {len(raw)} results", flush=True, file=sys.stderr)
                 # For paginated mode get total count
                 total = None
                 if paginated:
                     total = len(db.search(q or "", ref_type=ref_type, oa_only=oa_only,
                                           limit=10_000, offset=0))
             ref_ids    = [_ref_id(ref) for ref, _ in raw]
+            print(f"[list_refs] fetching tags/extras for {len(ref_ids)} refs", flush=True, file=sys.stderr)
             tags_map   = db.get_tags_batch(ref_ids)
             extras_map = db.get_extras_bulk(ref_ids)
+            print("[list_refs] building result", flush=True, file=sys.stderr)
             result = [
                 _ref_to_dict(
                     ref,
@@ -261,10 +270,12 @@ def list_refs():
                 )
                 for ref, _ in raw
             ]
+        print(f"[list_refs] returning {len(result)} refs", flush=True, file=sys.stderr)
         if paginated:
             return jsonify({"refs": result, "total": total, "offset": offset, "limit": limit})
         return jsonify(result)
     except Exception as e:
+        print(f"[list_refs] ERROR: {e}", flush=True, file=sys.stderr)
         return jsonify({"error": str(e)}), 500
 
 
