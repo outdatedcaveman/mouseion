@@ -68,6 +68,12 @@ def _get_or_create_api_key() -> str:
 
 
 @app.before_request
+def _debug_log_request():
+    import sys
+    print(f"[req] {request.method} {request.path}", flush=True, file=sys.stderr)
+
+
+@app.before_request
 def _require_api_key() -> Optional[Response]:
     """Enforce API key authentication for all /api/* routes."""
     if not request.path.startswith("/api/"):
