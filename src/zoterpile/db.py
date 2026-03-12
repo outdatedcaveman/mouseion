@@ -479,8 +479,10 @@ class RefDatabase:
                     _db_initialized.add(db_key)
                     print("[db.open] schema init complete", file=sys.stderr, flush=True)
         # Per-connection performance settings (safe to re-apply each time).
-        self._conn.execute("PRAGMA cache_size     = -65536")   # 64 MB page cache
-        self._conn.execute("PRAGMA mmap_size      = 268435456")  # 256 MB mmap I/O
+        import os
+        _low_mem = bool(os.environ.get("RENDER") or os.environ.get("LOW_MEMORY"))
+        self._conn.execute(f"PRAGMA cache_size     = {-8192 if _low_mem else -65536}")   # 8 MB or 64 MB
+        self._conn.execute(f"PRAGMA mmap_size      = {0 if _low_mem else 268435456}")    # disabled or 256 MB
         self._conn.execute("PRAGMA synchronous    = NORMAL")   # safe with WAL
         self._conn.execute("PRAGMA temp_store     = MEMORY")   # temp tables in RAM
         self._conn.execute("PRAGMA wal_autocheckpoint = 1000")  # checkpoint every 1 000 pages
