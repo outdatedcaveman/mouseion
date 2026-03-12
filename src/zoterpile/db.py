@@ -448,7 +448,9 @@ class RefDatabase:
         self.open()
         return self
 
-    def __exit__(self, *_) -> None:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._conn and exc_type is None:
+            self._conn.commit()
         self.close()
 
     def open(self) -> None:
