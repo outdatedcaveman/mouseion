@@ -476,16 +476,21 @@ class RefDatabase:
                         except sqlite3.OperationalError:
                             pass
                     self._conn.commit()
+                    # Force a full WAL checkpoint so subsequent connections don't
+                    # inherit accumulated WAL pages that cause the 4th+ connection
+                    # to hang indefinitely when mmap or other PRAGMAs touch the WAL.
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                     _db_initialized.add(db_key)
                     print("[db.open] schema init complete", file=sys.stderr, flush=True)
         # Per-connection performance settings (safe to re-apply each time).
         import os
         _low_mem = bool(os.environ.get("RENDER") or os.environ.get("LOW_MEMORY"))
-        self._conn.execute(f"PRAGMA cache_size     = {-8192 if _low_mem else -65536}")   # 8 MB or 64 MB
-        self._conn.execute(f"PRAGMA mmap_size      = {0 if _low_mem else 268435456}")    # disabled or 256 MB
-        self._conn.execute("PRAGMA synchronous    = NORMAL")   # safe with WAL
-        self._conn.execute("PRAGMA temp_store     = MEMORY")   # temp tables in RAM
-        self._conn.execute("PRAGMA wal_autocheckpoint = 1000")  # checkpoint every 1 000 pages
+        self._conn.execute(f"PRAGMA cache_size = {-8192 if _low_mem else -65536}")
+        # mmap_size is intentionally omitted: setting it after WAL writes accumulate
+        # causes the 4th+ connection to hang indefinitely (WAL shm deadlock).
+        self._conn.execute("PRAGMA synchronous    = NORMAL")
+        self._conn.execute("PRAGMA temp_store     = MEMORY")
+        self._conn.execute("PRAGMA wal_autocheckpoint = 1000")
         print("[db.open] done", file=sys.stderr, flush=True)
 
     def close(self) -> None:
