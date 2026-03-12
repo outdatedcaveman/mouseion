@@ -16,7 +16,6 @@ import hmac
 import re
 import sys
 import threading
-import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -66,7 +65,6 @@ def _get_or_create_api_key() -> str:
 @app.before_request
 def _require_api_key() -> Optional[Response]:
     """Enforce API key authentication for all /api/* routes."""
-    print(f"[before_request] {request.method} {request.path}", file=sys.stderr, flush=True)
     if not request.path.startswith("/api/"):
         return None  # public routes: /, /manifest.json, /sw.js, /webhooks/*
     key = _get_or_create_api_key()
@@ -212,10 +210,6 @@ def _ref_to_dict(
 @app.route("/api/refs")
 def list_refs():
     from .db import RefDatabase
-    _t0 = time.monotonic()
-    def _log(msg: str) -> None:
-        print(f"[list_refs +{time.monotonic()-_t0:.3f}s] {msg}", file=sys.stderr, flush=True)
-    _log("entry")
     q             = request.args.get("q", "").strip()
     ref_type      = request.args.get("type") or None
     oa_only       = request.args.get("oa", "").lower() == "true"
@@ -224,13 +218,9 @@ def list_refs():
     collection_id = request.args.get("collection_id")
     paginated     = request.args.get("paginated", "").lower() == "true"
     try:
-        _log("opening RefDatabase")
         with RefDatabase() as db:
-            _log("db opened")
             if collection_id:
-                _log("list_collection_refs start")
                 coll_refs = db.list_collection_refs(int(collection_id), limit=limit + offset)
-                _log(f"list_collection_refs done ({len(coll_refs)} rows)")
                 if q:
                     q_low = q.lower()
                     coll_refs = [
@@ -241,22 +231,16 @@ def list_refs():
                 total = len(coll_refs)
                 raw = [(r, 0.5) for r in coll_refs[offset:offset + limit]]
             else:
-                _log(f"search start (q={q!r})")
                 raw = db.search(q or "", ref_type=ref_type, oa_only=oa_only,
                                 limit=limit, offset=offset)
-                _log(f"search done ({len(raw)} rows)")
                 # For paginated mode get total count
                 total = None
                 if paginated:
                     total = len(db.search(q or "", ref_type=ref_type, oa_only=oa_only,
                                           limit=10_000, offset=0))
             ref_ids    = [_ref_id(ref) for ref, _ in raw]
-            _log(f"get_tags_batch start ({len(ref_ids)} ids)")
             tags_map   = db.get_tags_batch(ref_ids)
-            _log("get_tags_batch done")
-            _log("get_extras_bulk start")
             extras_map = db.get_extras_bulk(ref_ids)
-            _log("get_extras_bulk done")
             result = [
                 _ref_to_dict(
                     ref,
@@ -272,12 +256,10 @@ def list_refs():
                 )
                 for ref, _ in raw
             ]
-        _log(f"db closed, returning {len(result)} refs")
         if paginated:
             return jsonify({"refs": result, "total": total, "offset": offset, "limit": limit})
         return jsonify(result)
     except Exception as e:
-        _log(f"exception: {e!r}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -5824,7 +5806,6 @@ def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
                 def _post_fork(server, worker):
                     import faulthandler
                     faulthandler.enable(file=sys.stderr)
-                    print(f"[post_fork] worker pid={worker.pid} started", file=sys.stderr, flush=True)
 
                 self.cfg.set("post_fork", _post_fork)
 
