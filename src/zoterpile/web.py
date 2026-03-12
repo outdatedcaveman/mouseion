@@ -40,9 +40,14 @@ _api_key_lock  = threading.Lock()
 
 def _get_or_create_api_key() -> str:
     """Return the API key, generating and persisting one if absent."""
+    import os
     global _api_key_cache
     with _api_key_lock:
         if _api_key_cache:
+            return _api_key_cache
+        env_key = os.environ.get("ZOTERPILE_API_KEY", "").strip()
+        if env_key:
+            _api_key_cache = env_key
             return _api_key_cache
         try:
             from .db import RefDatabase
@@ -5762,6 +5767,8 @@ async function commitEdit(refId, field) {
 
 def run(host: str = "0.0.0.0", port: int = 7274, debug: bool = False) -> None:
     """Start the web UI. Called by `zoterpile web` and `zoterpile-web` script."""
+    import os
+    port = int(os.environ.get("PORT", port))
     # Generate the API key WITHOUT opening SQLite in the master/arbiter process.
     # Opening a WAL-mode database before gunicorn fork() causes the worker to
     # inherit the parent's WAL shared-memory mmap — the WAL shm state from the
