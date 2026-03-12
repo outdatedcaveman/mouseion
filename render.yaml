@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -e .
-    startCommand: zoterpile-web
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 120 "zoterpile.web:app"
     envVars:
       - key: ZOTERPILE_API_KEY
         generateValue: true
