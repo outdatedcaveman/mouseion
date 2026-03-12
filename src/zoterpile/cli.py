@@ -1388,15 +1388,13 @@ def gui():
 # ---------------------------------------------------------------------------
 
 @main.command("web")
-@click.option("--host", default=None,  show_default=False, help="Bind host (default: 127.0.0.1, or 0.0.0.0 with --public)")
+@click.option("--host", default=None,  show_default=False, help="Bind host (default: 0.0.0.0)")
 @click.option("--port", default=7274,  show_default=True,  help="Bind port")
 @click.option("--public", is_flag=True, default=False,
               help="Bind to 0.0.0.0 to allow remote access (overrides --host default)")
 def web(host: Optional[str], port: int, public: bool):
     """Launch the browser-based web UI.
 
-    Use --public to bind to all interfaces (needed for remote access from
-    other devices, Docker containers, or the browser extension).
     The API key is printed at startup — save it in the ⚙ Settings modal.
     """
     try:
@@ -1407,7 +1405,7 @@ def web(host: Optional[str], port: int, public: bool):
             f"Install it with:  pip install flask\n({e})"
         )
         raise SystemExit(1)
-    effective_host = host or ("0.0.0.0" if public else "127.0.0.1")
+    effective_host = host or "0.0.0.0"
     web_run(host=effective_host, port=port)
 
 

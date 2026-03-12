@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: zoterpile
+    runtime: python
+    buildCommand: pip install -e .
+    startCommand: zoterpile-web
+    envVars:
+      - key: ZOTERPILE_API_KEY
+        generateValue: true
+      - key: ZOTERPILE_DB_PATH
+        value: /data/refs.db
+    disk:
+      name: zoterpile-data
+      mountPath: /data
+      sizeGB: 1
