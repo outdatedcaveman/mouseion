@@ -8,3 +8,5 @@ services:
     envVars:
       - key: ZOTERPILE_API_KEY
         generateValue: true
+      - key: RENDER
+        value: "true"
