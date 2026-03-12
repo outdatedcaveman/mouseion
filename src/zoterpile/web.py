@@ -5760,7 +5760,7 @@ async function commitEdit(refId, field) {
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run(host: str = "127.0.0.1", port: int = 7274, debug: bool = False) -> None:
+def run(host: str = "0.0.0.0", port: int = 7274, debug: bool = False) -> None:
     """Start the web UI. Called by `zoterpile web` and `zoterpile-web` script."""
     # Generate the API key WITHOUT opening SQLite in the master/arbiter process.
     # Opening a WAL-mode database before gunicorn fork() causes the worker to
