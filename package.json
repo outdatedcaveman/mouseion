@@ -27,11 +27,11 @@
     "monacopilot": "^1.1.15",
     "npm": "^11.4.2",
     "prop-types": "^15.8.0",
-    "react": "^18.3.1",
+    "react": "^19.2.4",
     "react-autosuggest": "^10.1.0",
-    "react-dom": "^18.3.1",
-    "react-intl": "^3.4.0",
-    "react-select": "^3.0.8",
+    "react-dom": "^19.2.4",
+    "react-intl": "^10.0.0",
+    "react-select": "^5.10.2",
     "url": "^0.11.0"
   },
   "devDependencies": {
