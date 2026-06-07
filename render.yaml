@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: mouseion
+    runtime: python
+    plan: free
+    buildCommand: pip install -e .
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --timeout 120 "mouseion.web:app"
+    envVars:
+      - key: MOUSEION_API_KEY
+        generateValue: true
+      - key: RENDER
+        value: "true"

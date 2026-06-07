@@ -1,0 +1,813 @@
+"""
+Background enrichment daemon.
+
+Processes references in strict priority tiers:
+
+  Tier 1 — Has DOI/PMID/arXiv/ISBN: Direct identifier lookup (fast, reliable)
+  Tier 2 — Has URL from academic publisher: Extract identifiers from URL, then lookup
+  Tier 3 — Has title + other metadata (year/authors): Title search on multiple APIs
+  Tier 4 — Has title only: Broader title search with cleaning
+  Tier 5 — Junk/minimal info: Deep search with substring variations (last resort)
+
+The daemon exhausts each tier before moving to the next. Within each tier,
+refs are processed in order of completeness gap (most incomplete first).
+This ensures we never waste API calls on hopeless cases while easy DOI
+lookups are waiting.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import threading
+import time
+from typing import List, Optional
+
+from .models import Reference
+
+logger = logging.getLogger("mouseion.enrich_daemon")
+
+# Daemon state
+_daemon_thread: Optional[threading.Thread] = None
+_daemon_running = threading.Event()
+_daemon_stop    = threading.Event()
+_daemon_lock    = threading.Lock()
+
+_BATCH_SIZE = 50        # keep asyncio.gather bounded; batch APIs handle ≥50 fine
+_CYCLE_PAUSE = 1.0      # between batches within a tier
+_TIER_PAUSE  = 2.0      # between tiers
+_IDLE_PAUSE  = 30.0     # when all tiers are empty
+_AUTO_QUEUE_THRESHOLD = 0.85
+
+
+def is_running() -> bool:
+    return _daemon_running.is_set() and not _daemon_stop.is_set()
+
+
+def start():
+    global _daemon_thread
+    with _daemon_lock:
+        if _daemon_thread and _daemon_thread.is_alive():
+            _daemon_running.set()
+            return
+        _daemon_stop.clear()
+        _daemon_running.set()
+        _daemon_thread = threading.Thread(target=_daemon_loop, daemon=True, name="enrich-daemon")
+        _daemon_thread.start()
+        logger.info("Daemon started")
+
+
+def pause():
+    _daemon_running.clear()
+    logger.info("Daemon paused")
+
+
+def resume():
+    _daemon_running.set()
+    logger.info("Daemon resumed")
+
+
+def stop():
+    _daemon_stop.set()
+    _daemon_running.set()
+    logger.info("Daemon stopping")
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def _daemon_loop():
+    try:
+        _daemon_loop_inner()
+    except Exception:
+        logger.exception("Daemon loop crashed")
+
+
+def _daemon_loop_inner():
+    from .db import RefDatabase
+
+    logger.info("Enrichment daemon loop started")
+
+    db = RefDatabase()
+    try:
+        db.open()
+    except Exception as e:
+        logger.error("Daemon: failed to open DB: %s", e)
+        return
+
+    logger.info("Daemon: DB opened successfully")
+
+    def _reconnect():
+        nonlocal db
+        try:
+            db.close()
+        except Exception:
+            pass
+        db = RefDatabase()
+        db.open()
+        logger.info("Daemon: reconnected to DB")
+
+    # Reset stale active items from previous crash
+    try:
+        reset = db.reset_stale_active()
+        if reset:
+            logger.info("Reset %d stale active items", reset)
+    except Exception:
+        logger.exception("Reset stale active failed")
+
+    while not _daemon_stop.is_set():
+        _daemon_running.wait()
+        if _daemon_stop.is_set():
+            break
+
+        try:
+            total = _process_all_tiers(db)
+            if total == 0:
+                _auto_queue(db)
+                time.sleep(_IDLE_PAUSE)
+        except Exception:
+            logger.exception("Daemon cycle error — reconnecting")
+            try:
+                _reconnect()
+            except Exception:
+                logger.exception("Reconnect failed")
+            time.sleep(5.0)
+
+    try:
+        db.close()
+    except Exception:
+        pass
+    logger.info("Enrichment daemon stopped")
+
+
+def _auto_queue(db):
+    try:
+        added = db.enqueue_incomplete(threshold=_AUTO_QUEUE_THRESHOLD)
+        if added:
+            logger.info("Auto-queued %d incomplete refs", added)
+    except Exception:
+        logger.exception("Auto-queue error")
+
+
+# ---------------------------------------------------------------------------
+# Tier-based processing
+# ---------------------------------------------------------------------------
+
+def _process_all_tiers(db) -> int:
+    """Process all tiers in order. Returns total refs processed.
+
+    After completing all tiers, re-check Tier 1 — title search in later
+    tiers often discovers DOIs that get re-queued as Tier 1 pending.
+    """
+    total = 0
+    for tier_num, (query, handler) in enumerate(TIERS, 1):
+        if _daemon_stop.is_set() or not _daemon_running.is_set():
+            break
+        count = _process_tier(db, tier_num, query, handler)
+        total += count
+        if count > 0:
+            time.sleep(_TIER_PAUSE)
+
+    # Re-check Tier 1: later tiers re-queue refs that gained identifiers
+    if total > 0 and not _daemon_stop.is_set() and _daemon_running.is_set():
+        tier1_query, tier1_handler = TIERS[0]
+        extra = _process_tier(db, 1, tier1_query, tier1_handler)
+        if extra:
+            logger.info("Tier 1 re-pass: processed %d re-queued refs", extra)
+            total += extra
+
+    return total
+
+
+# Each tier is (SQL WHERE clause, handler function)
+# The WHERE clause selects pending refs matching the tier criteria.
+# Refs are processed in order of completeness (most incomplete first).
+
+TIERS = []  # populated after handler definitions below
+
+
+def _process_tier(db, tier_num: int, extra_where: str, handler) -> int:
+    """Process one full pass of a tier. Returns count processed."""
+    processed = 0
+
+    while not _daemon_stop.is_set() and _daemon_running.is_set():
+        # Fetch next batch for this tier
+        try:
+            batch = _dequeue_tier(db, extra_where, _BATCH_SIZE)
+        except Exception:
+            logger.exception("Tier %d: dequeue error", tier_num)
+            break
+
+        if not batch:
+            break
+
+        logger.info("Tier %d: processing %d refs", tier_num, len(batch))
+
+        # Load all refs for this batch
+        refs_by_id = {}
+        rows_by_id = {}
+        for row in batch:
+            ref = db.get(row["ref_id"])
+            if ref:
+                refs_by_id[row["ref_id"]] = ref
+                rows_by_id[row["ref_id"]] = row
+
+        if not refs_by_id:
+            time.sleep(_CYCLE_PAUSE)
+            continue
+
+        try:
+            # handler returns dict[ref_id -> enriched_ref] for batch handlers
+            # or processes one-at-a-time for legacy handlers
+            result = handler(list(refs_by_id.values()), list(rows_by_id.values()))
+
+            if isinstance(result, dict):
+                # Batch handler: result is {ref_id: enriched_ref}
+                for ref_id, enriched in result.items():
+                    row = rows_by_id.get(ref_id)
+                    original = refs_by_id.get(ref_id)
+                    if row and original and enriched:
+                        try:
+                            _save_result(db, original, enriched, row)
+                            processed += 1
+                        except Exception as e:
+                            logger.warning("Tier %d: save failed %s: %s", tier_num, ref_id[:8], e)
+                            try:
+                                db.complete_enrich(ref_id, new_completeness=original.completeness, error=str(e))
+                                db._conn.commit()
+                            except Exception:
+                                pass
+                # Mark unresolved refs as completed with no change
+                for ref_id in refs_by_id:
+                    if ref_id not in result:
+                        row = rows_by_id[ref_id]
+                        ref = refs_by_id[ref_id]
+                        try:
+                            db.complete_enrich(ref_id, new_completeness=ref.completeness, error="no match")
+                            db._conn.commit()
+                        except Exception:
+                            pass
+            else:
+                # Legacy single-ref handler (shouldn't happen with new code)
+                logger.warning("Tier %d: handler returned non-dict", tier_num)
+        except Exception as e:
+            logger.exception("Tier %d: batch handler error", tier_num)
+            # Requeue on error
+            _requeue_batch(db, batch)
+
+        time.sleep(_CYCLE_PAUSE)
+
+    return processed
+
+
+def _dequeue_tier(db, extra_where: str, limit: int):
+    """Fetch pending refs matching tier criteria."""
+    with db._db() as conn:
+        sql = f"""
+            SELECT eq.ref_id, eq.priority, eq.difficulty, eq.strategy_level,
+                   eq.attempts, r.doi, r.pmid, r.arxiv_id, r.isbn, r.url,
+                   r.title, r.completeness, r.year
+            FROM enrich_queue eq
+            JOIN refs r ON r.id = eq.ref_id
+            WHERE eq.status = 'pending' AND ({extra_where})
+            ORDER BY r.completeness ASC
+            LIMIT ?
+        """
+        rows = conn.execute(sql, (limit,)).fetchall()
+        ids = [r["ref_id"] for r in rows]
+        if ids:
+            ph = ",".join("?" * len(ids))
+            conn.execute(
+                f"UPDATE enrich_queue SET status = 'active', last_attempt = datetime('now') WHERE ref_id IN ({ph})",
+                ids,
+            )
+        return [dict(r) for r in rows]
+
+
+def _requeue_batch(db, rows):
+    """Put refs back to pending."""
+    for r in rows:
+        try:
+            db._conn.execute(
+                "UPDATE enrich_queue SET status = 'pending' WHERE ref_id = ?",
+                (r["ref_id"],),
+            )
+        except Exception:
+            pass
+    try:
+        db._conn.commit()
+    except Exception:
+        pass
+
+
+def _save_result(db, original, enriched, queue_item):
+    """Save enrichment result and update queue.
+
+    If a title-only ref gained a DOI/PMID/arXiv from this pass, re-queue it
+    for Tier 1 (batch ID lookup) to fetch full metadata (abstract, authors, etc).
+    """
+    from .tagger import auto_tag, tag_from_keywords
+    from .config import get_config
+    cfg = get_config()
+
+    tags = list(set(auto_tag(enriched, cfg) + tag_from_keywords(enriched)))
+    db.upsert(enriched, tags=tags)
+
+    # Did this ref gain a new identifier it didn't have before?
+    gained_id = (
+        (enriched.doi and not original.doi)
+        or (enriched.pmid and not original.pmid)
+        or (enriched.arxiv_id and not original.arxiv_id)
+    )
+    # Is it still below 80% and could benefit from a Tier 1 pass?
+    # Cap re-queues: after 3 re-queues the ref clearly isn't improving via
+    # Tier 1 batch lookup — accept the current state rather than looping forever.
+    already_requeued = (queue_item.get("last_error") or "").startswith("requeued:")
+    attempt_count = queue_item.get("attempts", 0)
+    needs_deeper = (
+        gained_id
+        and (enriched.completeness or 0) < 0.80
+        and not (already_requeued and attempt_count >= 3)
+    )
+
+    if needs_deeper:
+        # Re-queue for another pass — the new DOI will put it in Tier 1
+        # which hits batch APIs for full metadata (abstract, full authors, etc)
+        try:
+            with db._db() as conn:
+                conn.execute(
+                    """UPDATE enrich_queue SET
+                         status = 'pending', strategy_level = 0,
+                         difficulty = 0, priority = 1.0,
+                         last_error = 'requeued: gained identifier'
+                       WHERE ref_id = ?""",
+                    (queue_item["ref_id"],),
+                )
+            logger.info(
+                "Re-queued %s for Tier 1 (gained %s): %.0f%% [%s]",
+                queue_item["ref_id"][:8],
+                "DOI" if enriched.doi and not original.doi else
+                "PMID" if enriched.pmid and not original.pmid else "arXiv",
+                (enriched.completeness or 0) * 100,
+                enriched.title[:40] if enriched.title else "?"
+            )
+        except Exception:
+            logger.exception("Re-queue failed for %s", queue_item["ref_id"][:8])
+            db.complete_enrich(queue_item["ref_id"], new_completeness=enriched.completeness, error=None)
+    else:
+        db.complete_enrich(
+            queue_item["ref_id"],
+            new_completeness=enriched.completeness,
+            error=None,
+        )
+
+    try:
+        db._conn.commit()
+    except Exception:
+        pass
+
+    old_c = queue_item.get("completeness", 0) or 0
+    new_c = enriched.completeness or 0
+    if new_c > old_c + 0.01:
+        logger.info(
+            "Enriched %s: %.0f%% -> %.0f%% [%s]",
+            queue_item["ref_id"][:8], old_c * 100, new_c * 100,
+            enriched.title[:40] if enriched.title else "?"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tier handlers
+# ---------------------------------------------------------------------------
+
+# Persistent event loop for the daemon thread — keeps provider rate-limiting
+# state (semaphores, _last_request_time) alive across calls.
+_loop: Optional[asyncio.AbstractEventLoop] = None
+_providers_cache: Optional[dict] = None
+
+
+def _get_loop() -> asyncio.AbstractEventLoop:
+    global _loop
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+    return _loop
+
+
+def _get_providers_map() -> dict:
+    global _providers_cache
+    if _providers_cache is None:
+        from .providers import _make_providers
+        _providers_cache = {p.name: p for p in _make_providers()}
+    return _providers_cache
+
+
+def _enrich_with_providers(ref, provider_names):
+    """Look up ref using specific providers. Returns enriched ref."""
+    from .lookup import enrich_one
+    by_name = _get_providers_map()
+    providers = [by_name[n] for n in provider_names if n in by_name]
+    if not providers:
+        return ref
+
+    loop = _get_loop()
+    return loop.run_until_complete(enrich_one(ref, providers))
+
+
+def _enrich_many_concurrent(refs: List[Reference], provider_names, concurrency: int = 5) -> List[Reference]:
+    """Enrich multiple refs concurrently using asyncio.gather with a semaphore.
+
+    Default concurrency=5: each ref hits ~3 providers in parallel, so this
+    means ~15 simultaneous API requests — within provider rate limits.
+    A small stagger delay spreads requests to avoid bursts.
+    """
+    from .lookup import enrich_one
+    by_name = _get_providers_map()
+    providers = [by_name[n] for n in provider_names if n in by_name]
+    if not providers:
+        return list(refs)
+
+    async def _run():
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _one(ref):
+            async with sem:
+                result = await enrich_one(ref, providers)
+                # Small delay after each ref to spread out new requests
+                await asyncio.sleep(0.5)
+                return result
+
+        return await asyncio.gather(
+            *[_one(r) for r in refs],
+            return_exceptions=True,
+        )
+
+    loop = _get_loop()
+    results = loop.run_until_complete(_run())
+    # Replace exceptions with original refs
+    return [r if isinstance(r, Reference) else refs[i] for i, r in enumerate(results)]
+
+
+def _clean_title(ref):
+    """Clean the ref's title in place. Returns True if title is usable."""
+    from .providers.base import clean_query_title
+    if ref.title:
+        ref.title = clean_query_title(ref.title)
+    return bool(ref.title and len(ref.title) >= 5)
+
+
+def _clean_title_all(refs):
+    """Clean titles on a list of refs in place."""
+    for ref in refs:
+        _clean_title(ref)
+
+
+def _clean_doi(ref):
+    """Clean DOI in place — strip whitespace, fragments, control chars."""
+    if not ref.doi:
+        return
+    doi = ref.doi.strip()
+    # Remove control characters (\r, \n, \t)
+    doi = re.sub(r'[\r\n\t]', '', doi)
+    # Remove URL fragments (#supplementary-data, etc.)
+    doi = doi.split('#')[0]
+    # Remove trailing punctuation that's not part of a DOI
+    doi = doi.rstrip('.,;:) ')
+    # Remove query strings (?type=printable, etc.)
+    doi = doi.split('?')[0]
+    ref.doi = doi if doi else None
+
+
+# --- Tier 1: Has identifier (DOI, PMID, arXiv, ISBN) — BATCH MODE ---
+
+def _handle_tier1_batch(refs: List[Reference], rows: List[dict]) -> dict:
+    """Batch identifier lookup using S2, OpenAlex, and CrossRef batch APIs."""
+    from .batch_lookup import enrich_batch_by_id
+    from .config import get_config
+
+    cfg = get_config()
+
+    # Attach ref_id and clean all refs
+    for ref, row in zip(refs, rows):
+        ref._batch_id = row["ref_id"]
+        _clean_doi(ref)
+        _clean_title(ref)
+
+    loop = _get_loop()
+    enriched_map = loop.run_until_complete(
+        enrich_batch_by_id(
+            refs,
+            s2_api_key=cfg.semantic_scholar_api_key,
+            oa_email=cfg.openalex_email,
+            oa_api_key=cfg.openalex_api_key,
+            cr_email=cfg.crossref_email or cfg.openalex_email,
+        )
+    )
+
+    # ISBN refs are now handled by batch_openlibrary inside enrich_batch_by_id.
+    # Fall back to Google Books only for unresolved ISBN refs (no batch API).
+    for ref in refs:
+        if ref._batch_id not in enriched_map or enriched_map[ref._batch_id] is ref:
+            if ref.isbn:
+                try:
+                    enriched_map[ref._batch_id] = _enrich_with_providers(ref, ["google_books"])
+                except Exception:
+                    pass
+
+    return enriched_map
+
+
+# --- Tier 2: Has URL — extract IDs then batch ---
+
+def _handle_tier2_batch(refs: List[Reference], rows: List[dict]) -> dict:
+    """Extract identifiers from URLs, then batch lookup."""
+    from .batch_lookup import enrich_batch_by_id
+    from .config import get_config
+
+    cfg = get_config()
+
+    # Attach ref_id and extract IDs from URLs
+    for ref, row in zip(refs, rows):
+        ref._batch_id = row["ref_id"]
+        _extract_ids_from_url(ref)
+        _clean_title(ref)
+
+    # Refs that now have identifiers go through batch lookup
+    id_refs = [r for r in refs if r.doi or r.arxiv_id or r.pmid]
+    title_refs = [r for r in refs if r not in id_refs and r.title and len(r.title) >= 10]
+
+    results = {}
+
+    if id_refs:
+        loop = _get_loop()
+        batch_results = loop.run_until_complete(
+            enrich_batch_by_id(
+                id_refs,
+                s2_api_key=cfg.semantic_scholar_api_key,
+                oa_email=cfg.openalex_email,
+                oa_api_key=cfg.openalex_api_key,
+                cr_email=cfg.crossref_email or cfg.openalex_email,
+            )
+        )
+        results.update(batch_results)
+
+    # Title-only refs: concurrent lookup
+    unresolved_title = [r for r in title_refs if r._batch_id not in results]
+    if unresolved_title:
+        enriched_list = _enrich_many_concurrent(unresolved_title, ["crossref", "openalex", "semantic_scholar"])
+        for ref, enriched in zip(unresolved_title, enriched_list):
+            results[ref._batch_id] = enriched
+
+    return results
+
+
+# --- Tier 3: Has title + metadata — single lookup per ref ---
+
+def _handle_tier3_batch(refs: List[Reference], rows: List[dict]) -> dict:
+    """Title search enriched by author/year metadata — concurrent."""
+    # Attach batch IDs and filter to usable refs
+    usable = []
+    for ref, row in zip(refs, rows):
+        ref._batch_id = row["ref_id"]
+        _clean_title(ref)
+        if ref.title:
+            usable.append(ref)
+
+    if not usable:
+        return {}
+
+    enriched_list = _enrich_many_concurrent(usable, ["crossref", "openalex", "semantic_scholar"])
+    return {ref._batch_id: enriched for ref, enriched in zip(usable, enriched_list)}
+
+
+# --- Tier 4: Has title only ---
+
+def _handle_tier4_batch(refs: List[Reference], rows: List[dict]) -> dict:
+    """Broader title search with aggressive cleaning — concurrent."""
+    usable = []
+    for ref, row in zip(refs, rows):
+        ref._batch_id = row["ref_id"]
+        _clean_title(ref)
+        if ref.title:
+            usable.append(ref)
+
+    if not usable:
+        return {}
+
+    # First pass: concurrent lookup
+    enriched_list = _enrich_many_concurrent(usable, ["crossref", "openalex", "semantic_scholar"])
+
+    results = {}
+    retry_refs = []
+    for ref, enriched in zip(usable, enriched_list):
+        if enriched.completeness > (ref.completeness or 0) + 0.05:
+            results[ref._batch_id] = enriched
+        else:
+            # Try aggressive title cleaning for second pass
+            _aggressive_clean(ref)
+            if ref.title and len(ref.title) >= 10:
+                retry_refs.append(ref)
+            else:
+                results[ref._batch_id] = enriched
+
+    # Second pass: retry with cleaned titles concurrently
+    if retry_refs:
+        retry_results = _enrich_many_concurrent(retry_refs, ["crossref", "openalex"])
+        for ref, enriched in zip(retry_refs, retry_results):
+            results[ref._batch_id] = enriched
+
+    return results
+
+
+# --- Tier 5: Last resort ---
+
+def _handle_tier5_batch(refs: List[Reference], rows: List[dict]) -> dict:
+    """Last-ditch effort with URL resolution and substring variations — concurrent."""
+    # Attach batch IDs and try to extract identifiers from URLs
+    for ref, row in zip(refs, rows):
+        ref._batch_id = row["ref_id"]
+        if ref.url and not ref.doi:
+            _extract_ids_from_url(ref)
+
+    # Refs with newly-extracted IDs go through batch ID lookup
+    id_refs = [r for r in refs if r.doi or r.arxiv_id or r.pmid]
+    title_refs = []
+    for ref in refs:
+        if ref not in id_refs:
+            _clean_title(ref)
+            if ref.title and len(ref.title) >= 5:
+                title_refs.append(ref)
+
+    results = {}
+
+    # Batch lookup for refs where we extracted IDs from URLs
+    if id_refs:
+        from .batch_lookup import enrich_batch_by_id
+        from .config import get_config
+        cfg = get_config()
+        loop = _get_loop()
+        batch_results = loop.run_until_complete(
+            enrich_batch_by_id(
+                id_refs,
+                s2_api_key=cfg.semantic_scholar_api_key,
+                oa_email=cfg.openalex_email,
+                oa_api_key=cfg.openalex_api_key,
+                cr_email=cfg.crossref_email or cfg.openalex_email,
+            )
+        )
+        results.update(batch_results)
+
+    # Title refs: concurrent first pass
+    if title_refs:
+        enriched_list = _enrich_many_concurrent(title_refs, ["crossref", "openalex", "semantic_scholar"])
+
+        retry_refs = []
+        for ref, enriched in zip(title_refs, enriched_list):
+            if enriched.completeness > (ref.completeness or 0) + 0.05:
+                results[ref._batch_id] = enriched
+            else:
+                _aggressive_clean(ref)
+                if ref.title and len(ref.title) >= 10:
+                    retry_refs.append(ref)
+                else:
+                    results[ref._batch_id] = enriched
+
+        # Second pass with cleaned titles
+        if retry_refs:
+            retry_results = _enrich_many_concurrent(retry_refs, ["crossref", "openalex"])
+            for ref, enriched in zip(retry_refs, retry_results):
+                results[ref._batch_id] = enriched
+
+    # Phase 3: Web search for anything still unresolved
+    unresolved = [r for r in refs if r._batch_id not in results or results[r._batch_id] is r]
+    if unresolved:
+        _clean_title_all(unresolved)
+        searchable = [r for r in unresolved if r.title and len(r.title) >= 8]
+        if searchable:
+            try:
+                from .web_search import web_search_refs
+                from .merge import merge as _merge
+                loop = _get_loop()
+                web_results = loop.run_until_complete(web_search_refs(searchable))
+                for ref in searchable:
+                    candidates = web_results.get(ref._batch_id, [])
+                    if candidates:
+                        try:
+                            results[ref._batch_id] = _merge(ref, candidates)
+                        except Exception:
+                            results[ref._batch_id] = candidates[0][0]
+            except Exception:
+                logger.exception("Tier 5 web search failed")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tier definitions (query + handler)
+# ---------------------------------------------------------------------------
+
+# Tier 1: Has any standard identifier — BATCH MODE
+TIERS.append((
+    "r.doi IS NOT NULL AND r.doi != '' "
+    "OR r.pmid IS NOT NULL AND r.pmid != '' "
+    "OR r.arxiv_id IS NOT NULL AND r.arxiv_id != '' "
+    "OR r.isbn IS NOT NULL AND r.isbn != ''",
+    _handle_tier1_batch,
+))
+
+# Tier 2: Has URL but no identifier — BATCH MODE (extract IDs then batch)
+TIERS.append((
+    "r.url IS NOT NULL AND r.url != '' "
+    "AND (r.doi IS NULL OR r.doi = '') "
+    "AND (r.pmid IS NULL OR r.pmid = '') "
+    "AND (r.arxiv_id IS NULL OR r.arxiv_id = '') "
+    "AND (r.isbn IS NULL OR r.isbn = '')",
+    _handle_tier2_batch,
+))
+
+# Tier 3: Has title + metadata (year or authors present) but no identifier/URL
+TIERS.append((
+    "r.title IS NOT NULL AND r.title != '' AND LENGTH(r.title) > 10 "
+    "AND (r.year IS NOT NULL OR r.authors IS NOT NULL AND r.authors != '[]') "
+    "AND (r.doi IS NULL OR r.doi = '') "
+    "AND (r.url IS NULL OR r.url = '') "
+    "AND (r.pmid IS NULL OR r.pmid = '') "
+    "AND (r.arxiv_id IS NULL OR r.arxiv_id = '') "
+    "AND (r.isbn IS NULL OR r.isbn = '')",
+    _handle_tier3_batch,
+))
+
+# Tier 4: Has title only (no other metadata)
+TIERS.append((
+    "r.title IS NOT NULL AND r.title != '' AND LENGTH(r.title) > 10 "
+    "AND (r.doi IS NULL OR r.doi = '') "
+    "AND (r.url IS NULL OR r.url = '') "
+    "AND (r.pmid IS NULL OR r.pmid = '') "
+    "AND (r.arxiv_id IS NULL OR r.arxiv_id = '') "
+    "AND (r.isbn IS NULL OR r.isbn = '') "
+    "AND (r.year IS NULL) "
+    "AND (r.authors IS NULL OR r.authors = '[]')",
+    _handle_tier4_batch,
+))
+
+# Tier 5: Everything else (garbage titles, no info, etc.)
+TIERS.append((
+    "1=1",  # catches anything still pending after tiers 1-4
+    _handle_tier5_batch,
+))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_ids_from_url(ref):
+    """Try to extract DOI, arXiv ID, PMID from a URL."""
+    if not ref.url:
+        return
+    url = ref.url
+
+    # DOI patterns
+    for pat in [
+        r'doi\.org/(10\.\d{4,}/[^\s"\'<>]+)',
+        r'/doi/(?:abs|full|pdf)?/?(10\.\d{4,}/[^\s"\'<>]+)',
+        r'doi[=:]\s*(10\.\d{4,}/[^\s"\'<>&]+)',
+    ]:
+        m = re.search(pat, url, re.I)
+        if m:
+            ref.doi = m.group(1).rstrip('.,;)')
+            return
+
+    # arXiv
+    m = re.search(r'arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})', url, re.I)
+    if m:
+        ref.arxiv_id = m.group(1)
+        return
+
+    # PubMed
+    m = re.search(r'pubmed\.ncbi\.nlm\.nih\.gov/(\d+)', url, re.I)
+    if m:
+        ref.pmid = m.group(1)
+        return
+
+
+def _aggressive_clean(ref):
+    """Aggressively clean title for last-resort searches."""
+    import unicodedata
+    if not ref.title:
+        return
+    s = ref.title.strip()
+    s = re.sub(r'^\([^)]*\)\s*', '', s)
+    s = re.sub(r'\s*\([^)]*\)$', '', s)
+    s = s.strip('"\'""''')
+    m = re.match(r'^(.{15,}?)\s*[|—–\-:]\s*(.{1,30})$', s)
+    if m:
+        s = m.group(1).strip()
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(c for c in s if not unicodedata.combining(c))
+    s = unicodedata.normalize('NFC', s)
+    s = re.sub(r'[^\w\s]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    if len(s) >= 10:
+        ref.title = s

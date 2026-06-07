@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "mouseion-web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "mouseion.web"],
+      "port": 7274
+    },
+    {
+      "name": "mouseion-tui",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "mouseion.tui"],
+      "port": 0
+    },
+    {
+      "name": "zotero-js-watch",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["./js-build/build.js"],
+      "port": 0
+    }
+  ]
+}

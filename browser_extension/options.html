@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mouseion — Settings</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 15px;
+    background: #0d0d12;
+    color: #e0e0ec;
+    padding: 40px 24px;
+    max-width: 540px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 24px; color: #5b8af5; margin-bottom: 8px; }
+  .subtitle { color: #888; font-size: 13px; margin-bottom: 32px; }
+  label { display: block; font-size: 12px; color: #aaa; margin-bottom: 6px; margin-top: 20px; }
+  input[type="text"], input[type="url"], input[type="password"] {
+    width: 100%;
+    background: #1a1a2e;
+    border: 1px solid #2a2a3a;
+    border-radius: 8px;
+    color: #e0e0ec;
+    padding: 10px 14px;
+    font-size: 14px;
+    outline: none;
+    font-family: monospace;
+  }
+  input:focus { border-color: #5b8af5; }
+  input::placeholder { color: #444; }
+  .hint { font-size: 12px; color: #666; margin-top: 6px; line-height: 1.5; }
+  .btn-row { display: flex; gap: 10px; margin-top: 28px; }
+  .btn {
+    background: #5b8af5;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 22px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn:hover { background: #4a78e0; }
+  .btn-ghost {
+    background: #1a1a2e;
+    color: #aaa;
+    border: 1px solid #2a2a3a;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .btn-ghost:hover { background: #2a2a3e; color: #e0e0ec; }
+  .status {
+    display: none;
+    font-size: 13px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    margin-top: 16px;
+  }
+  .status.show { display: block; }
+  .status.ok  { background: #0d2a1a; color: #4caf7d; border: 1px solid #1a4a2a; }
+  .status.err { background: #2a0d0d; color: #e57373; border: 1px solid #4a1a1a; }
+  .status.run { background: #1a1a2e; color: #888; border: 1px solid #2a2a3a; }
+  hr { border: none; border-top: 1px solid #2a2a3a; margin: 30px 0; }
+  .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #666; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<h1>📚 mouseion</h1>
+<p class="subtitle">Browser extension settings — connect to your mouseion server</p>
+
+<div class="section-title">Server Connection</div>
+
+<label for="inp-url">Server URL</label>
+<input type="url" id="inp-url" placeholder="http://localhost:7274">
+<p class="hint">
+  The URL where your mouseion server is running.<br>
+  Use <code>http://localhost:7274</code> for a local server, or your public URL if hosted remotely.
+</p>
+
+<label for="inp-key">API Key</label>
+<input type="password" id="inp-key" placeholder="64-character hex key (shown at server startup)">
+<p class="hint">
+  The API key is printed in the terminal when you start mouseion with <code>mouseion web</code>.<br>
+  You can also find it in the ⚙ Settings modal in the web UI.
+</p>
+
+<div class="btn-row">
+  <button class="btn" id="btn-save">Save</button>
+  <button class="btn-ghost" id="btn-test">Test connection</button>
+</div>
+<div class="status" id="status"></div>
+
+<hr>
+
+<div class="section-title">Usage Tips</div>
+<p class="hint" style="margin-top:8px;color:#888;">
+  • Click the extension icon to save a reference from the current page.<br>
+  • Right-click any link or selected text and choose <em>Save to mouseion</em>.<br>
+  • DOI, arXiv IDs, and citation metadata are detected automatically.<br>
+  • Use <code>mouseion web --public</code> to allow access from other devices.
+</p>
+
+<script src="options.js"></script>
+</body>
+</html>

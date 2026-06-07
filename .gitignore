@@ -1,0 +1,34 @@
+.DS_Store
+node_modules
+build/
+.signatures.json
+tmp
+app/win/codesign
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Databases and sensitive files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.log
+.env
+*.bak
+*credential*.json
+client_secret*.json
+
+# Git backups
+.git.bak/
+
+# build artifacts — ship via Releases, not the repo
+dist/
+*.exe
