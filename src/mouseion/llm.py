@@ -26,13 +26,26 @@ If a field is missing or cannot be confidently determined, omit it from the JSON
 DO NOT include any markdown formatting, only the raw JSON string.
 """
 
+# Circuit breaker: if the LLM endpoint is misconfigured (wrong model → 404,
+# bad key → 401, etc.) it must NOT be retried for every ref — that floods the
+# log and wastes huge amounts of daemon time. After a few consecutive failures
+# we disable LLM parsing for the rest of the process and skip the call entirely.
+_llm_consecutive_failures = 0
+_llm_disabled = False
+_LLM_FAILURE_LIMIT = 5
+
+
 async def parse_citation_to_ref(text: str) -> Optional[Reference]:
+    global _llm_consecutive_failures, _llm_disabled
+
+    if _llm_disabled:
+        return None
+
     cfg = get_config()
     api_key = cfg.llm_api_key
     provider = cfg.llm_provider
-    
+
     if not api_key:
-        logger.warning("LLM requested but no API key configured")
         return None
 
     try:
@@ -44,11 +57,22 @@ async def parse_citation_to_ref(text: str) -> Optional[Reference]:
             result = await _call_gemini(api_key, text)
         else:
             logger.error(f"Unsupported LLM provider: {provider}")
+            _llm_disabled = True
             return None
-            
+
+        _llm_consecutive_failures = 0  # success → reset the breaker
         return _json_to_ref(result)
     except Exception as e:
-        logger.error(f"LLM parsing failed: {e}")
+        _llm_consecutive_failures += 1
+        if _llm_consecutive_failures >= _LLM_FAILURE_LIMIT:
+            _llm_disabled = True
+            logger.error(
+                "LLM parsing disabled for this session after %d consecutive "
+                "failures (last: %s). Fix the provider/model/key and restart.",
+                _llm_consecutive_failures, e,
+            )
+        elif _llm_consecutive_failures == 1:
+            logger.error(f"LLM parsing failed: {e}")
         return None
 
 async def _call_openai(api_key: str, text: str) -> str:
@@ -79,7 +103,11 @@ async def _call_anthropic(api_key: str, text: str) -> str:
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-3-haiku-20240307",
+                # claude-3-haiku-20240307 (and the whole 3.5 line) is retired →
+                # 404. claude-haiku-4-5 is the current cheap/fast model (verified
+                # 200 against this account). The circuit breaker above will
+                # auto-disable if this ever 404s again after a future refresh.
+                "model": "claude-haiku-4-5",
                 "system": _SYSTEM_PROMPT,
                 "messages": [
                     {"role": "user", "content": text}
@@ -94,7 +122,7 @@ async def _call_anthropic(api_key: str, text: str) -> str:
 async def _call_gemini(api_key: str, text: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
             headers={"Content-Type": "application/json"},
             json={
                 "system_instruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
@@ -110,7 +138,18 @@ async def _call_gemini(api_key: str, text: str) -> str:
 
 def _json_to_ref(json_str: str) -> Optional[Reference]:
     try:
-        data = json.loads(json_str)
+        # Models often wrap JSON in ```json ... ``` fences despite instructions.
+        # Strip them (and any leading/trailing prose) before parsing.
+        s = (json_str or "").strip()
+        if s.startswith("```"):
+            s = s.split("```", 2)
+            s = s[1] if len(s) >= 2 else json_str
+            if s.lstrip().lower().startswith("json"):
+                s = s.lstrip()[4:]
+        first, last = s.find("{"), s.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            s = s[first:last + 1]
+        data = json.loads(s)
         ref = Reference()
         ref.title = data.get("title")
         ref.doi = data.get("doi")

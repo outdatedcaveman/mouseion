@@ -33,7 +33,9 @@ from .local_resolver import find_local_candidates
 logger = logging.getLogger("mouseion.lookup")
 
 # Per-provider timeout: don't let a slow/dead provider block everything.
-_PROVIDER_TIMEOUT = 90.0  # seconds per provider (increased to 90s to accommodate rate-limiting queue/sleep times under concurrency)
+_PROVIDER_TIMEOUT = 20.0  # seconds. A provider that hasn't answered in 20s is
+# effectively dead for this ref; waiting 90s (the old value) stalled the whole
+# batch behind one slow call and was a major throughput killer.
 
 # Retry settings for transient provider failures.
 # Keep low — the provider _get() already retries 429/5xx internally.
@@ -58,8 +60,13 @@ def _select_providers(
     """
     by_name = {p.name: p for p in providers}
 
+    # METADATA-ONLY hot path. Unpaywall / doi_org were removed: they do slow
+    # OA-PDF discovery (unpaywall → core.ac.uk, whose 429 backoff is up to 900s)
+    # which has no place in fast metadata enrichment — it was making each DOI
+    # ref's enrichment wait on rate-limited PDF sources and crushed throughput.
+    # OA-URL / PDF discovery is the PDF engine's job, not enrichment's.
     if ref.doi:
-        pick = ["crossref", "doi_org", "openalex", "semantic_scholar", "unpaywall"]
+        pick = ["crossref", "openalex", "semantic_scholar"]
     elif ref.pmid:
         pick = ["pubmed", "crossref", "semantic_scholar"]
     elif ref.arxiv_id:
@@ -67,13 +74,14 @@ def _select_providers(
     elif ref.isbn:
         pick = ["openlibrary", "google_books", "crossref"]
     else:
-        # Title-only: use the 3 fastest providers with broadest coverage
-        pick = ["crossref", "openalex", "semantic_scholar"]
-
-    # If the ref has a DOI but wasn't in the DOI branch (e.g. PMID with DOI),
-    # append unpaywall to get OA URLs.
-    if ref.doi and "unpaywall" not in pick:
-        pick.append("unpaywall")
+        # Title-only: journal databases PLUS the book providers. The deep
+        # tier-3 pile is largely books/essays ("In Search of Schrödinger's
+        # Cat", "Encyclopedia of Algorithms"…) that CrossRef/OpenAlex/S2 can
+        # never match — while OpenLibrary + Google Books sat unused in
+        # providers/ (Bruno 2026-07-12: "3 enriched in the last hour doesn't
+        # seem like a win"). Each provider self-regulates on 429.
+        pick = ["crossref", "openalex", "semantic_scholar",
+                "openlibrary", "google_books"]
 
     standard_names = {
         "crossref", "doi_org", "openalex", "semantic_scholar", "pubmed",
@@ -111,24 +119,33 @@ async def enrich_one(
 
     ref_id = ref.doi or ref.pmid or ref.arxiv_id or ref.isbn or ref.title or "unknown"
 
+    # Attempt-ledger identity. Prefer the stable DB row id; hash the entry's
+    # content so a CHANGED entry (gained a DOI/URL/title) is eligible to retry,
+    # but an UNCHANGED one is never re-sent to an API that already missed it.
+    from .api_router import get_router
+    _router = get_router()
+    _rid = getattr(ref, "_db_id", None) or getattr(ref, "_batch_id", None) or ref_id
+    _ehash = _router.entry_hash(ref)
+
     async def _lookup_with_retry(p: BaseProvider) -> list:
+        # Churn killer: don't try an API with an entry it already tried+missed.
+        if _router.was_tried(_rid, p.name, _ehash):
+            return []
+        result: list = []
         for attempt in range(_MAX_RETRIES + 1):
-            logger.debug("provider=%s ref=%s attempt=%d", p.name, ref_id, attempt + 1)
             try:
-                return await asyncio.wait_for(p.lookup(ref), timeout=_PROVIDER_TIMEOUT)
+                result = await asyncio.wait_for(p.lookup(ref), timeout=_PROVIDER_TIMEOUT)
+                break
             except asyncio.TimeoutError:
-                logger.warning(
-                    "provider=%s timed out (attempt %d/%d) ref=%s",
-                    p.name, attempt + 1, _MAX_RETRIES + 1, ref_id,
-                )
+                logger.warning("provider=%s timed out ref=%s", p.name, ref_id)
             except Exception as exc:
-                logger.warning(
-                    "provider=%s error (attempt %d/%d) ref=%s: %s",
-                    p.name, attempt + 1, _MAX_RETRIES + 1, ref_id, exc,
-                )
+                logger.warning("provider=%s error ref=%s: %s", p.name, ref_id, exc)
             if attempt < _MAX_RETRIES:
                 await asyncio.sleep(_RETRY_DELAYS[attempt])
-        return []
+        # Record the outcome so this (entry, api) pair is not retried until the
+        # entry changes. 'hit' results still allow a future re-confirm if changed.
+        _router.record_attempt(_rid, p.name, _ehash, "hit" if result else "miss")
+        return result
 
     # Fire selected providers concurrently
     tasks = [asyncio.create_task(_lookup_with_retry(p)) for p in selected]
