@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Optional
 import httpx
 
@@ -45,20 +46,37 @@ async def parse_citation_to_ref(text: str) -> Optional[Reference]:
     api_key = cfg.llm_api_key
     provider = cfg.llm_provider
 
-    if not api_key:
-        return None
+    # 'ollama' is LOCAL: no key exists or is needed (Bruno 2026-07-13 — Gemma 4
+    # E4B on the idle GPU is the fallback when cloud credits run out).
+    if not api_key and provider != "ollama":
+        if not await _local_ready():
+            return None
+        provider = "ollama"          # no cloud key at all → go local
 
     try:
-        if provider == "openai":
-            result = await _call_openai(api_key, text)
-        elif provider == "anthropic":
-            result = await _call_anthropic(api_key, text)
-        elif provider == "google":
-            result = await _call_gemini(api_key, text)
-        else:
-            logger.error(f"Unsupported LLM provider: {provider}")
-            _llm_disabled = True
-            return None
+        try:
+            if provider == "openai":
+                result = await _call_openai(api_key, text)
+            elif provider == "anthropic":
+                result = await _call_anthropic(api_key, text)
+            elif provider == "google":
+                result = await _call_gemini(api_key, text)
+            elif provider == "ollama":
+                result = await _call_ollama(text)
+            else:
+                logger.error(f"Unsupported LLM provider: {provider}")
+                _llm_disabled = True
+                return None
+        except Exception as cloud_err:
+            # CREDIT/QUOTA/AUTH death → local rescue instead of a dead parser.
+            # This is exactly what silently killed enrichment for a week when
+            # the Anthropic balance hit zero (404/400 storm, zero output).
+            if provider != "ollama" and _is_exhausted(cloud_err) and await _local_ready():
+                logger.warning("LLM provider %s exhausted (%s) - falling back to local %s",
+                               provider, str(cloud_err)[:60], OLLAMA_MODEL)
+                result = await _call_ollama(text)
+            else:
+                raise
 
         _llm_consecutive_failures = 0  # success → reset the breaker
         return _json_to_ref(result)
@@ -135,6 +153,56 @@ async def _call_gemini(api_key: str, text: str) -> str:
         )
         resp.raise_for_status()
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("MOUSEION_OLLAMA_MODEL", "gemma4:e4b")
+
+
+def _is_exhausted(err: Exception) -> bool:
+    """Cloud provider is OUT (no credit / quota / auth) — the whole provider is
+    unusable, so only a LOCAL model can keep the pipeline alive."""
+    s = str(err).lower()
+    return any(m in s for m in (
+        "credit balance is too low", "insufficient_quota", "insufficient credit",
+        "billing", "quota", "401", "403", "429", "invalid api key",
+        "authentication", "resource_exhausted", "rate limit",
+    ))
+
+
+async def _local_ready() -> bool:
+    """Ollama up AND the fallback model present."""
+    try:
+        async with httpx.AsyncClient(timeout=3) as c:
+            r = await c.get(f"{OLLAMA_URL}/api/tags")
+            if r.status_code != 200:
+                return False
+            names = [m.get("name", "") for m in (r.json().get("models") or [])]
+            return any(n == OLLAMA_MODEL or n.startswith(OLLAMA_MODEL.split(":")[0])
+                       for n in names)
+    except Exception:
+        return False
+
+
+async def _call_ollama(text: str) -> str:
+    """Local Gemma 4 — free, no quota. Uses Ollama's JSON mode so the citation
+    parser gets strict JSON back like it does from the cloud providers."""
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0.1, "num_predict": 1000},
+            },
+        )
+        resp.raise_for_status()
+        return ((resp.json().get("message") or {}).get("content")) or ""
+
 
 def _json_to_ref(json_str: str) -> Optional[Reference]:
     try:
