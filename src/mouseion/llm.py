@@ -155,7 +155,9 @@ async def _call_gemini(api_key: str, text: str) -> str:
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("MOUSEION_OLLAMA_MODEL", "gemma4:e4b")
+# granite4:3b (2.1GB) is the largest model that fits the GTX 1650's
+# ~2GB usable VRAM; gemma4 (4.3GB+) and phi4-mini/qwen3:4b all OOM.
+OLLAMA_MODEL = os.environ.get("MOUSEION_OLLAMA_MODEL", "granite4:3b")
 
 
 def _is_exhausted(err: Exception) -> bool:
@@ -197,7 +199,10 @@ async def _call_ollama(text: str) -> str:
                 ],
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.1, "num_predict": 1000},
+                # num_ctx 2048 keeps the model 100% on a 4GB GPU (32768 default
+                # spills to CPU and is ~135x slower - measured 2026-07-25).
+                "options": {"temperature": 0.1, "num_predict": 1000,
+                            "num_ctx": 2048},
             },
         )
         resp.raise_for_status()
