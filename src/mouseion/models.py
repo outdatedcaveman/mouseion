@@ -248,6 +248,16 @@ class Reference:
     # -----------------------------------------------------------------------
 
     @property
+    def is_complete(self) -> bool:
+        """Title + at least one author + an identifier or delivery (DOI, ISBN,
+        arXiv, PMID, URL, or a PDF -- PDF links live in the DB row and in
+        extras). Mirrors RefDatabase.COMPLETE_SQL, the authoritative count."""
+        ex = self.extras or {}
+        has_id = any([self.doi, self.isbn, self.arxiv_id, self.pmid, self.url, self.oa_url,
+                      ex.get("pdf_local"), ex.get("pdf_drive_id")])
+        return bool((self.title or "").strip() and self.authors and has_id)
+
+    @property
     def completeness(self) -> float:
         """
         Weighted completeness score 0.0–1.0.

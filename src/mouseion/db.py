@@ -2088,6 +2088,15 @@ class RefDatabase:
             return avg_row["avg_done"], avg_row["avg_pending"], avg_row["enriched_success"]
 
     # Tier classification SQL — single source of truth
+    # THE definition of a complete reference (Bruno 2026-09-24): a title, at least
+    # one author, and SOMETHING that identifies or delivers the work -- a DOI,
+    # ISBN, arXiv id, PMID, a URL, or an attached PDF. Every gauge (Mouseion,
+    # Egon's goal tracker and Connectors page) must use this, not the 0-1
+    # completeness score, which measures richness, not completeness.
+    COMPLETE_SQL = """(COALESCE(title,'')!='' AND COALESCE(authors,'') NOT IN ('','[]') AND (
+        COALESCE(doi,'')!='' OR COALESCE(isbn,'')!='' OR COALESCE(arxiv_id,'')!='' OR COALESCE(pmid,'')!=''
+        OR COALESCE(url,'')!='' OR COALESCE(oa_url,'')!='' OR COALESCE(pdf_local,'')!='' OR COALESCE(pdf_drive_id,'')!=''))"""
+
     TIER_CASE_SQL = """(CASE WHEN COALESCE(doi,'')!='' OR COALESCE(pmid,'')!='' OR COALESCE(arxiv_id,'')!='' OR COALESCE(isbn,'')!='' THEN 1 WHEN COALESCE(url,'')!='' OR COALESCE(oa_url,'')!='' THEN 2 WHEN COALESCE(title,'')!='' AND (COALESCE(year,'')!='' OR COALESCE(journal,'')!='' OR COALESCE(container_title,'')!='') THEN 3 WHEN COALESCE(title,'')!='' THEN 4 ELSE 5 END)"""
 
     def tier_breakdown(self) -> dict:
