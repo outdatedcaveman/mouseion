@@ -37,8 +37,8 @@ _daemon_stop    = threading.Event()
 _daemon_lock    = threading.Lock()
 
 _BATCH_SIZE = 250        # keep asyncio.gather bounded; batch APIs handle >=50 fine
-_CYCLE_PAUSE = 1.0      # between batches within a tier
-_TIER_PAUSE  = 2.0      # between tiers
+_CYCLE_PAUSE = 0.1      # between batches within a tier
+_TIER_PAUSE  = 0.2      # between tiers
 _IDLE_PAUSE  = 30.0     # when all tiers are empty
 _AUTO_QUEUE_THRESHOLD = 0.85
 
@@ -419,7 +419,9 @@ def _process_tier(db, tier_num: int, extra_where: str, handler, batch_size: int)
                     if tier_num in (1, 2):
                         tier_fully_cooled = (s2_cooled and oa_cooled and cr_cooled)
                     elif tier_num in (3, 4, 5):
-                        tier_fully_cooled = (s2_cooled and cr_cooled and oa_cooled)
+                        # Only halt if BOTH major providers are cooled. S2 alone
+                        # shouldn't block the tier since CR+OA can resolve most titles.
+                        tier_fully_cooled = (cr_cooled and oa_cooled)
 
                     if tier_fully_cooled:
                         logger.info("Tier %d: all providers are cooled down, breaking loop to pause", tier_num)
@@ -448,9 +450,11 @@ def _dequeue_tier(db, extra_where: str, limit: int):
             FROM enrich_queue eq
             JOIN refs r ON r.id = eq.ref_id
             WHERE eq.status = 'pending'
-              AND (eq.last_attempt IS NULL OR eq.last_attempt < datetime('now', '-5 minutes'))
+              AND (eq.last_attempt IS NULL OR eq.last_attempt < datetime('now', '-90 seconds'))
               AND ({extra_where})
-            ORDER BY eq.priority DESC
+            ORDER BY 
+              CASE WHEN r.completeness >= 0.6 AND r.completeness < 0.8 THEN 1 ELSE 2 END ASC,
+              eq.priority DESC
             LIMIT ?
         """
         rows = conn.execute(sql, (limit,)).fetchall()
@@ -660,10 +664,10 @@ def _enrich_many_concurrent(refs: List[Reference], provider_names, concurrency: 
     # (MOUSEION_NET_METADATA) also cap throughput, so they were raised in
     # lockstep with this value. Raising this number alone does nothing.
     if provider_set & {"semantic_scholar", "crossref", "openalex", "dblp"}:
-        concurrency = min(concurrency, 10)
+        concurrency = min(concurrency, 20)
     if provider_set == {"semantic_scholar"}:
         # S2 alone stays low: tiny daily quota (10k) + aggressive 429s.
-        concurrency = min(concurrency, 2)
+        concurrency = min(concurrency, 4)
 
     async def _run():
         sem = SafeSemaphore(concurrency)
@@ -672,7 +676,7 @@ def _enrich_many_concurrent(refs: List[Reference], provider_names, concurrency: 
             async with sem:
                 result = await enrich_one(ref, providers)
                 # Small stagger to spread requests and avoid bursts
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.05)
                 return result
 
         return await asyncio.gather(
@@ -1509,7 +1513,7 @@ TIERS.append((
     "AND (r.arxiv_id IS NULL OR r.arxiv_id = '') "
     "AND (r.isbn IS NULL OR r.isbn = '')",
     _handle_tier3_batch,
-    25,
+    50,
 ))
 
 # Tier 4: Has title only (no other metadata)
@@ -1523,7 +1527,7 @@ TIERS.append((
     "AND (r.year IS NULL) "
     "AND (r.authors IS NULL OR r.authors = '[]')",
     _handle_tier4_batch,
-    20,
+    60,
 ))
 
 # Tier 5: Everything else (garbage titles, no info, etc.)

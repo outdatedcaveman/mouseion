@@ -44,8 +44,10 @@ class CrossRefProvider(BaseProvider):
         # CrossRef may allow high burst rates, but long-running title searches
         # are much more reliable when kept below the published ceiling.
         if self._email:
-            self._max_concurrent = 5
-            self._min_interval = 0.20  # ~5 req/s
+            # Polite pool tolerates well above this; 10 concurrent @ ~10 req/s
+            # is comfortably under CrossRef's ~50 req/s ceiling.
+            self._max_concurrent = 10
+            self._min_interval = 0.10  # ~10 req/s
         else:
             self._max_concurrent = 3
             self._min_interval = 0.35

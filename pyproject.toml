@@ -32,6 +32,8 @@ dependencies = [
     "tomlkit>=0.12",
     # .env file support
     "python-dotenv>=1.0",
+    # Native process and network inspection without shelling out to taskkill/ipconfig
+    "psutil>=5.9",
     # Terminal UI
     "textual>=0.50",
     # Web UI

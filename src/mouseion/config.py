@@ -124,6 +124,7 @@ class Config:
     vpn_gateway: str = ""
     vpn_username: str = ""
     vpn_password: str = ""
+    vpn_protocol: str = "anyconnect"                 # openconnect protocol: e.g. "anyconnect" or "fortinet" or "gp"
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -229,6 +230,7 @@ def _apply_toml(cfg: Config, raw: dict) -> None:
         "vpn":          {
             "enabled": "vpn_enabled",
             "type": "vpn_type",
+            "protocol": "vpn_protocol",
             "gateway": "vpn_gateway",
             "username": "vpn_username",
             "password": "vpn_password",
@@ -277,6 +279,7 @@ _ENV_MAP: Dict[str, str] = {
     "MOUSEION_VPN_GATEWAY":                "vpn_gateway",
     "MOUSEION_VPN_USERNAME":               "vpn_username",
     "MOUSEION_VPN_PASSWORD":               "vpn_password",
+    "MOUSEION_VPN_PROTOCOL":               "vpn_protocol",
     "CROSSREF_EMAIL":                       "crossref_email",
     "SEMANTIC_SCHOLAR_API_KEY":             "semantic_scholar_api_key",
     "NCBI_API_KEY":                         "ncbi_api_key",
@@ -373,6 +376,7 @@ def _render_toml(cfg: Config) -> str:
         "[vpn]",
         f"enabled  = {str(cfg.vpn_enabled).lower()}",
         f'type     = "{cfg.vpn_type}"  # "openconnect" or "forticlient"',
+        f'protocol = "{cfg.vpn_protocol}"  # "anyconnect" or "fortinet" or "gp"',
         f'gateway  = "{cfg.vpn_gateway}"',
         f'username = "{cfg.vpn_username}"',
         f'password = "{cfg.vpn_password}"',

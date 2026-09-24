@@ -59,6 +59,14 @@ _stats_completeness_cache = {
 }
 _stats_cache_lock = threading.Lock()
 
+# Cache for slow tier breakdown queries to prevent DB locking/timeouts
+_tier_breakdown_cache = {
+    "last_update": 0.0,
+    "data": None
+}
+_tier_breakdown_lock = threading.Lock()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -68,11 +76,17 @@ _stats_cache_lock = threading.Lock()
 
 _FTS_IDENTIFIERS_EXPR = "IFNULL(new.doi,'') || ' ' || IFNULL(new.url,'') || ' ' || IFNULL(new.isbn,'') || ' ' || IFNULL(new.pmid,'') || ' ' || IFNULL(new.arxiv_id,'') || ' ' || IFNULL(new.publisher,'')"
 
+# FTS maintenance keyed on the integer rowid (the FTS5 docid = refs.rowid), NOT
+# the UNINDEXED ref_id string. `DELETE FROM refs_fts WHERE ref_id = ?` cannot use
+# an index (ref_id is UNINDEXED) and SCANS all ~250k FTS rows — ~2.8 s per refs
+# UPDATE, which made every enrichment save crawl and tripped the daemon watchdog.
+# Keying on rowid makes the delete O(1) (~1 ms). refs.rowid is stable for a row's
+# lifetime, so it's a safe join key between refs and its FTS shadow row.
 _FTS_TRIGGER_DDL = f"""
     CREATE TRIGGER IF NOT EXISTS refs_ai AFTER INSERT ON refs BEGIN
-        INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
+        INSERT INTO refs_fts (rowid, ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
         VALUES (
-            new.id, new.title, new.abstract,
+            new.rowid, new.id, new.title, new.abstract,
             (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
                                   IFNULL(json_extract(value, '$.given'), ''), ' ')
              FROM json_each(IFNULL(new.authors, '[]'))),
@@ -82,11 +96,14 @@ _FTS_TRIGGER_DDL = f"""
         );
     END;
 
-    CREATE TRIGGER IF NOT EXISTS refs_au AFTER UPDATE ON refs BEGIN
-        DELETE FROM refs_fts WHERE ref_id = old.id;
-        INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
+    CREATE TRIGGER IF NOT EXISTS refs_au
+        AFTER UPDATE OF title, abstract, authors, keywords, journal,
+                       doi, url, isbn, pmid, arxiv_id, publisher
+        ON refs BEGIN
+        DELETE FROM refs_fts WHERE rowid = old.rowid;
+        INSERT INTO refs_fts (rowid, ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
         VALUES (
-            new.id, new.title, new.abstract,
+            new.rowid, new.id, new.title, new.abstract,
             (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
                                   IFNULL(json_extract(value, '$.given'), ''), ' ')
              FROM json_each(IFNULL(new.authors, '[]'))),
@@ -97,7 +114,7 @@ _FTS_TRIGGER_DDL = f"""
     END;
 
     CREATE TRIGGER IF NOT EXISTS refs_ad AFTER DELETE ON refs BEGIN
-        DELETE FROM refs_fts WHERE ref_id = old.id;
+        DELETE FROM refs_fts WHERE rowid = old.rowid;
     END;
 """
 
@@ -112,12 +129,18 @@ def _bulk_fts_update(conn: sqlite3.Connection, ids: List[str]) -> None:
     if not ids:
         return
     ph = ",".join("?" * len(ids))
-    conn.execute(f"DELETE FROM refs_fts WHERE ref_id IN ({ph})", ids)
+    # Delete + reinsert keyed on refs.rowid (the FTS5 docid), so the rowid↔ref
+    # mapping the triggers rely on stays intact AND the delete is O(1) per row.
+    # Deleting by the UNINDEXED ref_id would scan the whole ~250k-row FTS index.
+    conn.execute(
+        f"DELETE FROM refs_fts WHERE rowid IN (SELECT rowid FROM refs WHERE id IN ({ph}))",
+        ids,
+    )
     conn.execute(
         f"""
-        INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
+        INSERT INTO refs_fts (rowid, ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
         SELECT
-            id, title, abstract,
+            rowid, id, title, abstract,
             (SELECT group_concat(
                 json_extract(value, '$.family') || ' ' ||
                 IFNULL(json_extract(value, '$.given'), ''), ' ')
@@ -416,9 +439,9 @@ class RefDatabase:
     );
 
     CREATE TRIGGER IF NOT EXISTS refs_ai AFTER INSERT ON refs BEGIN
-        INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
+        INSERT INTO refs_fts (rowid, ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
         VALUES (
-            new.id, new.title, new.abstract,
+            new.rowid, new.id, new.title, new.abstract,
             (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
                                   IFNULL(json_extract(value, '$.given'), ''), ' ')
              FROM json_each(IFNULL(new.authors, '[]'))),
@@ -428,11 +451,14 @@ class RefDatabase:
         );
     END;
 
-    CREATE TRIGGER IF NOT EXISTS refs_au AFTER UPDATE ON refs BEGIN
-        DELETE FROM refs_fts WHERE ref_id = old.id;
-        INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
+    CREATE TRIGGER IF NOT EXISTS refs_au
+        AFTER UPDATE OF title, abstract, authors, keywords, journal,
+                       doi, url, isbn, pmid, arxiv_id, publisher
+        ON refs BEGIN
+        DELETE FROM refs_fts WHERE rowid = old.rowid;
+        INSERT INTO refs_fts (rowid, ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
         VALUES (
-            new.id, new.title, new.abstract,
+            new.rowid, new.id, new.title, new.abstract,
             (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
                                   IFNULL(json_extract(value, '$.given'), ''), ' ')
              FROM json_each(IFNULL(new.authors, '[]'))),
@@ -443,7 +469,7 @@ class RefDatabase:
     END;
 
     CREATE TRIGGER IF NOT EXISTS refs_ad AFTER DELETE ON refs BEGIN
-        DELETE FROM refs_fts WHERE ref_id = old.id;
+        DELETE FROM refs_fts WHERE rowid = old.rowid;
     END;
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -533,14 +559,35 @@ class RefDatabase:
             created_at     TEXT DEFAULT (datetime('now'))
         )""",
         "CREATE INDEX IF NOT EXISTS idx_eq_status_prio ON enrich_queue (status, priority DESC)",
+        # --- FTS rowid migration -------------------------------------------
+        # Make refs_fts maintenance O(1). The old triggers deleted by the
+        # UNINDEXED ref_id column, forcing a full ~250k-row FTS scan on EVERY
+        # refs UPDATE (~2.8 s each) — which made enrichment saves crawl and
+        # tripped the daemon watchdog. Drop the old triggers (re-created
+        # rowid-keyed by _FTS_TRIGGER_DDL on open) and rebuild refs_fts so each
+        # FTS docid == refs.rowid, making `DELETE ... WHERE rowid = ?` O(1).
+        "DROP TRIGGER IF EXISTS refs_ai",
+        "DROP TRIGGER IF EXISTS refs_au",
+        "DROP TRIGGER IF EXISTS refs_ad",
+        "DELETE FROM refs_fts",
+        """INSERT INTO refs_fts (rowid, ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
+           SELECT r.rowid, r.id, r.title, r.abstract,
+                  (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
+                                       IFNULL(json_extract(value, '$.given'), ''), ' ')
+                   FROM json_each(IFNULL(r.authors, '[]'))),
+                  r.keywords, r.journal,
+                  IFNULL(r.doi,'') || ' ' || IFNULL(r.url,'') || ' ' || IFNULL(r.isbn,'') || ' ' ||
+                  IFNULL(r.pmid,'') || ' ' || IFNULL(r.arxiv_id,'') || ' ' || IFNULL(r.publisher,'')
+           FROM refs r""",
     ]
 
-    def __init__(self, path: Optional[str | Path] = None) -> None:
+    def __init__(self, path: Optional[str] = None, read_only: bool = False):
         from .config import get_config
         db_path = path or get_config().db_path
         self._path = Path(db_path).expanduser()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
+        self._read_only = read_only
 
     # -----------------------------------------------------------------------
     # Context manager
@@ -551,14 +598,15 @@ class RefDatabase:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._conn and exc_type is None:
+        if self._conn and exc_type is None and not self._read_only:
             self._conn.commit()
         self.close()
 
     def open(self) -> None:
         global _db_initialized
         _dbg(f"[db.open] connecting to {self._path}")
-        self._conn = sqlite3.connect(str(self._path), timeout=30, isolation_level="IMMEDIATE")
+        iso = None if self._read_only else "IMMEDIATE"
+        self._conn = sqlite3.connect(str(self._path), timeout=30, isolation_level=iso)
         self._conn.row_factory = sqlite3.Row
         _dbg("[db.open] connected; setting busy_timeout")
         self._conn.execute("PRAGMA busy_timeout = 30000")  # 10 s max lock wait
@@ -1891,32 +1939,33 @@ class RefDatabase:
                     "UPDATE enrich_queue SET status = 'done', attempts = ?, last_error = NULL WHERE ref_id = ?",
                     (attempts, ref_id),
                 )
+                if improved:
+                    global _stats_completeness_cache
+                    with _stats_cache_lock:
+                        if _stats_completeness_cache["last_update"] > 0:
+                            _stats_completeness_cache["enriched_success"] += 1
             elif level >= 4 and not improved:
-                # Exhausted the current strategy ladder with no improvement.
-                # Keep it eligible for future resolver/web/provider upgrades,
-                # but lower its priority so the daemon does not spin on hard
-                # tail refs while easier recoveries are still pending.
-                if attempts >= 8:
-                    conn.execute(
-                        "UPDATE enrich_queue SET status = 'failed', attempts = ?, last_error = ? WHERE ref_id = ?",
-                        (attempts, error or "exhausted level 4 attempts", ref_id),
-                    )
-                else:
-                    gap = max(0, 1.0 - new_completeness)
-                    prio = max(0.005, min(0.05, gap / max(attempts, 1) / 10))
-                    conn.execute(
-                        """UPDATE enrich_queue SET
-                             status = 'pending', attempts = ?,
-                             strategy_level = 4, difficulty = 3,
-                             priority = ?, last_error = ?
-                           WHERE ref_id = ?""",
-                        (attempts, round(prio, 3), error or "deferred: exhausted current strategies", ref_id),
-                    )
-            elif error and attempts >= 5:
-                # Too many hard failures — park it
+                # This ref was resurfaced into the Tier-5 rescue (web+LLM) and
+                # STILL didn't resolve. It's genuinely unresolvable — mark it
+                # permanently exhausted so it isn't ground again.
                 conn.execute(
-                    "UPDATE enrich_queue SET status = 'failed', attempts = ?, last_error = ? WHERE ref_id = ?",
-                    (attempts, error, ref_id),
+                    "UPDATE enrich_queue SET status = 'done', attempts = ?, "
+                    "last_error = 'exhausted: no match after full rescue' WHERE ref_id = ?",
+                    (attempts, ref_id),
+                )
+            elif not improved and attempts >= 3:
+                # PHASE 1 -> 2 handoff. The fast title-search ladder (3 escalating
+                # attempts) is exhausted. Don't grind it now — DEFER it to the
+                # hard-tail pool at level 4 (status='done', retriable). The daemon
+                # resurfaces these into the expensive Tier-5 web+LLM rescue ONLY
+                # after the whole fast/resolvable queue is drained, so the very
+                # hard refs (the biggest beneficiaries of the rescue) still get it,
+                # just last instead of starving everything else.
+                conn.execute(
+                    "UPDATE enrich_queue SET status = 'done', attempts = ?, "
+                    "strategy_level = 4, "
+                    "last_error = 'deferred: hard tail (awaiting rescue)' WHERE ref_id = ?",
+                    (attempts, ref_id),
                 )
             else:
                 # No improvement — escalate strategy, reduce priority, re-queue
@@ -1972,31 +2021,23 @@ class RefDatabase:
             
             # Average completeness of done items vs pending (cached for 5 minutes)
             now = time.time()
+            import threading
             with _stats_cache_lock:
-                if now - _stats_completeness_cache["last_update"] > 300.0:
-                    try:
-                        avg_row = conn.execute("""
-                            SELECT
-                                COALESCE(AVG(CASE WHEN eq.status='done' THEN r.completeness END), 0) as avg_done,
-                                COALESCE(AVG(CASE WHEN eq.status='pending' THEN r.completeness END), 0) as avg_pending,
-                                -- "Successfully enriched": done refs whose completeness
-                                -- actually rose by >5% vs when they were queued. This
-                                -- EXCLUDES no-match give-ups and already-complete refs,
-                                -- so it reflects real enrichment work (unlike raw 'done').
-                                COALESCE(SUM(CASE WHEN eq.status='done'
-                                    AND r.completeness > COALESCE(eq.completeness_before, 0) + 0.05
-                                    THEN 1 ELSE 0 END), 0) as enriched_success
-                            FROM enrich_queue eq JOIN refs r ON r.id = eq.ref_id
-                        """).fetchone()
-                        _stats_completeness_cache["avg_done"] = avg_row["avg_done"]
-                        _stats_completeness_cache["avg_pending"] = avg_row["avg_pending"]
-                        _stats_completeness_cache["enriched_success"] = avg_row["enriched_success"]
-                        _stats_completeness_cache["last_update"] = now
-                    except Exception as e:
-                        _dbg(f"Error calculating stats: {e}")
-                avg_done = _stats_completeness_cache["avg_done"]
-                avg_pending = _stats_completeness_cache["avg_pending"]
-                enriched_success = _stats_completeness_cache["enriched_success"]
+                if _stats_completeness_cache.get("last_update", 0.0) > 0.0:
+                    if now - _stats_completeness_cache["last_update"] > 300.0:
+                        if not _stats_completeness_cache.get("updating", False):
+                            _stats_completeness_cache["updating"] = True
+                            threading.Thread(target=self._async_stats_completeness_update, name="async_stats_completeness_update", daemon=True).start()
+                    avg_done = _stats_completeness_cache["avg_done"]
+                    avg_pending = _stats_completeness_cache["avg_pending"]
+                    enriched_success = _stats_completeness_cache["enriched_success"]
+                else:
+                    if not _stats_completeness_cache.get("updating", False):
+                        _stats_completeness_cache["updating"] = True
+                        threading.Thread(target=self._async_stats_completeness_update, name="async_stats_completeness_update", daemon=True).start()
+                    avg_done = 0.0
+                    avg_pending = 0.0
+                    enriched_success = 0
 
             return {
                 "pending": stats.get("pending", 0),
@@ -2017,24 +2058,85 @@ class RefDatabase:
                 ],
             }
 
+    def _async_stats_completeness_update(self):
+        try:
+            with RefDatabase(path=str(self._path), read_only=True) as db:
+                avg_done, avg_pending, enriched_success = db._calculate_stats_completeness_query()
+            import time
+            with _stats_cache_lock:
+                _stats_completeness_cache["avg_done"] = avg_done
+                _stats_completeness_cache["avg_pending"] = avg_pending
+                _stats_completeness_cache["enriched_success"] = enriched_success
+                _stats_completeness_cache["last_update"] = time.time()
+        except Exception as e:
+            _dbg(f"Error in _async_stats_completeness_update: {e}")
+        finally:
+            with _stats_cache_lock:
+                _stats_completeness_cache["updating"] = False
+
+    def _calculate_stats_completeness_query(self):
+        with self._db() as conn:
+            avg_row = conn.execute("""
+                SELECT
+                    COALESCE(AVG(CASE WHEN eq.status='done' THEN r.completeness END), 0) as avg_done,
+                    COALESCE(AVG(CASE WHEN eq.status='pending' THEN r.completeness END), 0) as avg_pending,
+                    COALESCE(SUM(CASE WHEN eq.status='done'
+                        AND r.completeness > COALESCE(eq.completeness_before, 0) + 0.05
+                        THEN 1 ELSE 0 END), 0) as enriched_success
+                FROM enrich_queue eq JOIN refs r ON r.id = eq.ref_id
+            """).fetchone()
+            return avg_row["avg_done"], avg_row["avg_pending"], avg_row["enriched_success"]
+
     # Tier classification SQL — single source of truth
     TIER_CASE_SQL = """(CASE WHEN COALESCE(doi,'')!='' OR COALESCE(pmid,'')!='' OR COALESCE(arxiv_id,'')!='' OR COALESCE(isbn,'')!='' THEN 1 WHEN COALESCE(url,'')!='' OR COALESCE(oa_url,'')!='' THEN 2 WHEN COALESCE(title,'')!='' AND (COALESCE(year,'')!='' OR COALESCE(journal,'')!='' OR COALESCE(container_title,'')!='') THEN 3 WHEN COALESCE(title,'')!='' THEN 4 ELSE 5 END)"""
 
     def tier_breakdown(self) -> dict:
         """Per-tier counts for the library AND the enrichment queue."""
+        import time
+        import threading
+        now = time.time()
+        global _tier_breakdown_cache
+        with _tier_breakdown_lock:
+            if _tier_breakdown_cache["data"] is not None:
+                if now - _tier_breakdown_cache["last_update"] > 300.0:
+                    if not _tier_breakdown_cache.get("updating", False):
+                        _tier_breakdown_cache["updating"] = True
+                        threading.Thread(target=self._async_tier_breakdown_update, name="async_tier_breakdown_update", daemon=True).start()
+                return _tier_breakdown_cache["data"]
+            else:
+                if not _tier_breakdown_cache.get("updating", False):
+                    _tier_breakdown_cache["updating"] = True
+                    threading.Thread(target=self._async_tier_breakdown_update, name="async_tier_breakdown_update", daemon=True).start()
+                return {"library": {}, "queue_pending": {}}
+
+    def _async_tier_breakdown_update(self):
+        try:
+            with RefDatabase(path=str(self._path), read_only=True) as db:
+                data = db._calculate_tier_breakdown_query()
+            import time
+            with _tier_breakdown_lock:
+                _tier_breakdown_cache["data"] = data
+                _tier_breakdown_cache["last_update"] = time.time()
+        except Exception as e:
+            _dbg(f"Error in _async_tier_breakdown_update: {e}")
+        finally:
+            with _tier_breakdown_lock:
+                _tier_breakdown_cache["updating"] = False
+
+    def _calculate_tier_breakdown_query(self) -> dict:
         tc = self.TIER_CASE_SQL
         with self._db() as conn:
             lib_rows = conn.execute(f"""
                 SELECT {tc} as tier, COUNT(*) as cnt
                 FROM refs GROUP BY tier
-            """.format(tc=tc)).fetchall()
+            """).fetchall()
             q_rows = conn.execute(f"""
                 SELECT {tc} as tier, COUNT(*) as cnt
                 FROM enrich_queue eq
                 JOIN refs r ON r.id = eq.ref_id
                 WHERE eq.status = 'pending'
                 GROUP BY tier
-            """.format(tc=tc)).fetchall()
+            """).fetchall()
         lib   = {row["tier"]: row["cnt"] for row in lib_rows}
         queue = {row["tier"]: row["cnt"] for row in q_rows}
         return {"library": lib, "queue_pending": queue}
@@ -2047,6 +2149,11 @@ class RefDatabase:
         """
         with self._db() as conn:
             cur = conn.execute("DELETE FROM enrich_queue")
+            global _stats_completeness_cache, _tier_breakdown_cache
+            with _stats_cache_lock:
+                _stats_completeness_cache["last_update"] = 0.0
+            with _tier_breakdown_lock:
+                _tier_breakdown_cache["last_update"] = 0.0
             return cur.rowcount
 
     def skip_pending_below_level(self, max_strategy_level: int) -> int:
@@ -2066,6 +2173,11 @@ class RefDatabase:
                    AND strategy_level < ?""",
                 (max_strategy_level,),
             )
+            global _stats_completeness_cache, _tier_breakdown_cache
+            with _stats_cache_lock:
+                _stats_completeness_cache["last_update"] = 0.0
+            with _tier_breakdown_lock:
+                _tier_breakdown_cache["last_update"] = 0.0
             return cur.rowcount
 
     def reset_stale_active(self, max_age_minutes: int = 10) -> int:

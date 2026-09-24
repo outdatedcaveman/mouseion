@@ -178,8 +178,37 @@ class QuotaManager:
         Async context manager: block until the provider's quota permits a
         request, record the request, then yield.
 
-        Wraps every HTTP request in BaseProvider._get().
+        DELEGATES to the master APIRouter so that legacy callers (batch_lookup,
+        etc.) are counted against the SAME single, persistent budget as
+        everything else — no double-metering, no uncoordinated hammering. Falls
+        back to the legacy sliding window only if the router is unavailable.
         """
+        # Try the master router first. CRITICAL: the yield must NOT live inside
+        # a try/except that swallows exceptions. An exception thrown back into
+        # this context manager (athrow — e.g. the `async with` body is cancelled
+        # by a timeout, or the HTTP call errors) would otherwise be caught by the
+        # `except Exception` and the generator would fall through to the legacy
+        # `yield` below, yielding a SECOND time. Python then raises "generator
+        # didn't stop after athrow()", the broken cleanup hangs the enclosing
+        # asyncio.gather, and the whole enrichment batch stalls until the 450s
+        # watchdog fires. So: acquire INSIDE the try, but yield OUTSIDE it so a
+        # body exception propagates cleanly and the generator stops.
+        router_acquired = False
+        use_legacy = False
+        try:
+            from .api_router import get_router
+            router = get_router()
+            router_acquired = await router.acquire(provider, max_wait=25.0)
+        except Exception:
+            use_legacy = True
+
+        if not use_legacy:
+            if router_acquired:
+                yield
+                return
+            else:
+                raise QuotaExceeded(provider, "budget_or_cooldown", 0, retry_after=25.0)
+
         state = self._get_state(provider)
         async with state._lock:
             while True:

@@ -1325,66 +1325,103 @@ _pdf_fetch_status = {
 _pdf_status_lock = threading.Lock()
 _pdf_breakdown_cache = None
 _pdf_breakdown_cache_time = 0.0
+_pdf_breakdown_updating = False
 _pdf_breakdown_cache_lock = threading.Lock()
+
+_pdf_library_total_cache = None
+_pdf_library_total_cache_time = 0.0
+_pdf_library_total_updating = False
+_pdf_library_total_cache_lock = threading.Lock()
 
 
 def _get_pdf_tier_breakdown():
-    global _pdf_breakdown_cache, _pdf_breakdown_cache_time
+    global _pdf_breakdown_cache, _pdf_breakdown_cache_time, _pdf_breakdown_updating
     import time
     with _pdf_breakdown_cache_lock:
         now = time.time()
-        if _pdf_breakdown_cache is not None and now - _pdf_breakdown_cache_time < 15.0:
+        if _pdf_breakdown_cache is not None and now - _pdf_breakdown_cache_time < 300.0:
             return _pdf_breakdown_cache
+        if _pdf_breakdown_updating:
+            return _pdf_breakdown_cache or {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        _pdf_breakdown_updating = True
 
-    from .db import RefDatabase
-    counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-    try:
-        with RefDatabase() as db:
-            with db._db() as conn:
-                cur = conn.execute(
-                    "SELECT "
-                    "  SUM(CASE WHEN (oa_url IS NOT NULL AND oa_url != '') THEN 1 ELSE 0 END), "
-                    "  SUM(CASE WHEN (oa_url IS NULL OR oa_url = '') AND (arxiv_id IS NOT NULL AND arxiv_id != '') THEN 1 ELSE 0 END), "
-                    "  SUM(CASE WHEN (oa_url IS NULL OR oa_url = '') AND (arxiv_id IS NULL OR arxiv_id = '') AND (doi IS NOT NULL AND doi != '') THEN 1 ELSE 0 END), "
-                    "  SUM(CASE WHEN (oa_url IS NULL OR oa_url = '') AND (arxiv_id IS NULL OR arxiv_id = '') AND (doi IS NULL OR doi = '') AND (title IS NOT NULL AND title != '') THEN 1 ELSE 0 END), "
-                    "  SUM(CASE WHEN (oa_url IS NULL OR oa_url = '') AND (arxiv_id IS NULL OR arxiv_id = '') AND (doi IS NULL OR doi = '') AND (title IS NULL OR title = '') THEN 1 ELSE 0 END) "
-                    "FROM refs "
-                    "WHERE (pdf_local IS NULL OR pdf_local = '') "
-                    "  AND (pdf_drive_id IS NULL OR pdf_drive_id = '')"
-                )
-                row = cur.fetchone()
-                if row:
-                    counts[1] = row[0] or 0
-                    counts[2] = row[1] or 0
-                    counts[3] = row[2] or 0
-                    counts[4] = row[3] or 0
-                    counts[5] = row[4] or 0
-        with _pdf_breakdown_cache_lock:
-            _pdf_breakdown_cache = counts
-            _pdf_breakdown_cache_time = time.time()
-    except Exception as e:
-        logging.warning("Failed to get pdf tier breakdown: %s", e)
-    return counts
+    def _bg_update():
+        global _pdf_breakdown_cache, _pdf_breakdown_cache_time, _pdf_breakdown_updating
+        from .db import RefDatabase
+        counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        try:
+            with RefDatabase(read_only=True) as db:
+                with db._db() as conn:
+                    cur = conn.execute(
+                        "SELECT "
+                        "  SUM(CASE WHEN (oa_url IS NOT NULL AND oa_url != '') THEN 1 ELSE 0 END), "
+                        "  SUM(CASE WHEN (oa_url IS NULL OR oa_url = '') AND (arxiv_id IS NOT NULL AND arxiv_id != '') THEN 1 ELSE 0 END), "
+                        "  SUM(CASE WHEN (oa_url IS NULL OR oa_url = '') AND (arxiv_id IS NULL OR arxiv_id = '') AND (doi IS NOT NULL AND doi != '') THEN 1 ELSE 0 END), "
+                        "  SUM(CASE WHEN (oa_url IS NULL OR oa_url = '') AND (arxiv_id IS NULL OR arxiv_id = '') AND (doi IS NULL OR doi = '') AND (title IS NOT NULL AND title != '') THEN 1 ELSE 0 END), "
+                        "  SUM(CASE WHEN (oa_url IS NULL OR oa_url = '') AND (arxiv_id IS NULL OR arxiv_id = '') AND (doi IS NULL OR doi = '') AND (title IS NULL OR title = '') THEN 1 ELSE 0 END) "
+                        "FROM refs "
+                        "WHERE (pdf_local IS NULL OR pdf_local = '') "
+                        "  AND (pdf_drive_id IS NULL OR pdf_drive_id = '')"
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        counts[1] = row[0] or 0
+                        counts[2] = row[1] or 0
+                        counts[3] = row[2] or 0
+                        counts[4] = row[3] or 0
+                        counts[5] = row[4] or 0
+            with _pdf_breakdown_cache_lock:
+                _pdf_breakdown_cache = counts
+                _pdf_breakdown_cache_time = time.time()
+        except Exception as e:
+            logging.warning("Failed to get pdf tier breakdown in background: %s", e)
+        finally:
+            with _pdf_breakdown_cache_lock:
+                _pdf_breakdown_updating = False
+
+    threading.Thread(target=_bg_update, name="pdf_breakdown_bg_update", daemon=True).start()
+    return _pdf_breakdown_cache or {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
 
 
 @app.route("/api/pdfs/status")
 def get_pdf_status():
+    global _pdf_library_total_cache, _pdf_library_total_cache_time, _pdf_library_total_updating
     with _pdf_status_lock:
         status_copy = dict(_pdf_fetch_status)
     status_copy["tiers"] = _get_pdf_tier_breakdown()
-    # CUMULATIVE truth from the DB — the actual number of refs that have a PDF
-    # right now. The in-memory "found" counter is per-session and resets, which
-    # is why it looked like progress vanished between runs. This is the real one.
-    try:
+    
+    import time
+    now = time.time()
+    with _pdf_library_total_cache_lock:
+        if _pdf_library_total_cache is not None and now - _pdf_library_total_cache_time < 300.0:
+            status_copy["library_total"] = _pdf_library_total_cache
+            return jsonify(status_copy)
+        if _pdf_library_total_updating:
+            status_copy["library_total"] = _pdf_library_total_cache
+            return jsonify(status_copy)
+        _pdf_library_total_updating = True
+
+    def _bg_total_update():
+        global _pdf_library_total_cache, _pdf_library_total_cache_time, _pdf_library_total_updating
         from .db import RefDatabase
-        with RefDatabase() as db:
-            with db._db() as conn:
-                status_copy["library_total"] = conn.execute(
-                    "SELECT COUNT(*) FROM refs WHERE (pdf_local IS NOT NULL AND pdf_local!='') "
-                    "OR (pdf_drive_id IS NOT NULL AND pdf_drive_id!='')"
-                ).fetchone()[0]
-    except Exception:
-        status_copy["library_total"] = None
+        try:
+            with RefDatabase(read_only=True) as db:
+                with db._db() as conn:
+                    total = conn.execute(
+                        "SELECT COUNT(*) FROM refs WHERE (pdf_local IS NOT NULL AND pdf_local!='') "
+                        "OR (pdf_drive_id IS NOT NULL AND pdf_drive_id!='')"
+                    ).fetchone()[0]
+            with _pdf_library_total_cache_lock:
+                _pdf_library_total_cache = total
+                _pdf_library_total_cache_time = time.time()
+        except Exception as e:
+            logging.warning("Failed to get pdf library total in background: %s", e)
+        finally:
+            with _pdf_library_total_cache_lock:
+                _pdf_library_total_updating = False
+
+    threading.Thread(target=_bg_total_update, name="pdf_library_total_bg_update", daemon=True).start()
+    status_copy["library_total"] = _pdf_library_total_cache
     return jsonify(status_copy)
 
 
@@ -1434,14 +1471,51 @@ def fetch_all_pdfs():
         _pdf_fetch_status["logs"] = ["Starting PDF fetch engine..."]
 
     def _worker():
+        vpn_connected = False
+        stop_vpn_monitor = threading.Event()
         try:
             import anyio
+            import logging
             from .db import RefDatabase
             from .pdf_manager import download_pdf as _dl_pdf, get_pdf_dir
             from .config import get_config
 
             cfg = get_config()
             pdf_dir = get_pdf_dir()
+
+            # Auto-establish VPN if configured
+            if cfg.vpn_gateway:
+                try:
+                    logging.info("PDF WORKER: Auto-establishing VPN connection for PDF fetching...")
+                    from .vpn_manager import start_vpn
+                    start_vpn(cfg)
+                    vpn_connected = True
+                    import time
+                    time.sleep(3.0)  # wait for routing table
+                except Exception as vpn_err:
+                    logging.error("PDF WORKER: Failed to start VPN: %s", vpn_err)
+
+                # Start a background watchdog thread to maintain the VPN connection during fetching
+                def _vpn_monitor():
+                    from .vpn_manager import get_vpn_status, start_vpn
+                    while not stop_vpn_monitor.is_set():
+                        for _ in range(10):
+                            if stop_vpn_monitor.is_set():
+                                return
+                            time.sleep(1.0)
+                        try:
+                            with _pdf_status_lock:
+                                if not _pdf_fetch_status.get("running"):
+                                    return
+                            status = get_vpn_status()
+                            if status.get("status") == "disconnected":
+                                logging.warning("PDF WORKER: VPN connection dropped during PDF sweep. Reconnecting...")
+                                start_vpn(cfg)
+                                time.sleep(5.0)
+                        except Exception as mon_err:
+                            logging.error("PDF WORKER: VPN monitor error: %s", mon_err)
+
+                threading.Thread(target=_vpn_monitor, name="pdf_vpn_monitor", daemon=True).start()
 
             with _pdf_status_lock:
                 max_tier = _pdf_fetch_status.get("focus_max_tier", 4)
@@ -1458,23 +1532,37 @@ def fetch_all_pdfs():
             
             sub_condition = " OR ".join(conditions) if conditions else "1=0"
 
-            query = (
-                "SELECT * FROM refs "
-                "WHERE (pdf_local IS NULL OR pdf_local = '') "
-                "  AND (pdf_drive_id IS NULL OR pdf_drive_id = '') "
-                f"  AND ( {sub_condition} ) "
-                "ORDER BY "
-                "  CASE "
-                "    WHEN (oa_url IS NOT NULL AND oa_url != '') THEN 1 "
-                "    WHEN (arxiv_id IS NOT NULL AND arxiv_id != '') THEN 2 "
-                "    WHEN (doi IS NOT NULL AND doi != '') THEN 3 "
-                "    ELSE 4 "
-                "  END ASC, "
-                "  year DESC"
-            )
-
             with RefDatabase() as db:
                 with db._db() as conn:
+                    # Attach api_router.db to exclude already-failed PDF downloads in the query
+                    from .api_router import _default_db_path
+                    api_db_path = str(_default_db_path())
+                    try:
+                        conn.execute("ATTACH DATABASE ? AS api_router", (api_db_path,))
+                    except Exception as attach_err:
+                        logging.warning("Could not attach api_router db: %s", attach_err)
+
+                    query = (
+                        "SELECT r.* FROM refs r "
+                        "LEFT JOIN api_router.attempt_ledger al ON al.ref_id = r.id AND al.api = 'pdf' "
+                        "WHERE (r.pdf_local IS NULL OR r.pdf_local = '') "
+                        "  AND (r.pdf_drive_id IS NULL OR r.pdf_drive_id = '') "
+                        f"  AND ( {sub_condition} ) "
+                        # Exclude refs already tried for a PDF — UNLESS the ref CHANGED
+                        # since (e.g. the DOI-recovery added a DOI → now fetchable via
+                        # unpaywall/VPN). ledger.ts is a unix float, refs.updated_at is
+                        # ISO, so convert before comparing. Honours the ledger rule:
+                        # re-try only on a changed entry.
+                        "  AND (al.ref_id IS NULL OR CAST(strftime('%s', r.updated_at) AS REAL) > al.ts) "
+                        "ORDER BY "
+                        "  CASE "
+                        "    WHEN (r.oa_url IS NOT NULL AND r.oa_url != '') THEN 1 "
+                        "    WHEN (r.arxiv_id IS NOT NULL AND r.arxiv_id != '') THEN 2 "
+                        "    WHEN (r.doi IS NOT NULL AND r.doi != '') THEN 3 "
+                        "    ELSE 4 "
+                        "  END ASC, "
+                        "  r.year DESC"
+                    )
                     cur = conn.execute(query)
                     from .db import _row_to_ref
                     targets = []
@@ -1534,13 +1622,23 @@ def fetch_all_pdfs():
                     except asyncio.QueueEmpty:
                         break
 
-                    ref_label = ref.title or ref.id
+                    ref_label = ref.title or _ref_id(ref)
                     with _pdf_status_lock:
                         _pdf_fetch_status["logs"].append(f"[{idx+1}/{total}] Searching PDF for: {ref_label}...")
+                        # Cap the in-memory log so a multi-day sweep over 180k+ refs
+                        # (≈2 entries each) can't grow the list unbounded and bloat
+                        # the process. Keep only the most recent lines for the UI.
+                        _lg = _pdf_fetch_status["logs"]
+                        if len(_lg) > 400:
+                            del _lg[:len(_lg) - 400]
 
                     try:
-                        # Call _dl_pdf asynchronously
-                        result = await _dl_pdf(ref, client=client)
+                        # Call _dl_pdf asynchronously with a hard timeout to prevent hangs during network/VPN transitions
+                        try:
+                            result = await asyncio.wait_for(_dl_pdf(ref, client=client), timeout=150.0)
+                        except asyncio.TimeoutError:
+                            logging.warning("PDF Worker: Timeout fetching PDF for: %s", ref_label)
+                            result = None
                         if result:
                             rid = _ref_id(ref)
                             async with db_write_lock:
@@ -1591,16 +1689,12 @@ def fetch_all_pdfs():
                                 _pdf_fetch_status["found"] = current_fetched
                                 _pdf_fetch_status["logs"].append(f"  --> SUCCESS: Saved to {result}{drive_msg}")
                         else:
-                            rid = _ref_id(ref)
-                            if ref.extras is None:
-                                ref.extras = {}
-                            ref.extras["pdf_failed_attempts"] = ref.extras.get("pdf_failed_attempts", 0) + 1
-                            import time
-                            ref.extras["pdf_last_failed"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                            async with db_write_lock:
-                                with RefDatabase() as db:
-                                    db.update_integration_ids(rid, extras=ref.extras)
-
+                            # NO refs.db write on failure. The master router's
+                            # attempt ledger (separate api_router.db) already
+                            # recorded this miss, so we don't re-try this entry.
+                            # Writing pdf_failed_attempts to refs.db on every
+                            # failure held the write lock and starved the
+                            # enrichment daemon's dequeue — that's removed.
                             with progress_lock:
                                 failed += 1
                                 checked += 1
@@ -1611,19 +1705,7 @@ def fetch_all_pdfs():
                                 _pdf_fetch_status["failed"] = current_failed
                                 _pdf_fetch_status["logs"].append(f"  --> FAILED: No PDF link could be resolved/downloaded.")
                     except Exception as ex:
-                        rid = _ref_id(ref)
-                        if ref.extras is None:
-                            ref.extras = {}
-                        ref.extras["pdf_failed_attempts"] = ref.extras.get("pdf_failed_attempts", 0) + 1
-                        import time
-                        ref.extras["pdf_last_failed"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                        try:
-                            async with db_write_lock:
-                                with RefDatabase() as db:
-                                    db.update_integration_ids(rid, extras=ref.extras)
-                        except Exception:
-                            pass
-
+                        # No refs.db write — the router ledger tracks the miss.
                         with progress_lock:
                             failed += 1
                             checked += 1
@@ -1647,6 +1729,8 @@ def fetch_all_pdfs():
                     # arXiv, Unpaywall) dominate the early tiers and benefit from
                     # the extra parallelism; the rate-limited sources (CORE,
                     # sci-hub) still self-throttle via their own locks/cooldowns.
+                    # Restored to 16 workers because database locks on failure are
+                    # removed, and the network budget limits are expanded.
                     workers = [asyncio.create_task(_worker_coro(client, db_write_lock)) for _ in range(16)]
                     await asyncio.gather(*workers)
 
@@ -1667,6 +1751,15 @@ def fetch_all_pdfs():
             with _pdf_status_lock:
                 _pdf_fetch_status["running"] = False
                 _pdf_fetch_status["logs"].append(f"Engine crash: {e}")
+        finally:
+            stop_vpn_monitor.set()
+            if vpn_connected:
+                try:
+                    logging.info("PDF WORKER: Disconnecting VPN after PDF fetching completion...")
+                    from .vpn_manager import stop_vpn
+                    stop_vpn()
+                except Exception as vpn_err:
+                    logging.error("PDF WORKER: Failed to stop VPN: %s", vpn_err)
 
     threading.Thread(target=_worker, daemon=True).start()
     return jsonify({"job_id": job_id}), 202
@@ -2357,7 +2450,7 @@ def enrich_daemon_status():
     """Return daemon state + queue stats + tier breakdown."""
     from .enrich_daemon import is_running, get_focus
     from .db import RefDatabase
-    with RefDatabase() as db:
+    with RefDatabase(read_only=True) as db:
         stats = db.enrich_queue_stats()
         try:
             stats["tiers"] = db.tier_breakdown()
@@ -2844,6 +2937,7 @@ def get_settings_config():
             "openalex_api_key": c.openalex_api_key,
             "vpn_enabled": c.vpn_enabled,
             "vpn_type": c.vpn_type,
+            "vpn_protocol": c.vpn_protocol,
             "vpn_gateway": c.vpn_gateway,
             "vpn_username": c.vpn_username,
             "vpn_password": c.vpn_password,
@@ -2867,6 +2961,7 @@ def patch_settings_config():
         if "openalex_api_key" in body: c.openalex_api_key = body["openalex_api_key"]
         if "vpn_enabled" in body: c.vpn_enabled = bool(body["vpn_enabled"])
         if "vpn_type" in body: c.vpn_type = body["vpn_type"]
+        if "vpn_protocol" in body: c.vpn_protocol = body["vpn_protocol"]
         if "vpn_gateway" in body: c.vpn_gateway = body["vpn_gateway"]
         if "vpn_username" in body: c.vpn_username = body["vpn_username"]
         if "vpn_password" in body: c.vpn_password = body["vpn_password"]
@@ -2900,6 +2995,7 @@ def toggle_vpn_endpoint():
         if "username" in body: c.vpn_username = body["username"]
         if "password" in body: c.vpn_password = body["password"]
         if "type" in body: c.vpn_type = body["type"]
+        if "protocol" in body: c.vpn_protocol = body["protocol"]
         
         if enabled:
             c.vpn_enabled = True
@@ -4429,6 +4525,12 @@ kbd {
         <option value="openconnect">OpenConnect (Recommended)</option>
         <option value="forticlient">FortiClient CLI</option>
       </select>
+      <label style="font-size:12px;color:var(--muted);white-space:nowrap;margin-left:8px">Protocol:</label>
+      <select id="cfg-vpn-protocol" style="font-size:12px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);border-color:var(--border)">
+        <option value="anyconnect">Cisco AnyConnect</option>
+        <option value="fortinet">Fortinet</option>
+        <option value="gp">GlobalProtect</option>
+      </select>
       <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer;margin-left:auto">
         <input type="checkbox" id="cfg-vpn-enabled"> Auto-start on launch
       </label>
@@ -5074,6 +5176,7 @@ async function openSettings(msg) {
       
       // Load VPN configuration
       document.getElementById('cfg-vpn-type').value = cd.vpn_type || 'openconnect';
+      document.getElementById('cfg-vpn-protocol').value = cd.vpn_protocol || 'anyconnect';
       document.getElementById('cfg-vpn-enabled').checked = !!cd.vpn_enabled;
       document.getElementById('cfg-vpn-gateway').value = cd.vpn_gateway || '';
       document.getElementById('cfg-vpn-username').value = cd.vpn_username || '';
@@ -5147,6 +5250,7 @@ async function toggleVpnActive() {
     const payload = {
       enabled: !isDisconnect,
       type: document.getElementById('cfg-vpn-type').value,
+      protocol: document.getElementById('cfg-vpn-protocol').value,
       gateway: document.getElementById('cfg-vpn-gateway').value.trim(),
       username: document.getElementById('cfg-vpn-username').value.trim(),
       password: document.getElementById('cfg-vpn-password').value,
@@ -5212,6 +5316,7 @@ function saveSettings() {
       crossref_email: document.getElementById('cfg-cr-email').value.trim(),
       openalex_email: document.getElementById('cfg-cr-email').value.trim(),
       vpn_type: document.getElementById('cfg-vpn-type').value,
+      vpn_protocol: document.getElementById('cfg-vpn-protocol').value,
       vpn_enabled: document.getElementById('cfg-vpn-enabled').checked,
       vpn_gateway: document.getElementById('cfg-vpn-gateway').value.trim(),
       vpn_username: document.getElementById('cfg-vpn-username').value.trim(),
@@ -6954,9 +7059,19 @@ async function loadRefs(resetLimit = true) {
   }
 }
 
+// Cap how many refs we eagerly pull into the embedded WebView. On very large
+// libraries (250k+) the old code loaded EVERY page into a JS array AND re-ran
+// applyAdvFilter()/renderStatus() after each page — O(n^2) work plus hundreds of
+// MB in the renderer, which OOM/hangs the WebView2 window and takes the whole
+// app (and the background engines) down with it. We now (1) cap the eager load,
+// (2) filter/render only ONCE at the end, and (3) yield between pages so the UI
+// thread stays alive. Everything beyond the cap is reachable via search (the
+// server-side FTS index is fast).
+const _MAX_CLIENT_REFS = 2000;
 async function _loadRemainingPages(ac, baseParams, total) {
+  const cap = Math.min(total, _MAX_CLIENT_REFS);
   let loaded = refs.length;
-  while (loaded < total) {
+  while (loaded < cap) {
     if (ac.signal.aborted) return;
     const params = new URLSearchParams(baseParams);
     params.set('offset', loaded);
@@ -6966,19 +7081,30 @@ async function _loadRemainingPages(ac, baseParams, total) {
       const data = await r.json();
       const page = data.refs || data;
       if (!page.length) break;  // no more results
-      page.forEach((r, i) => r._idx = loaded + i);
+      page.forEach((rr, i) => rr._idx = loaded + i);
       refs = refs.concat(page);
       loaded += page.length;
-      _fullRefs = null;
-      applyAdvFilter();
-      renderStatus();
+      // Cheap count update only; defer the expensive filter/render. Yield so the
+      // renderer can paint and stay responsive (prevents the watchdog kill).
       const el = document.getElementById('all-count');
-      if (el && activeColl === null) el.textContent = total || refs.length;
+      if (el && activeColl === null) {
+        el.textContent = loaded < total ? (loaded + ' / ' + total) : total;
+      }
+      await new Promise(res => setTimeout(res, 0));
     } catch(e) {
       if (e.name === 'AbortError') return;
       console.error('Page load error:', e);
       break;
     }
+  }
+  if (ac.signal.aborted) return;
+  // Single filter + render pass over everything we loaded.
+  _fullRefs = null;
+  applyAdvFilter();
+  renderStatus();
+  const el = document.getElementById('all-count');
+  if (el && activeColl === null) {
+    el.textContent = (loaded < total) ? (total + ' (' + loaded + ' loaded — search for more)') : total;
   }
 }
 

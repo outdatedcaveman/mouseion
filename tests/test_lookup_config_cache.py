@@ -333,6 +333,14 @@ class TestReferenceCache:
 # ===========================================================================
 
 class TestQuota:
+    @pytest.fixture(autouse=True)
+    def mock_router(self, monkeypatch):
+        """Mock APIRouter to simulate it being unavailable, so legacy tests fallback to legacy path."""
+        from mouseion import api_router
+        def mock_get_router():
+            raise RuntimeError("API Router offline during test")
+        monkeypatch.setattr(api_router, "get_router", mock_get_router)
+
     @pytest.fixture
     def qm(self, tmp_path):
         from mouseion.quota import QuotaManager, ProviderLimits

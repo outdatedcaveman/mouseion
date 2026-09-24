@@ -40,8 +40,12 @@ _USER_AGENT = (
 )
 
 # Concurrency limit for batch downloads
-_MAX_CONCURRENT = 12
+_MAX_CONCURRENT = 20
 
+
+class TemporaryDownloadError(Exception):
+    """Exception raised when a PDF download strategy fails due to transient reasons (rate limits, timeouts, etc.)."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -168,9 +172,9 @@ _active_annas_mirror = None
 _CORE_BASE = "https://api.core.ac.uk/v3"
 
 # Conservative rate-limiting delays (seconds) for legally gray sources
-_SCIHUB_DELAY = 5.0    # be very gentle
-_ANNAS_DELAY = 3.0
-_CORE_DELAY = 0.5
+_SCIHUB_DELAY = 3.0    # reduced but still gentle
+_ANNAS_DELAY = 2.0
+_CORE_DELAY = 0.3
 
 # Global locks and last request times to rate limit PDF searches
 _unpaywall_lock = asyncio.Lock()
@@ -220,6 +224,17 @@ async def download_pdf(
         ref.pdf_path = rel
         return rel
 
+    # Attempt ledger: if this exact entry already failed a PDF fetch, don't try
+    # again until the entry changes (e.g. enrichment adds an oa_url/doi → hash
+    # changes → eligible again). Stops the "thousands found, counter never moves"
+    # re-churn that wasted PDF-source quota every run.
+    from .api_router import get_router
+    _router = get_router()
+    _rid = getattr(ref, "_db_id", None) or getattr(ref, "_batch_id", None) or (ref.doi or ref.arxiv_id or ref.title or "")
+    _eh = _router.entry_hash(ref)
+    if _rid and _router.was_tried(_rid, "pdf", _eh):
+        return None
+
     from .config import get_config
     cfg = get_config()
     proxy_url = cfg.institutional_proxy_url.strip() if cfg.institutional_proxy_url else ""
@@ -240,74 +255,148 @@ async def download_pdf(
             client_kwargs["proxy"] = proxy_url
         client = httpx.AsyncClient(**client_kwargs)
 
+    temporary_failure = False
+
     try:
         # Strategy 1: Use oa_url already on the reference
         if ref.oa_url:
-            result = await _stream_download(client, ref.oa_url, dest)
-            if result:
-                ref.pdf_path = filename
-                return filename
+            try:
+                result = await _stream_download(client, ref.oa_url, dest)
+                if result:
+                    ref.pdf_path = filename
+                    return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using ref.oa_url: %s", e)
+                temporary_failure = True
 
         # Strategy 2: arXiv PDF
         if ref.arxiv_id:
-            url = f"https://arxiv.org/pdf/{ref.arxiv_id}"
-            result = await _stream_download(client, url, dest)
-            if result:
-                ref.pdf_path = filename
-                return filename
+            try:
+                url = f"https://arxiv.org/pdf/{ref.arxiv_id}"
+                result = await _stream_download(client, url, dest)
+                if result:
+                    ref.pdf_path = filename
+                    return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using arXiv: %s", e)
+                temporary_failure = True
 
         # Strategy 3: Unpaywall
         if ref.doi:
             email = cfg.openalex_email or cfg.crossref_email
             if email:
-                oa_url = await _unpaywall_lookup(client, ref.doi, email)
-                if oa_url:
-                    ref.oa_url = oa_url
-                    result = await _stream_download(client, oa_url, dest)
-                    if result:
-                        ref.pdf_path = filename
-                        return filename
+                try:
+                    oa_url = await _unpaywall_lookup(client, ref.doi, email)
+                    if oa_url:
+                        ref.oa_url = oa_url
+                        result = await _stream_download(client, oa_url, dest)
+                        if result:
+                            ref.pdf_path = filename
+                            return filename
+                except TemporaryDownloadError as e:
+                    logger.info("Temporary failure using Unpaywall: %s", e)
+                    temporary_failure = True
 
         # Strategy 4: Semantic Scholar openAccessPdf
-        s2_url = await _s2_oa_lookup(client, ref, cfg)
-        if s2_url:
-            result = await _stream_download(client, s2_url, dest)
-            if result:
-                ref.pdf_path = filename
-                ref.oa_url = ref.oa_url or s2_url
-                return filename
+        try:
+            s2_url = await _s2_oa_lookup(client, ref, cfg)
+            if s2_url:
+                result = await _stream_download(client, s2_url, dest)
+                if result:
+                    ref.pdf_path = filename
+                    ref.oa_url = ref.oa_url or s2_url
+                    return filename
+        except TemporaryDownloadError as e:
+            logger.info("Temporary failure using Semantic Scholar: %s", e)
+            temporary_failure = True
 
         # Strategy 5: CORE.ac.uk
-        core_url = await _core_lookup(client, ref)
-        if core_url:
-            result = await _stream_download(client, core_url, dest)
-            if result:
-                ref.pdf_path = filename
-                ref.oa_url = ref.oa_url or core_url
-                return filename
+        try:
+            core_url = await _core_lookup(client, ref)
+            if core_url:
+                result = await _stream_download(client, core_url, dest)
+                if result:
+                    ref.pdf_path = filename
+                    ref.oa_url = ref.oa_url or core_url
+                    return filename
+        except TemporaryDownloadError as e:
+            logger.info("Temporary failure using CORE: %s", e)
+            temporary_failure = True
+
+        # Strategy 5.5: Direct DOI/Publisher URL download (takes advantage of VPN direct access)
+        if ref.doi:
+            try:
+                doi_url = f"https://doi.org/{ref.doi}"
+                result = await _stream_download(client, doi_url, dest)
+                if result:
+                    ref.pdf_path = filename
+                    return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using Direct DOI: %s", e)
+                temporary_failure = True
+
+        if ref.url and not ref.doi:
+            try:
+                result = await _stream_download(client, ref.url, dest)
+                if result:
+                    ref.pdf_path = filename
+                    return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using Direct URL: %s", e)
+                temporary_failure = True
 
         # Strategy 6: DOI Proxy Download (EZproxy/Institutional Proxy prepending)
         if ref.doi and proxy_url and not use_network_proxy:
-            target_url = f"https://doi.org/{ref.doi}"
-            url = f"{proxy_url}{target_url}"
-            result = await _stream_download(client, url, dest)
-            if result:
-                ref.pdf_path = filename
-                return filename
+            try:
+                target_url = f"https://doi.org/{ref.doi}"
+                url = f"{proxy_url}{target_url}"
+                result = await _stream_download(client, url, dest)
+                if result:
+                    ref.pdf_path = filename
+                    return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using DOI Proxy: %s", e)
+                temporary_failure = True
 
         # Strategy 7: Sci-Hub (with rate limiting to avoid bans)
         if ref.doi:
-            scihub_result = await _scihub_lookup(client, ref.doi, dest)
-            if scihub_result:
-                ref.pdf_path = filename
-                return filename
+            try:
+                scihub_result = await _scihub_lookup(client, ref.doi, dest)
+                if scihub_result:
+                    ref.pdf_path = filename
+                    return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using Sci-Hub: %s", e)
+                temporary_failure = True
 
         # Strategy 8: Anna's Archive (last resort, rate-limited)
-        annas_result = await _annas_archive_lookup(client, ref, dest)
-        if annas_result:
-            ref.pdf_path = filename
-            return filename
+        try:
+            annas_result = await _annas_archive_lookup(client, ref, dest)
+            if annas_result:
+                ref.pdf_path = filename
+                return filename
+        except TemporaryDownloadError as e:
+            logger.info("Temporary failure using Anna's Archive: %s", e)
+            temporary_failure = True
 
+        # Strategy 9: Web Search Fallback (DuckDuckGo Lite for direct PDF links)
+        try:
+            ddg_result = await _ddg_pdf_search(client, ref, dest)
+            if ddg_result:
+                ref.pdf_path = filename
+                return filename
+        except TemporaryDownloadError as e:
+            logger.info("Temporary failure using DuckDuckGo: %s", e)
+            temporary_failure = True
+
+        # Record miss even when temporary failures happened — the entry_hash
+        # changes if enrichment adds an oa_url/doi, making the ref eligible
+        # again.  Without this, refs where gray sources (Sci-Hub/CORE/Anna's)
+        # are all dead get re-attempted every sweep forever.
+        if _rid:
+            _router.record_attempt(_rid, "pdf", _eh, "miss")
+        if temporary_failure:
+            logger.info("All strategies exhausted (some had temporary failures) for ref: %s", _rid)
         return None
     except Exception as exc:
         logger.warning("PDF download failed for %s: %s", ref.doi or ref.title, exc)
@@ -322,53 +411,119 @@ async def _stream_download(
     client: httpx.AsyncClient,
     url: str,
     dest: Path,
+    follow_html_links: bool = True,
 ) -> bool:
     """Stream-download a URL to *dest*.  Returns True on success.
 
     Uses chunked streaming (64 KB) so large PDFs are never fully buffered.
     Cleans up partial files on failure.
+    
+    If follow_html_links is True and the URL returns HTML, attempts to parse
+    and download candidate PDF links from the page.
     """
+    html_content = None
     try:
         async with network_slot("pdf_stream", bucket=bucket_from_url(url), min_interval=0.05):
             async with client.stream("GET", url, timeout=25.0) as resp:
+                if resp.status_code in (429, 503, 504):
+                    raise TemporaryDownloadError(f"HTTP {resp.status_code} rate limit/server error during stream download")
                 if resp.status_code != 200:
                     return False
                 content_type = resp.headers.get("content-type", "")
-                if "pdf" not in content_type.lower() and not url.lower().endswith(".pdf"):
-                    return False
+                
+                # Check if it's HTML
+                if "html" in content_type.lower() or "text/xml" in content_type.lower():
+                    if not follow_html_links:
+                        return False
+                    body_bytes = await resp.aread()
+                    html_content = body_bytes.decode("utf-8", errors="ignore")
+                else:
+                    is_pdf = "pdf" in content_type.lower() or url.lower().endswith(".pdf")
+                    bytes_written = 0
+                    is_first_chunk = True
+                    with dest.open("wb") as fh:
+                        async for chunk in resp.aiter_bytes(65536):
+                            if is_first_chunk:
+                                is_first_chunk = False
+                                # Validate PDF magic bytes if not explicitly labeled as PDF
+                                if not is_pdf:
+                                    if chunk.startswith(b"%PDF"):
+                                        is_pdf = True
+                                    else:
+                                        break
+                            fh.write(chunk)
+                            bytes_written += len(chunk)
 
-                bytes_written = 0
-                with dest.open("wb") as fh:
-                    async for chunk in resp.aiter_bytes(65536):
-                        fh.write(chunk)
-                        bytes_written += len(chunk)
-
-        if bytes_written < 1024:
-            dest.unlink(missing_ok=True)
-            return False
-        return True
+                    if not is_pdf or bytes_written < 1024:
+                        dest.unlink(missing_ok=True)
+                        return False
+                    return True
+    except TemporaryDownloadError:
+        dest.unlink(missing_ok=True)
+        raise
+    except httpx.RequestError as exc:
+        dest.unlink(missing_ok=True)
+        raise TemporaryDownloadError(f"Request error during stream download: {exc}")
     except Exception:
         dest.unlink(missing_ok=True)
         return False
+
+    # If we got HTML content, parse and follow links outside the lock
+    if html_content:
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
+        soup = BeautifulSoup(html_content, "html.parser")
+        candidates = []
+        
+        # 1. citation_pdf_url meta tags
+        for meta in soup.find_all("meta", attrs={"name": "citation_pdf_url"}):
+            if meta.get("content"):
+                candidates.append(meta["content"])
+                
+        # 2. regular links
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            href_lower = href.lower()
+            text_lower = a.get_text(strip=True).lower()
+            if ".pdf" in href_lower or "pdf" in text_lower or "download" in text_lower:
+                candidates.append(href)
+                
+        seen = set()
+        resolved_candidates = []
+        for c in candidates:
+            full_url = urljoin(url, c)
+            if full_url not in seen and full_url.startswith("http"):
+                seen.add(full_url)
+                resolved_candidates.append(full_url)
+                
+        for cand_url in resolved_candidates[:5]:
+            try:
+                # Attempt to download the candidate (do not follow nested HTML pages)
+                if await _stream_download(client, cand_url, dest, follow_html_links=False):
+                    return True
+            except Exception:
+                pass
+                
+    return False
 
 
 async def _unpaywall_lookup(
     client: httpx.AsyncClient, doi: str, email: str
 ) -> Optional[str]:
-    """Query Unpaywall for the best OA PDF URL."""
-    global _unpaywall_last_time
-    async with _unpaywall_lock:
-        elapsed = time.monotonic() - _unpaywall_last_time
-        sleep_for = max(0.0, 0.25 - elapsed)
-        _unpaywall_last_time = time.monotonic() + sleep_for
-    if sleep_for > 0:
-        await asyncio.sleep(sleep_for)
+    """Query Unpaywall for the best OA PDF URL (metered by the master router)."""
+    from .api_router import get_router
+    router = get_router()
+    if not await router.acquire("unpaywall", max_wait=15.0):
+        raise TemporaryDownloadError("Unpaywall lock timeout")
     try:
-        async with network_slot("pdf_lookup", bucket="unpaywall", min_interval=0.25):
+        async with network_slot("pdf_lookup", bucket="unpaywall"):
             resp = await client.get(
                 f"https://api.unpaywall.org/v2/{doi}",
                 params={"email": email},
             )
+        router.report("unpaywall", resp.status_code, ok=(resp.status_code == 200))
+        if resp.status_code in (429, 503, 504):
+            raise TemporaryDownloadError(f"Unpaywall HTTP {resp.status_code} rate limit/server error")
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -376,21 +531,23 @@ async def _unpaywall_lookup(
             return None
         best = data.get("best_oa_location") or {}
         return best.get("url_for_pdf") or best.get("url") or None
+    except TemporaryDownloadError:
+        raise
+    except httpx.RequestError as exc:
+        router.report("unpaywall", None, ok=False)
+        raise TemporaryDownloadError(f"Unpaywall request error: {exc}")
     except Exception:
+        router.report("unpaywall", None, ok=False)
         return None
 
 
 async def _s2_oa_lookup(
     client: httpx.AsyncClient, ref: Reference, cfg
 ) -> Optional[str]:
-    """Query Semantic Scholar for the openAccessPdf link."""
-    global _s2_last_time
-    async with _s2_lock:
-        elapsed = time.monotonic() - _s2_last_time
-        sleep_for = max(0.0, 1.05 - elapsed)
-        _s2_last_time = time.monotonic() + sleep_for
-    if sleep_for > 0:
-        await asyncio.sleep(sleep_for)
+    """Query Semantic Scholar for the openAccessPdf link (shares the S2 budget
+    with enrichment via the master router, so PDF can't exhaust S2 on its own)."""
+    from .api_router import get_router
+    router = get_router()
     try:
         s2_id = None
         if ref.doi:
@@ -401,6 +558,8 @@ async def _s2_oa_lookup(
             s2_id = f"PMID:{ref.pmid}"
         if not s2_id:
             return None
+        if not await router.acquire("semantic_scholar", max_wait=15.0):
+            raise TemporaryDownloadError("Semantic Scholar lock timeout")
 
         headers = {}
         if cfg.semantic_scholar_api_key:
@@ -414,6 +573,9 @@ async def _s2_oa_lookup(
                 headers=headers,
                 timeout=8.0,
             )
+        router.report("semantic_scholar", resp.status_code, ok=(resp.status_code == 200))
+        if resp.status_code in (429, 503, 504):
+            raise TemporaryDownloadError(f"Semantic Scholar HTTP {resp.status_code} rate limit/server error")
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -422,6 +584,10 @@ async def _s2_oa_lookup(
         if url and url.startswith("http"):
             return url
         return None
+    except TemporaryDownloadError:
+        raise
+    except httpx.RequestError as exc:
+        raise TemporaryDownloadError(f"Semantic Scholar request error: {exc}")
     except Exception:
         return None
 
@@ -429,30 +595,24 @@ async def _s2_oa_lookup(
 async def _core_lookup(
     client: httpx.AsyncClient, ref: Reference
 ) -> Optional[str]:
-    """Query CORE.ac.uk for a free full-text PDF link.
+    """Query CORE.ac.uk for a free full-text PDF link (metered by master router).
 
-    CORE provides free API access without a key for moderate usage.
+    CORE's free tier is tiny and 429s aggressively — the router caps it hard
+    (6/min, 900/day) and cools it down on every denial so it can never become
+    the daemon-stalling 900s-backoff sink it used to be.
     """
-    global _core_last_time, _core_cooldown_until
-    # Skip entirely while CORE is in a 429-cooldown — don't waste a request slot.
-    if time.monotonic() < _core_cooldown_until:
+    from .api_router import get_router
+    router = get_router()
+    query = None
+    if ref.doi:
+        query = f'doi:"{ref.doi}"'
+    elif ref.title and len(ref.title) > 15:
+        query = f'title:"{ref.title}"'
+    if not query:
         return None
-    async with _core_lock:
-        elapsed = time.monotonic() - _core_last_time
-        sleep_for = max(0.0, 1.5 - elapsed)
-        _core_last_time = time.monotonic() + sleep_for
-    if sleep_for > 0:
-        await asyncio.sleep(sleep_for)
+    if not await router.acquire("core", max_wait=10.0):
+        raise TemporaryDownloadError("CORE lock timeout")
     try:
-        query = None
-        if ref.doi:
-            query = f'doi:"{ref.doi}"'
-        elif ref.title and len(ref.title) > 15:
-            # Use title search — quote for exact match
-            query = f'title:"{ref.title}"'
-        if not query:
-            return None
-
         async with network_slot("pdf_lookup", bucket="core", min_interval=2.0):
             resp = await client.get(
                 f"{_CORE_BASE}/search/works",
@@ -460,11 +620,9 @@ async def _core_lookup(
                 headers={"Accept": "application/json"},
                 timeout=8.0,
             )
-        if resp.status_code == 429:
-            # CORE quota hit — park it for 15 min so the pool stops flooding it.
-            _core_cooldown_until = time.monotonic() + 900.0
-            logger.info("CORE.ac.uk 429 — cooling down 15 min")
-            return None
+        router.report("core", resp.status_code, ok=(resp.status_code == 200))
+        if resp.status_code in (429, 503, 504):
+            raise TemporaryDownloadError(f"CORE HTTP {resp.status_code} rate limit/server error")
         if resp.status_code != 200:
             return None
 
@@ -472,15 +630,18 @@ async def _core_lookup(
         for result in results:
             download_url = result.get("downloadUrl")
             if download_url and download_url.startswith("http"):
-                await asyncio.sleep(_CORE_DELAY)
                 return download_url
-            # Try links array
             for link in result.get("links", []):
                 if link.get("type") == "download":
-                    await asyncio.sleep(_CORE_DELAY)
                     return link.get("url")
         return None
+    except TemporaryDownloadError:
+        raise
+    except httpx.RequestError as exc:
+        router.report("core", None, ok=False)
+        raise TemporaryDownloadError(f"CORE request error: {exc}")
     except Exception:
+        router.report("core", None, ok=False)
         return None
 
 
@@ -495,13 +656,20 @@ async def _scihub_lookup(
     global _active_scihub_mirror
     import asyncio
     import re
+    from .api_router import get_router
+    router = get_router()
 
     mirrors = _SCIHUB_MIRRORS
     if _active_scihub_mirror:
         mirrors = [_active_scihub_mirror] + [m for m in _SCIHUB_MIRRORS if m != _active_scihub_mirror]
 
+    had_temporary_error = False
+    temp_error_msg = ""
+
     for mirror in mirrors:
         request_succeeded = False
+        if not await router.acquire("scihub", max_wait=10.0):
+            raise TemporaryDownloadError("Sci-Hub lock timeout")
         try:
             # Sci-Hub serves the PDF directly at /{doi}
             async with network_slot("gray_source", bucket=bucket_from_url(mirror), min_interval=_SCIHUB_DELAY):
@@ -512,6 +680,12 @@ async def _scihub_lookup(
                 )
             request_succeeded = True
             _active_scihub_mirror = mirror
+            router.report("scihub", resp.status_code, ok=(resp.status_code == 200))
+
+            if resp.status_code in (429, 503, 504):
+                had_temporary_error = True
+                temp_error_msg = f"Sci-Hub HTTP {resp.status_code} on {mirror}"
+                continue
 
             if resp.status_code != 200:
                 continue
@@ -550,6 +724,12 @@ async def _scihub_lookup(
             if result:
                 return True
 
+        except TemporaryDownloadError:
+            raise
+        except httpx.RequestError as exc:
+            logger.debug("Sci-Hub mirror %s failed: %s", mirror, exc)
+            had_temporary_error = True
+            temp_error_msg = f"Sci-Hub connection error on {mirror}: {exc}"
         except Exception as e:
             logger.debug("Sci-Hub mirror %s failed: %s", mirror, e)
 
@@ -557,6 +737,8 @@ async def _scihub_lookup(
         if request_succeeded:
             await asyncio.sleep(_SCIHUB_DELAY)
 
+    if had_temporary_error:
+        raise TemporaryDownloadError(temp_error_msg)
     return False
 
 
@@ -565,94 +747,146 @@ async def _annas_archive_lookup(
 ) -> bool:
     """Try Anna's Archive to find a PDF download link.
 
-    Searches by DOI or ISBN, then follows the download chain.
+    Searches by DOI or ISBN, or falls back to title search.
     Rate-limited with 3s delays between attempts.
     """
     import asyncio
     import re
+    from bs4 import BeautifulSoup
+    from rapidfuzz import fuzz
 
-    search_query = None
+    # Set up search queries in priority order: strong identifiers first, then title fallback
+    queries = []
     if ref.doi:
-        search_query = ref.doi
-    elif ref.isbn:
-        search_query = ref.isbn
-    else:
-        # Title searches on Anna's Archive are too slow (noisy HTTP requests + 3s delay)
-        # for mass processing of Tier 4/5. Skip unless we have a strong identifier.
+        queries.append((ref.doi, True))
+    if ref.isbn:
+        queries.append((ref.isbn, True))
+    if ref.title and len(ref.title) > 10:
+        queries.append((ref.title, False))
+
+    if not queries:
         return False
 
     global _active_annas_mirror
+    from .api_router import get_router
+    router = get_router()
     mirrors = _ANNAS_MIRRORS
     if _active_annas_mirror:
         mirrors = [_active_annas_mirror] + [m for m in _ANNAS_MIRRORS if m != _active_annas_mirror]
 
+    had_temporary_error = False
+    temp_error_msg = ""
+
     for mirror in mirrors:
-        request_succeeded = False
-        try:
-            # Search for the paper (omit content=book_any to support articles/journals)
-            async with network_slot("gray_source", bucket=bucket_from_url(mirror), min_interval=_ANNAS_DELAY):
-                resp = await client.get(
-                    f"{mirror}/search",
-                    params={"q": search_query, "ext": "pdf"},
-                    timeout=10.0,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-                )
-            request_succeeded = True
-            _active_annas_mirror = mirror
+        for search_query, is_identifier in queries:
+            request_succeeded = False
+            if not await router.acquire("annas", max_wait=10.0):
+                raise TemporaryDownloadError("Anna's Archive lock timeout")
+            try:
+                # Search for the paper (omit content=book_any to support articles/journals)
+                async with network_slot("gray_source", bucket=bucket_from_url(mirror), min_interval=_ANNAS_DELAY):
+                    resp = await client.get(
+                        f"{mirror}/search",
+                        params={"q": search_query, "ext": "pdf"},
+                        timeout=12.0,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                    )
+                request_succeeded = True
+                _active_annas_mirror = mirror
 
-            if resp.status_code != 200:
-                continue
+                if resp.status_code in (429, 503, 504):
+                    had_temporary_error = True
+                    temp_error_msg = f"Anna's Archive HTTP {resp.status_code} on {mirror}"
+                    continue
+                if resp.status_code != 200:
+                    continue
 
-            html = resp.text
+                html = resp.text
+                soup = BeautifulSoup(html, "html.parser")
+                
+                # Find all md5 result links and their texts
+                results_found = []
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    # Matches /md5/ followed by 32 hex chars
+                    if re.match(r'^/md5/[a-fA-F0-9]{32}$', href):
+                        title_text = a.get_text(strip=True)
+                        results_found.append((href, title_text))
 
-            # Parse result links — Anna's Archive uses /md5/ paths
-            md5_links = re.findall(
-                r'href="(/md5/[a-fA-F0-9]{32})"',
-                html
-            )
+                if not results_found:
+                    continue
 
-            if not md5_links:
-                continue
+                # Find the best match
+                best_href = None
+                if is_identifier:
+                    # If we have a strong identifier, take the first link
+                    best_href = results_found[0][0]
+                else:
+                    # If searching by title, verify that it's a good match
+                    target_title = ref.title.lower()
+                    for href, result_title in results_found:
+                        res_title_clean = result_title.lower()
+                        # Calculate similarity score
+                        score = fuzz.ratio(target_title, res_title_clean)
+                        partial_score = fuzz.partial_ratio(target_title, res_title_clean)
+                        if score >= 80 or partial_score >= 90:
+                            best_href = href
+                            break
 
-            # Follow the first result to get the download page
-            detail_url = f"{mirror}{md5_links[0]}"
-            await asyncio.sleep(_ANNAS_DELAY)
+                if not best_href:
+                    continue
 
-            async with network_slot("gray_source", bucket=bucket_from_url(detail_url), min_interval=_ANNAS_DELAY):
-                resp2 = await client.get(
-                    detail_url,
-                    timeout=10.0,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-                )
+                # Follow the md5 link to get the download page
+                detail_url = f"{mirror}{best_href}"
+                await asyncio.sleep(_ANNAS_DELAY)
 
-            if resp2.status_code != 200:
-                continue
+                async with network_slot("gray_source", bucket=bucket_from_url(detail_url), min_interval=_ANNAS_DELAY):
+                    resp2 = await client.get(
+                        detail_url,
+                        timeout=12.0,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                    )
 
-            # Look for direct download links (various mirrors)
-            download_links = re.findall(
-                r'href="(https?://[^"]+)"[^>]*>\s*(?:.*?(?:download|Libgen|fast|slow|partner|IPFS|gateway|option|sci-hub|z-library))',
-                resp2.text, re.I
-            )
-            
-            if not download_links:
-                # Fallback to parsing all external download subdomain links
+                if resp2.status_code in (429, 503, 504):
+                    had_temporary_error = True
+                    temp_error_msg = f"Anna's Archive detail page HTTP {resp2.status_code} on {mirror}"
+                    continue
+                if resp2.status_code != 200:
+                    continue
+
+                # Look for direct download links (various mirrors)
                 download_links = re.findall(
-                    r'href="(https?://[^"]+(?:ipfs|libgen|scihub|sci-hub|annas|pinata|cloudflare|gateway|download|get\.php)[^"]*)"',
+                    r'href="(https?://[^"]+)"[^>]*>\s*(?:.*?(?:download|Libgen|fast|slow|partner|IPFS|gateway|option|sci-hub|z-library))',
                     resp2.text, re.I
                 )
+                
+                if not download_links:
+                    # Fallback to parsing all external download subdomain links
+                    download_links = re.findall(
+                        r'href="(https?://[^"]+(?:ipfs|libgen|scihub|sci-hub|annas|pinata|cloudflare|gateway|download|get\.php)[^"]*)"',
+                        resp2.text, re.I
+                    )
 
-            for dl_link in download_links[:3]:  # try first 3 download options
-                result = await _stream_download(client, dl_link, dest)
-                if result:
-                    return True
-                await asyncio.sleep(1.0)
+                for dl_link in download_links[:3]:  # try first 3 download options
+                    result = await _stream_download(client, dl_link, dest)
+                    if result:
+                        return True
+                    await asyncio.sleep(1.0)
 
-        except Exception as e:
-            logger.debug("Anna's Archive mirror %s failed: %s", mirror, e)
+            except TemporaryDownloadError:
+                raise
+            except httpx.RequestError as exc:
+                logger.debug("Anna's Archive mirror %s query failed: %s", mirror, exc)
+                had_temporary_error = True
+                temp_error_msg = f"Anna's Archive connection error on {mirror}: {exc}"
+            except Exception as e:
+                logger.debug("Anna's Archive mirror %s failed: %s", mirror, e)
 
-        if request_succeeded:
-            await asyncio.sleep(_ANNAS_DELAY)
+            if request_succeeded:
+                await asyncio.sleep(_ANNAS_DELAY)
 
+    if had_temporary_error:
+        raise TemporaryDownloadError(temp_error_msg)
     return False
 
 
@@ -872,3 +1106,89 @@ def _drive_cache_write(drive_id: str, data: bytes, config) -> Path:
     except Exception:
         pass
     return path
+
+
+async def _ddg_pdf_search(
+    client: httpx.AsyncClient, ref: Reference, dest: Path
+) -> bool:
+    """Search DuckDuckGo Lite for the paper title to find direct PDF download links."""
+    from .web_search import _search_duckduckgo
+    from .api_router import get_router
+    from rapidfuzz import fuzz
+    import json
+    
+    router = get_router()
+
+    if not ref.title or len(ref.title) < 10:
+        return False
+
+    # Try both quoted search and unquoted fallback search
+    clean_title = ref.title.strip().replace('"', '')
+    
+    # 1. Quoted search query
+    quoted_query = f'"{clean_title}" filetype:pdf'
+    if ref.authors:
+        try:
+            authors_data = json.loads(ref.authors) if isinstance(ref.authors, str) else ref.authors
+            if authors_data and isinstance(authors_data, list):
+                family = authors_data[0].get("family", "")
+                if family:
+                    quoted_query = f'"{clean_title}" {family} filetype:pdf'
+        except Exception:
+            pass
+
+    # 2. Unquoted fallback query
+    unquoted_query = f'{clean_title} filetype:pdf'
+    if ref.authors:
+        try:
+            authors_data = json.loads(ref.authors) if isinstance(ref.authors, str) else ref.authors
+            if authors_data and isinstance(authors_data, list):
+                family = authors_data[0].get("family", "")
+                if family:
+                    unquoted_query = f'{clean_title} {family} filetype:pdf'
+        except Exception:
+            pass
+
+    # We will try both queries
+    for query, is_quoted in [(quoted_query, True), (unquoted_query, False)]:
+        if not await router.acquire("duckduckgo", max_wait=60.0):
+            raise TemporaryDownloadError("DuckDuckGo lock acquisition timeout")
+            
+        logger.info("DDG PDF Search: searching for '%s'", query)
+        try:
+            results = await _search_duckduckgo(query, client, max_results=5)
+            if not results:
+                continue
+                
+            for res in results:
+                url = res.get("url", "")
+                res_title = res.get("title", "")
+                if not url:
+                    continue
+                
+                # Check similarity if it's an unquoted search or for extra safety
+                if res_title and ref.title:
+                    target_title_lower = ref.title.lower()
+                    res_title_lower = res_title.lower()
+                    score = fuzz.ratio(target_title_lower, res_title_lower)
+                    partial_score = fuzz.partial_ratio(target_title_lower, res_title_lower)
+                    if score < 75 and partial_score < 85:
+                        logger.debug("DDG PDF Search: skipping '%s' due to low similarity (ratio: %d, partial: %d)", res_title, score, partial_score)
+                        continue
+
+                # Verify it looks like a direct PDF link
+                if url.lower().endswith(".pdf") or "pdf" in url.lower():
+                    # Try streaming the download
+                    success = await _stream_download(client, url, dest)
+                    if success:
+                        logger.info("DDG PDF Search SUCCESS: found and downloaded PDF from %s", url)
+                        return True
+                    await asyncio.sleep(1.0)
+        except TemporaryDownloadError:
+            raise
+        except Exception as err:
+            logger.warning("DDG PDF Search failed: %s", err)
+            if isinstance(err, (httpx.RequestError, httpx.HTTPStatusError)):
+                raise TemporaryDownloadError(f"DuckDuckGo request error: {err}")
+    return False
+

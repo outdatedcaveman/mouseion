@@ -12,7 +12,9 @@ Follows the same threading pattern as enrich_daemon.py.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+import shutil
 import tempfile
 import threading
 import time
@@ -21,6 +23,16 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("mouseion.sync_daemon")
+
+DB_BACKUP_INTERVAL_SECONDS = max(
+    3600, int(os.environ.get("MOUSEION_DB_BACKUP_INTERVAL_SECONDS", "86400"))
+)
+DB_BACKUP_MIN_FREE_GB = float(
+    os.environ.get("MOUSEION_DB_BACKUP_MIN_FREE_GB", "15")
+)
+_BACKUP_STAGING_DIR = (
+    Path.home() / ".cache" / "mouseion" / "backup-staging"
+)
 
 # Daemon state
 _daemon_thread: Optional[threading.Thread] = None
@@ -50,6 +62,40 @@ def get_stats() -> dict:
 def _update_stats(**kwargs):
     with _stats_lock:
         _stats.update(kwargs)
+
+
+def _cleanup_stale_db_backups(max_age_seconds: int = 1800) -> int:
+    """Remove abandoned generated snapshots, never the canonical database."""
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    roots = {Path(tempfile.gettempdir()), _BACKUP_STAGING_DIR}
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.glob("mouseion_backup_*.db"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                logger.warning("Could not remove stale DB snapshot: %s", path)
+    if removed:
+        logger.info("Removed %d abandoned local DB snapshot(s)", removed)
+    return removed
+
+
+def _db_backup_due(db) -> bool:
+    raw = db.get_setting("drive_last_backup_time")
+    if not raw:
+        return True
+    try:
+        last = datetime.fromisoformat(raw)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - last).total_seconds()
+        return age >= DB_BACKUP_INTERVAL_SECONDS
+    except (TypeError, ValueError):
+        return True
 
 
 def is_running() -> bool:
@@ -103,6 +149,7 @@ def _daemon_loop():
 
     db = RefDatabase()
     cfg = get_config()
+    _cleanup_stale_db_backups()
 
     # Build Drive service once (reused across cycles)
     service = None
@@ -175,11 +222,28 @@ def _sync_db_backup(db, service, folders: dict):
     if not db_path.exists():
         return
 
+    _cleanup_stale_db_backups()
+    if not _db_backup_due(db):
+        return
+
+    free_gb = shutil.disk_usage(str(db_path.parent)).free / (1024 ** 3)
+    if free_gb < DB_BACKUP_MIN_FREE_GB:
+        logger.warning(
+            "DB backup deferred: %.1f GB free is below the %.1f GB floor",
+            free_gb,
+            DB_BACKUP_MIN_FREE_GB,
+        )
+        return
+
     # Use SQLite backup API for a consistent snapshot
-    tmp = None
+    tmp_path = None
     try:
+        _BACKUP_STAGING_DIR.mkdir(parents=True, exist_ok=True)
         tmp = tempfile.NamedTemporaryFile(
-            suffix=".db", prefix="mouseion_backup_", delete=False
+            suffix=".db",
+            prefix="mouseion_backup_",
+            dir=str(_BACKUP_STAGING_DIR),
+            delete=False,
         )
         tmp_path = Path(tmp.name)
         tmp.close()
@@ -206,11 +270,11 @@ def _sync_db_backup(db, service, folders: dict):
         logger.warning("DB backup failed: %s", e)
         raise
     finally:
-        if tmp:
+        if tmp_path is not None:
             try:
-                Path(tmp.name).unlink(missing_ok=True)
+                tmp_path.unlink(missing_ok=True)
             except Exception:
-                pass
+                logger.warning("Could not remove DB snapshot: %s", tmp_path)
 
 
 def _sync_pdfs(db, service, folders: dict, cfg):

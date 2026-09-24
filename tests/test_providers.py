@@ -488,6 +488,20 @@ class TestOpenAlexProvider:
         assert ref.open_access is True
         assert ref.oa_url == "https://example.com/pdf"
 
+    def test_parse_open_access_prefers_direct_pdf_location(self, provider):
+        work = _openalex_work(
+            is_oa=True,
+            oa_url="https://publisher.example/article",
+        )
+        work["locations"] = [
+            {"pdf_url": "https://repository.example/article.pdf"},
+        ]
+
+        ref = provider._parse_work(work)
+
+        assert ref.open_access is True
+        assert ref.oa_url == "https://repository.example/article.pdf"
+
     def test_parse_authors(self, provider):
         ref = provider._parse_work(_openalex_work())
         assert len(ref.authors) == 1

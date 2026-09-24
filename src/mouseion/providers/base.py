@@ -379,125 +379,73 @@ class BaseProvider(ABC):
         bulk jobs respect per-provider daily/hourly budgets.
         """
         from ..cache import get_default_cache
-        from ..quota import get_default_quota_manager
+        from ..api_router import get_router
+        from ..network_budget import network_slot
         cache = get_default_cache()
-        quota = get_default_quota_manager()
+        router = get_router()
 
-        cooldown_until = cache.get_cooldown(self.name)
-        if cooldown_until and time.time() < cooldown_until:
-            return None
+        # Serve from the response cache without consuming any budget.
+        cached = cache.get_http(self.name, url, params)
+        if cached is not None:
+            headers = dict(cached.get("headers") or {})
+            # Strip compression and length headers because content in cache is already decompressed
+            for h in ("content-encoding", "content-length", "transfer-encoding"):
+                headers.pop(h, None)
+                headers.pop(h.upper(), None)
+                headers.pop(h.title(), None)
+            return httpx.Response(
+                status_code=int(cached.get("status_code", 200)),
+                headers=headers,
+                content=cached.get("content") or b"",
+                request=httpx.Request("GET", url),
+            )
 
-        # Circuit breaker: if we've seen too many consecutive errors, skip
-        if self._circuit_open_until > 0:
-            if time.monotonic() < self._circuit_open_until:
-                return None  # circuit open — skip silently
-            # Circuit half-open: allow one request through
-            self._circuit_open_until = 0.0
+        for attempt in range(max_retries + 1):
+            # MASTER ROUTER gate: one authoritative place that enforces this
+            # API's per-minute rate, persisted daily budget, and adaptive
+            # cooldown. If it can't be served within a short wait (API cooling
+            # after a 429, or its daily budget is spent), SKIP — returning None
+            # without recording an attempt, so the entry can try it again once
+            # the API recovers. This is what prevents quota exhaustion / shutdowns.
+            if not await router.acquire(self.name, max_wait=12.0):
+                return None
 
-        # Quota check happens *before* the semaphore so we don't hold a
-        # concurrency slot while waiting for the budget to clear.
-        async with quota.acquire(self.name):
-            for attempt in range(max_retries + 1):
-                # Re-check cooldown and circuit breaker before acquiring the semaphore
-                cooldown_until = cache.get_cooldown(self.name)
-                if cooldown_until and time.time() < cooldown_until:
-                    return None
-                if self._circuit_open_until > 0 and time.monotonic() < self._circuit_open_until:
-                    return None
+            async with self._semaphore:
+                try:
+                    async with network_slot("metadata", bucket=self.name):
+                        resp = await client.get(url, params=params, headers=headers or {})
 
-                async with self._semaphore:
-                    # Enforce minimum interval between requests.
-                    # IMPORTANT: claim the next time slot atomically while
-                    # holding the lock, then sleep *outside* the lock so
-                    # other waiters can claim their own slots concurrently
-                    # (they just get pushed further into the future).
-                    # This prevents the lock from being held for the entire
-                    # sleep duration, which would force all waiters to
-                    # queue up sequentially behind each sleep.
-                    if self._min_interval > 0:
-                        async with self._rate_lock:
-                            elapsed = time.monotonic() - self._last_request_time
-                            sleep_for = max(0.0, self._min_interval - elapsed)
-                            # Advance the "next available slot" timestamp so the
-                            # next waiter queues up 1 interval after us.
-                            self._last_request_time = time.monotonic() + sleep_for
-                        if sleep_for > 0:
-                            await asyncio.sleep(sleep_for)
-
-                    # Re-check cooldown and circuit breaker inside the semaphore
-                    cooldown_until = cache.get_cooldown(self.name)
-                    if cooldown_until and time.time() < cooldown_until:
-                        return None
-                    if self._circuit_open_until > 0 and time.monotonic() < self._circuit_open_until:
+                    if resp.status_code in (404, 410):
+                        router.report(self.name, resp.status_code, ok=True)  # clean miss, not a failure
+                        cache.set_http(self.name, url, params, resp.status_code, dict(resp.headers), resp.content, ttl=24 * 3600)
                         return None
 
-                    try:
-                        cached = cache.get_http(self.name, url, params)
-                        if cached is not None:
-                            return httpx.Response(
-                                status_code=int(cached.get("status_code", 200)),
-                                headers=cached.get("headers") or {},
-                                content=cached.get("content") or b"",
-                                request=httpx.Request("GET", url),
-                            )
+                    if resp.status_code in (429, 403):
+                        # Feed the real denial back so the router cools this API
+                        # down for everyone (enrichment + PDF share it).
+                        router.report(self.name, resp.status_code, ok=False)
+                        return None
 
-                        from ..network_budget import network_slot
-                        async with network_slot(
-                            "metadata",
-                            bucket=self.name,
-                            min_interval=max(0.0, self._min_interval * 0.5),
-                        ):
-                            resp = await client.get(url, params=params, headers=headers or {})
-                        if self._min_interval <= 0:
-                            self._last_request_time = time.monotonic()
+                    if resp.status_code in (500, 502, 503, 504) and attempt < max_retries:
+                        router.report(self.name, resp.status_code, ok=False)
+                        await asyncio.sleep(2 ** attempt)
+                        continue
 
-                        if resp.status_code in (404, 410):
-                            self._consecutive_429s = 0
-                            cache.set_http(self.name, url, params, resp.status_code, dict(resp.headers), resp.content, ttl=24 * 3600)
-                            return None  # permanent miss
+                    resp.raise_for_status()
+                    router.report(self.name, resp.status_code, ok=True)
+                    if resp.status_code == 200:
+                        cache.set_http(self.name, url, params, resp.status_code, dict(resp.headers), resp.content)
+                    return resp
 
-                        if resp.status_code == 429:
-                            self._consecutive_429s += 1
-                            try:
-                                retry_after = float(resp.headers.get("Retry-After", 60.0))
-                            except (TypeError, ValueError):
-                                retry_after = 60.0
-                            cache.set_cooldown(self.name, time.time() + min(max(retry_after, 60.0), 900.0))
-                            if self._consecutive_429s >= 3:
-                                # Open circuit for 60s after 3 consecutive 429s
-                                backoff = min(60 * self._consecutive_429s, 300)
-                                self._circuit_open_until = time.monotonic() + backoff
-                                cache.set_cooldown(self.name, time.time() + backoff)
-                            return None  # return None immediately on 429
-
-                        if resp.status_code in (500, 502, 503, 504) and attempt < max_retries:
-                            # We break out of semaphore context to sleep outside
-                            pass
-                        else:
-                            resp.raise_for_status()
-                            self._consecutive_429s = 0
-                            if resp.status_code == 200:
-                                cache.set_http(self.name, url, params, resp.status_code, dict(resp.headers), resp.content)
-                            return resp
-
-                    except httpx.HTTPStatusError:
-                        if attempt >= max_retries:
-                            return None
-                    except httpx.RequestError:
-                        # Count network errors (timeouts, connection refused, etc.)
-                        # toward the circuit breaker so a flaky/down provider
-                        # doesn't stall the daemon for 20+ minutes.
-                        self._consecutive_429s += 1
-                        if self._consecutive_429s >= 5:
-                            backoff = min(30 * self._consecutive_429s, 180)
-                            self._circuit_open_until = time.monotonic() + backoff
-                            cache.set_cooldown(self.name, time.time() + backoff)
-                            return None
-                        if attempt >= max_retries:
-                            return None
-
-                # Sleep outside the semaphore context for 5xx/network errors
-                await asyncio.sleep(2 ** attempt)
+                except httpx.HTTPStatusError as exc:
+                    router.report(self.name, exc.response.status_code if exc.response else 500, ok=False)
+                    if attempt >= max_retries:
+                        return None
+                except httpx.RequestError:
+                    router.report(self.name, None, ok=False)
+                    if attempt >= max_retries:
+                        return None
+                    await asyncio.sleep(2 ** attempt)
         return None
 
     # -----------------------------------------------------------------------

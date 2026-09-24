@@ -78,6 +78,22 @@ def _clean_ref_ids(refs: List[Reference]) -> None:
             doi = re.sub(r'^https?://doi\.org/', '', doi)
             doi = re.sub(r'^doi:', '', doi, flags=re.I)
 
+            # Split and resolve multiple DOIs / spaces
+            if ' ' in doi:
+                parts = [p.strip() for p in doi.split() if p.strip()]
+                for p in parts:
+                    p_clean = re.sub(r'^https?://doi\.org/', '', p)
+                    p_clean = re.sub(r'^doi:', '', p_clean, flags=re.I)
+                    if p_clean.startswith('10.'):
+                        doi = p_clean
+                        break
+                else:
+                    ref.doi = None
+                    continue
+
+            # Remove backslashes, double quotes, single quotes, and pipes
+            doi = doi.replace('\\', '').replace('"', '').replace("'", "").replace('|', '')
+
             # Remove fragments and query strings
             doi = doi.split('#')[0]
             doi = doi.split('?')[0]

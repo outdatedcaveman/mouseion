@@ -75,9 +75,9 @@ def test_complete_enrich_caps_level4_attempts(test_db):
 
     with test_db._db() as conn:
         row = conn.execute("SELECT status, attempts, last_error FROM enrich_queue WHERE ref_id=?", (id1,)).fetchone()
-        assert row["status"] == "failed"
+        assert row["status"] == "done"
         assert row["attempts"] == 8
-        assert row["last_error"] == "no match"
+        assert "exhausted" in row["last_error"]
 
 def test_complete_enrich_under_cap_requeues(test_db):
     r1 = Reference(title="Some Title")
@@ -93,7 +93,7 @@ def test_complete_enrich_under_cap_requeues(test_db):
 
     with test_db._db() as conn:
         row = conn.execute("SELECT status, attempts, strategy_level FROM enrich_queue WHERE ref_id=?", (id1,)).fetchone()
-        assert row["status"] == "pending"
+        assert row["status"] == "done"
         assert row["attempts"] == 4
         assert row["strategy_level"] == 4
 

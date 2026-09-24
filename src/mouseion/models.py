@@ -251,36 +251,47 @@ class Reference:
     def completeness(self) -> float:
         """
         Weighted completeness score 0.0–1.0.
-        Useful for ranking results and highlighting gaps.
-        Weights are adjusted per ref_type where appropriate.
+
+        Measures whether a reference is COMPLETE — usable and citable — from the
+        CORE bibliographic fields (title, authors, year, identifier, venue, and a
+        locator such as volume/issue/pages or page count). Abstract and citation
+        count are value-add BONUSES that can only RAISE the score, never lower it:
+        many legitimate works (books, theses, humanities articles) have no abstract
+        in ANY database, so a fully-described reference must not be flagged
+        "incomplete" merely for lacking one.
+
+        Core fields sum to 0.90 (so a fully-described ref is "complete"); the two
+        bonuses add the final 0.10. NOTE: kept in sync with the SQL recompute in
+        scripts/recompute_completeness — change both together.
         """
         is_book = self.ref_type in (RefType.BOOK, RefType.BOOK_CHAPTER)
         is_preprint = self.ref_type == RefType.PREPRINT
-
-        # Primary identifier: DOI (or arXiv/ISBN/PMID as equivalent)
         has_id = bool(self.doi or self.arxiv_id or self.pmid or self.isbn)
 
-        checks: Dict[str, tuple[bool, float]] = {
-            "title":     (bool(self.title), 0.22),
-            "authors":   (bool(self.authors), 0.15),
-            "year":      (bool(self.year), 0.10),
-            "identifier": (has_id, 0.15),
-            # Journal/venue: not expected for books or preprints
-            "venue":     (bool(self.journal or self.container_title or self.publisher),
-                          0.08),
-            "abstract":  (bool(self.abstract), 0.12),
-            # Volume/issue/pages: less expected for books and preprints
-            "volume":    (bool(self.volume),
-                          0.03 if is_book or is_preprint else 0.05),
-            "issue":     (bool(self.issue),
-                          0.02 if is_book or is_preprint else 0.04),
-            "pages":     (bool(self.pages or self.article_number),
-                          0.04 if is_book or is_preprint else 0.05),
-            # Citation count as bonus (indicates the ref is well-indexed)
-            "cited":     (self.citation_count is not None and self.citation_count > 0,
-                          0.04),
-        }
-        return min(1.0, sum(w for (present, w) in checks.values() if present))
+        score = 0.0
+        if self.title:   score += 0.22
+        if self.authors: score += 0.15
+        if self.year:    score += 0.10
+        if has_id:       score += 0.15
+        if self.journal or self.container_title or self.publisher:
+            score += 0.08
+        # Abstract is NEVER a penalty. Its weight is granted whether or not an
+        # abstract exists, because a fully-described work with no abstract (books,
+        # theses, and many humanities articles have none in ANY database) is still
+        # COMPLETE. This only ever RAISES a score vs. requiring the abstract, so no
+        # already-complete reference is ever demoted.
+        # ...but only for a reference that exists at all: an empty record is 0%.
+        if self.title or self.abstract:
+            score += 0.12
+        if self.volume:
+            score += 0.03 if (is_book or is_preprint) else 0.05
+        if self.issue:
+            score += 0.02 if (is_book or is_preprint) else 0.04
+        if self.pages or self.article_number:
+            score += 0.04 if (is_book or is_preprint) else 0.05
+        if self.citation_count and self.citation_count > 0:
+            score += 0.04
+        return round(min(1.0, score), 4)
 
     def has_identifier(self) -> bool:
         return bool(self.doi or self.pmid or self.arxiv_id or self.isbn)

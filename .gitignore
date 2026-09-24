@@ -32,3 +32,19 @@ client_secret*.json
 # build artifacts — ship via Releases, not the repo
 dist/
 *.exe
+
+# local run output, credentials probes and one-off scratch (never commit; repo is public)
+auth_*.txt
+err.txt
+out.txt
+help.txt
+*_err.log
+*_out.log
+*.err.log
+*.out.log
+pdf_status_logs.txt
+vpn_test_output.txt
+egon_context.json
+scratch_*.py
+old_builds/
+openconnect-gui/

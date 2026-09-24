@@ -16,6 +16,16 @@ import threading
 import time
 import socket
 from pathlib import Path
+from typing import Optional
+
+
+def _safe_print(*args, **kwargs):
+    """Print to stdout safely, ignoring errors if stdout is None or closed."""
+    try:
+        if sys.stdout is not None:
+            print(*args, **kwargs)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +167,152 @@ def _setup_crash_logging():
     return log_file
 
 
+def _is_server_responsive(port: int) -> bool:
+    """Check if the Mouseion server is responding on the given port."""
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1.0)
+        return True
+    except Exception:
+        return False
+
+
+def _check_existing_instances() -> Optional[int]:
+    """Check if there is a responsive instance running in the port range 7274-7284."""
+    for port in range(7274, 7285):
+        if _is_server_responsive(port):
+            return port
+    return None
+
+
+def _kill_process_on_port(port: int):
+    """Find and kill any process listening on the given port (Windows only)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import psutil
+        pids_to_kill = {
+            conn.pid
+            for conn in psutil.net_connections(kind="tcp")
+            if conn.pid
+            and conn.pid != os.getpid()
+            and conn.status == psutil.CONN_LISTEN
+            and conn.laddr.port == port
+        }
+        for pid in sorted(pids_to_kill):
+            logging.info("Killing process %d holding port %d", pid, port)
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except psutil.TimeoutExpired:
+                proc.kill()
+    except Exception as e:
+        logging.warning("Failed to kill process on port %d: %s", port, e)
+
+
+def _terminate_processes_by_name(names: set[str]) -> None:
+    """Terminate stale helper processes without spawning taskkill.exe."""
+    import psutil
+
+    current_pid = os.getpid()
+    targets = {
+        name.lower()
+        for name in names
+    }
+    victims = [
+        proc
+        for proc in psutil.process_iter(["pid", "name"])
+        if proc.info["pid"] != current_pid
+        and (proc.info["name"] or "").lower() in targets
+    ]
+    for proc in victims:
+        proc.terminate()
+    _, alive = psutil.wait_procs(victims, timeout=2)
+    for proc in alive:
+        proc.kill()
+
+
 def main():
     # Set up crash logging FIRST, before anything can fail
     log_file = _setup_crash_logging()
 
-    # Single-instance check
+    # Kill any other running Mouseion.exe processes first to ensure clean start and update
+    if sys.platform == "win32":
+        try:
+            _terminate_processes_by_name({
+                "Mouseion.exe",
+                "Mouseion.old.exe",
+                "openconnect.exe",
+                "FortiSSLVPNclient.exe",
+            })
+            # Also kill any other processes holding our ports 7274-7284 to clean up background zombies
+            for port in range(7274, 7285):
+                _kill_process_on_port(port)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    # If running elevated, clean up/unregister the scheduled task to prevent "running in the dark"
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import subprocess
+            if ctypes.windll.shell32.IsUserAnAdmin():
+                logging.info("Running elevated. Ensuring Scheduled Task 'MouseionServer' is unregistered/deleted...")
+                # Run PowerShell to delete the task if it exists
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", "Get-ScheduledTask -TaskName 'MouseionServer' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                logging.info("Scheduled Task 'MouseionServer' cleanup completed.")
+        except Exception as e:
+            logging.warning("Failed to unregister scheduled task: %s", e)
+
+    # Check if a responsive server is already running
+    existing_port = _check_existing_instances()
+    if existing_port is not None:
+        import ctypes
+        window_exists = False
+        if sys.platform == "win32":
+            window_exists = bool(ctypes.windll.user32.FindWindowW(None, "Mouseion"))
+        
+        if window_exists:
+            _focus_existing_window()
+            sys.exit(0)
+            
+        # No window exists, but server is running -> open a native webview window pointing to it
+        url = f"http://127.0.0.1:{existing_port}"
+        try:
+            import webview
+            window = webview.create_window(
+                "Mouseion",
+                url,
+                width=1280,
+                height=860,
+                min_size=(800, 500),
+                background_color='#0d0d12',
+            )
+            webview.start()
+            sys.exit(0)
+        except Exception as e:
+            logging.warning("Failed to open webview window for existing instance: %s. Falling back to browser.", e)
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:
+                pass
+            sys.exit(0)
+
+    # If no responsive server is running, kill any hung processes holding our ports
+    if sys.platform == "win32":
+        for port in range(7274, 7285):
+            _kill_process_on_port(port)
+        time.sleep(0.5)
+
+    # Single-instance check (retry after killing any hung processes)
     if not _acquire_instance_lock():
         _focus_existing_window()
         sys.exit(0)
@@ -191,11 +342,16 @@ def main():
     # Set the key on the app
     app.config["API_KEY"] = api_key
 
-    def _safe_print(*args, **kwargs):
-        try:
-            print(*args, **kwargs)
-        except OSError:
-            pass
+    # Port bind check to ensure only ONE instance runs system-wide
+    try:
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.bind(("127.0.0.1", port))
+        test_sock.close()
+    except OSError:
+        _safe_print(f"\n  Error: Port {port} is already in use by another instance.")
+        _safe_print("  Please make sure you only run one instance of Mouseion.")
+        logging.error("Server startup aborted: port %d already in use", port)
+        sys.exit(1)
 
     _safe_print(f"\n  Mouseion is starting...")
     _safe_print(f"  Port     ->  {port}")
@@ -274,6 +430,23 @@ def main():
 
     # Try to open a native desktop window; fall back to browser if pywebview
     # is not available (e.g. missing system dependencies)
+    _window_loaded = False
+
+    def _on_loaded():
+        nonlocal _window_loaded
+        _window_loaded = True
+        logging.info("Webview window loaded successfully.")
+
+    def _webview_watchdog():
+        time.sleep(8.0)
+        if not _window_loaded:
+            logging.warning("Webview window failed to load in 8 seconds. Opening in browser as fallback.")
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:
+                logging.exception("Failed to open fallback browser")
+
     try:
         import webview
         window = webview.create_window(
@@ -284,6 +457,11 @@ def main():
             min_size=(800, 500),
             background_color='#0d0d12',
         )
+        window.events.loaded += _on_loaded
+
+        # Start the watchdog thread to open browser if the window hangs/fails to show
+        threading.Thread(target=_webview_watchdog, daemon=True, name="webview-watchdog").start()
+
         webview.start()
     except ImportError:
         _safe_print(f"  pywebview not available — opening in browser")

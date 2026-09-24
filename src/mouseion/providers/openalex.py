@@ -44,8 +44,10 @@ class OpenAlexProvider(BaseProvider):
         # OpenAlex limits are generous for direct lookups, but search batches
         # can trigger throttling if several refs fan out at once.
         if self._api_key or self._email:
-            self._max_concurrent = 4
-            self._min_interval = 0.25  # ~4 req/s
+            # Polite pool allows ~10 req/s; run wider since OpenAlex is the
+            # highest-coverage matcher. 8 concurrent @ ~8 req/s stays under cap.
+            self._max_concurrent = 8
+            self._min_interval = 0.12  # ~8 req/s
         else:
             self._max_concurrent = 2
             self._min_interval = 0.5
@@ -143,8 +145,16 @@ class OpenAlexProvider(BaseProvider):
 
         # --- Open access ---
         oa = data.get("open_access") or {}
-        ref.open_access = oa.get("is_oa") or False
-        ref.oa_url = oa.get("oa_url") or None
+        locations = data.get("locations") or []
+        direct_pdf = primary_loc.get("pdf_url") or next(
+            (loc.get("pdf_url") for loc in locations if loc.get("pdf_url")),
+            None,
+        )
+        ref.open_access = bool(oa.get("is_oa") or direct_pdf)
+        # The aggregate open_access.oa_url is often a publisher landing page.
+        # Prefer OpenAlex's validated direct PDF locations so the OA PDF batch
+        # does not repeatedly download HTML and reject it as a miss.
+        ref.oa_url = direct_pdf or oa.get("oa_url") or None
 
         # --- Citation count ---
         ref.citation_count = data.get("cited_by_count") or None

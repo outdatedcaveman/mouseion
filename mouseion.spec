@@ -184,4 +184,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='mouseion.ico',
+    uac_admin=True,
 )
