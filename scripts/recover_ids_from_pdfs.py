@@ -327,6 +327,60 @@ def _crossref_record(doi: str):
     return None
 
 
+def _scan_and_resolve(ref_id, drive_id, local):
+    """Worker: fetch + read the PDF, then (network, in parallel) look the record up.
+    arXiv ids are returned unresolved: the arXiv API wants batched, spaced calls."""
+    rid, kind, ident = _scan(ref_id, drive_id, local)
+    cand = None
+    if kind == "doi":
+        cand = _crossref_record(ident)
+    elif kind == "pdf_title":
+        cand = _search_by_title(ident)
+    return rid, kind, ident, cand
+
+
+def _apply(conn, stamp, rid, kind, ident, cand):
+    """Main thread only (one SQLite connection): verify, merge, back up, write, log."""
+    seed = DB.get(rid)
+    seed = _clean_seed(seed) if seed is not None else None
+    result = "no_record"
+    if cand is None:
+        STATS["no_record"] += 1
+    if cand is not None and seed is not None:
+        ok = (_agrees_with_ref(seed, cand) if kind == "pdf_title"
+              else _title_agrees(seed.title or "", cand.title or "") or _FILENAMEISH.search(seed.title or ""))
+        if not ok:
+            STATS["title_mismatch"] += 1
+            result = "title_mismatch"
+            if len(STATS.setdefault("_mismatch_samples", [])) < 8:
+                STATS["_mismatch_samples"].append([seed.title, cand.title, ident])
+        else:
+            STATS["verified"] += 1
+            if len(STATS.setdefault("_verified_samples", [])) < 25:
+                STATS["_verified_samples"].append(
+                    [kind, (seed.title or "")[:60], seed.year, (cand.title or "")[:60], cand.year, cand.doi or ident])
+            merged = merge(seed, [(cand, 0.97)])
+            if kind == "arxiv" and not merged.arxiv_id:
+                merged.arxiv_id = ident
+            before = seed.completeness or 0.0
+            gained = (merged.completeness > before + 0.005 or
+                      (merged.arxiv_id and not seed.arxiv_id) or (merged.doi and not seed.doi))
+            result = "improved" if gained else "no_gain"
+            if gained:
+                STATS["updated"] += 1
+                STATS["comp_gain"] = STATS.get("comp_gain", 0.0) + merged.completeness - before
+                if WRITE:
+                    row = conn.execute("SELECT * FROM refs WHERE id=?", (rid,)).fetchone()
+                    cols = [d[0] for d in conn.execute("SELECT * FROM refs LIMIT 0").description]
+                    conn.execute(f"INSERT OR IGNORE INTO pdf_id_bak_{stamp} VALUES (?,?)",
+                                 (rid, json.dumps(dict(zip(cols, row)), default=str)))
+                    conn.commit()
+                    DB.replace_ref(rid, merged)
+    if WRITE:
+        conn.execute("INSERT OR REPLACE INTO pdf_id_scan (ref_id, result, found_id) VALUES (?,?,?)",
+                     (rid, f"{kind}:{result}", ident))
+
+
 def main():
     stamp = time.strftime("%Y%m%d")
     conn = sqlite3.connect(str(DB.path if hasattr(DB, "path") else DB._path), timeout=60)
@@ -339,73 +393,36 @@ def main():
            WHERE COALESCE(r.doi,'') = '' AND COALESCE(r.arxiv_id,'') = '' AND COALESCE(r.status,'') != 'duplicate'
              AND (COALESCE(r.pdf_drive_id,'') != '' OR COALESCE(r.pdf_local,'') != '')
              AND r.id NOT IN (SELECT ref_id FROM pdf_id_scan)
-           ORDER BY (r.completeness >= 0.8), RANDOM() LIMIT ?""", (LIMIT,)).fetchall()
-    print(f"[pdf-ids] {len(rows):,} refs | {'WRITE' if WRITE else 'DRY-RUN'} | workers={WORKERS}", flush=True)
+           ORDER BY (COALESCE(r.completeness, 0) >= 0.8), RANDOM() LIMIT ?""", (LIMIT,)).fetchall()
+    print(f"[pdf-ids] {len(rows):,} refs | {'WRITE' if WRITE else 'DRY-RUN'} | workers={WORKERS} | pipelined",
+          flush=True)
     t0 = time.time()
-    found: list[tuple[str, str, str]] = []
+    arxiv_found: list[str] = []
+    ax_rows: list[tuple[str, str]] = []
     with ThreadPoolExecutor(WORKERS) as pool:
-        futs = [pool.submit(_scan, *r) for r in rows]
+        futs = [pool.submit(_scan_and_resolve, *r) for r in rows]
         for n, f in enumerate(as_completed(futs), 1):
-            rid, kind, ident = f.result()
+            rid, kind, ident, cand = f.result()
             STATS["scanned"] += 1
             STATS[kind if kind in STATS else "err"] += 1
-            if kind in ("arxiv", "doi", "pdf_title"):
-                found.append((rid, kind, ident))
+            if kind == "arxiv":
+                ax_rows.append((rid, ident))
+            elif kind in ("doi", "pdf_title"):
+                _apply(conn, stamp, rid, kind, ident, cand)
             elif WRITE:
                 conn.execute("INSERT OR REPLACE INTO pdf_id_scan (ref_id, result, found_id) VALUES (?,?,?)",
                              (rid, kind, ident))
+            if n % 50 == 0 and WRITE:
+                conn.commit()
             if n % 200 == 0:
-                if WRITE:
-                    conn.commit()
-                print(f"  ... scanned {n:,}/{len(rows):,} | arXiv {STATS['arxiv']:,} DOI {STATS['doi']:,} "
-                      f"| {n / (time.time() - t0):.1f}/s", flush=True)
+                print(f"  ... {n:,}/{len(rows):,} | improved {STATS['updated']:,} (+{STATS.get('comp_gain', 0):.0f} "
+                      f"completeness) | rejected {STATS['title_mismatch']:,} | {n / (time.time() - t0):.2f}/s",
+                      flush=True)
     if WRITE:
         conn.commit()
-    ax = _arxiv_records(sorted({i for _, k, i in found if k == "arxiv"}))
-    for rid, kind, ident in found:
-        if kind == "arxiv":
-            cand = ax.get(ident)
-        elif kind == "doi":
-            cand = _crossref_record(ident)
-        else:
-            cand = _search_by_title(ident)
-        seed = DB.get(rid)
-        seed = _clean_seed(seed) if seed is not None else None
-        result = "no_record"
-        if cand is None:
-            STATS["no_record"] += 1
-        if cand is not None and seed is not None:
-            ok = (_agrees_with_ref(seed, cand) if kind == "pdf_title"
-                  else _title_agrees(seed.title or "", cand.title or "") or _FILENAMEISH.search(seed.title or ""))
-            if not ok:
-                STATS["title_mismatch"] += 1
-                result = "title_mismatch"
-                if len(STATS.setdefault("_mismatch_samples", [])) < 8:
-                    STATS["_mismatch_samples"].append([seed.title, cand.title, ident])
-            else:
-                STATS["verified"] += 1
-                if len(STATS.setdefault("_verified_samples", [])) < 25:
-                    STATS["_verified_samples"].append(
-                        [kind, (seed.title or "")[:60], seed.year, (cand.title or "")[:60], cand.year, cand.doi or ident])
-                merged = merge(seed, [(cand, 0.97)])
-                if kind == "arxiv" and not merged.arxiv_id:
-                    merged.arxiv_id = ident
-                gained = (merged.completeness > seed.completeness + 0.005 or
-                          (merged.arxiv_id and not seed.arxiv_id) or (merged.doi and not seed.doi))
-                result = "improved" if gained else "no_gain"
-                if gained:
-                    STATS["updated"] += 1
-                    STATS["comp_gain"] = STATS.get("comp_gain", 0.0) + merged.completeness - seed.completeness
-                    if WRITE:
-                        row = conn.execute("SELECT * FROM refs WHERE id=?", (rid,)).fetchone()
-                        cols = [d[0] for d in conn.execute("SELECT * FROM refs LIMIT 0").description]
-                        conn.execute(f"INSERT OR IGNORE INTO pdf_id_bak_{stamp} VALUES (?,?)",
-                                     (rid, json.dumps(dict(zip(cols, row)), default=str)))
-                        conn.commit()
-                        DB.replace_ref(rid, merged)
-        if WRITE:
-            conn.execute("INSERT OR REPLACE INTO pdf_id_scan (ref_id, result, found_id) VALUES (?,?,?)",
-                         (rid, f"{kind}:{result}", ident))
+    ax = _arxiv_records(sorted({i for _, i in ax_rows}))
+    for rid, ident in ax_rows:
+        _apply(conn, stamp, rid, "arxiv", ident, ax.get(ident))
     if WRITE:
         conn.commit()
     STATS["seconds"] = int(time.time() - t0)
