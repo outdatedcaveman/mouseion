@@ -387,10 +387,15 @@ def _scan_and_resolve(ref_id, drive_id, local):
     return rid, kind, ident, cand
 
 
-def _apply(conn, stamp, rid, kind, ident, cand):
-    """Main thread only (one SQLite connection): verify, merge, back up, write, log."""
+def _apply(conn, stamp, rid, kind, ident, cand, verified_title=False):
+    """Main thread only (one SQLite connection): verify, merge, back up, write, log.
+    verified_title: the caller has already matched a DAMAGED title against the
+    candidate (resolve_lossy); the damaged title must then give way, or Mouseion's
+    merge drops the candidate as a title mismatch ("Mechanics in Six" vs
+    "Mechanics in Six-Dimensional Spacetime": 11 of 53 verified would be written)."""
     seed = DB.get(rid)
     seed = _clean_seed(seed) if seed is not None else None
+    original_title = seed.title if seed is not None else None
     result = "no_record"
     if cand is None:
         STATS["no_record"] += 1
@@ -407,7 +412,11 @@ def _apply(conn, stamp, rid, kind, ident, cand):
             if len(STATS.setdefault("_verified_samples", [])) < 25:
                 STATS["_verified_samples"].append(
                     [kind, (seed.title or "")[:60], seed.year, (cand.title or "")[:60], cand.year, cand.doi or ident])
+            if verified_title and cand.title:
+                seed.title = None
             merged = merge(seed, [(cand, 0.97)])
+            if verified_title and not merged.title:
+                merged.title = original_title
             if kind == "arxiv" and not merged.arxiv_id:
                 merged.arxiv_id = ident
             before = seed.completeness or 0.0
