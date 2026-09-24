@@ -442,7 +442,8 @@ def retry_logged():
     """--retry: rows logged as arxiv:no_record / doi:no_record get re-resolved from
     the identifier already found (no re-download)."""
     stamp = time.strftime("%Y%m%d")
-    conn = sqlite3.connect(str(DB.path if hasattr(DB, "path") else DB._path), timeout=60)
+    conn = sqlite3.connect(str(DB.path if hasattr(DB, "path") else DB._path), timeout=60,
+                           isolation_level=None)   # autocommit: never hold the write lock across network calls
     conn.execute(f"CREATE TABLE IF NOT EXISTS pdf_id_bak_{stamp} (ref_id TEXT PRIMARY KEY, row_json TEXT)")
     rows = conn.execute("SELECT ref_id, result, found_id FROM pdf_id_scan "
                         "WHERE result IN ('arxiv:no_record', 'doi:no_record') AND found_id IS NOT NULL").fetchall()
@@ -468,7 +469,8 @@ def main():
     if "--retry" in sys.argv:
         return retry_logged()
     stamp = time.strftime("%Y%m%d")
-    conn = sqlite3.connect(str(DB.path if hasattr(DB, "path") else DB._path), timeout=60)
+    conn = sqlite3.connect(str(DB.path if hasattr(DB, "path") else DB._path), timeout=60,
+                           isolation_level=None)   # autocommit: never hold the write lock across network calls
     conn.execute("CREATE TABLE IF NOT EXISTS pdf_id_scan (ref_id TEXT PRIMARY KEY, result TEXT, found_id TEXT, "
                  "scanned_at TEXT DEFAULT (datetime('now')))")
     conn.execute(f"CREATE TABLE IF NOT EXISTS pdf_id_bak_{stamp} (ref_id TEXT PRIMARY KEY, row_json TEXT)")

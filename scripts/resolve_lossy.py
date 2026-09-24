@@ -315,7 +315,8 @@ def _work(rid: str):
 
 def main():
     stamp = time.strftime("%Y%m%d")
-    conn = sqlite3.connect(str(P.DB._path), timeout=60)
+    conn = sqlite3.connect(str(P.DB._path), timeout=60,
+                           isolation_level=None)   # autocommit: never hold the write lock across network calls
     conn.execute("CREATE TABLE IF NOT EXISTS lossy_scan (ref_id TEXT PRIMARY KEY, result TEXT, found TEXT, "
                  "scanned_at TEXT DEFAULT (datetime('now')))")
     conn.execute(f"CREATE TABLE IF NOT EXISTS pdf_id_bak_{stamp} (ref_id TEXT PRIMARY KEY, row_json TEXT)")
