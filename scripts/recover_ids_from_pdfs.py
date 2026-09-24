@@ -421,7 +421,8 @@ def _apply(conn, stamp, rid, kind, ident, cand, verified_title=False):
                 merged.arxiv_id = ident
             before = seed.completeness or 0.0
             gained = (merged.completeness > before + 0.005 or
-                      (merged.arxiv_id and not seed.arxiv_id) or (merged.doi and not seed.doi))
+                      (merged.arxiv_id and not seed.arxiv_id) or (merged.doi and not seed.doi) or
+                      (merged.is_complete and not seed.is_complete) or (merged.authors and not seed.authors))
             result = "improved" if gained else "no_gain"
             if gained:
                 STATS["updated"] += 1

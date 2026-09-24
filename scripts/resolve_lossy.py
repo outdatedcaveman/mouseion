@@ -53,6 +53,104 @@ P.WRITE = WRITE                                 # _apply writes only when this i
 STATS = P.STATS
 STATS.update({"embedded_id": 0, "no_keywords": 0, "judge": 0})
 DECISIONS: list = []
+# v2 (2026-09-24): the library's definition -- complete = title + author + ANY identifier or
+# delivery (DOI/ISBN/arXiv/PMID/URL/PDF). --incomplete targets exactly the refs
+# that fail it; Crossref no-record rows go on to OpenAlex (key, when configured)
+# and Semantic Scholar (key configured), whose work URL also counts.
+INCOMPLETE = "--incomplete" in sys.argv
+import threading  # noqa: E402
+
+from mouseion.config import get_config  # noqa: E402
+from mouseion.db import RefDatabase  # noqa: E402
+from mouseion.providers.openalex import OpenAlexProvider as _OAP  # noqa: E402
+from mouseion.providers.semantic_scholar import SemanticScholarProvider as _S2P  # noqa: E402
+
+_CFG = get_config()
+S2_KEY = (_CFG.semantic_scholar_api_key or "").strip()
+OA_KEY = (_CFG.openalex_api_key or "").strip()
+OA_EMAIL = (_CFG.openalex_email or "").strip()
+STATS.update({"via_crossref": 0, "via_openalex": 0, "via_s2": 0, "s2_429": 0, "oa_err": 0})
+
+
+class _Rate:
+    """Process-wide minimum spacing between calls to one API."""
+    def __init__(self, interval: float):
+        self.interval, self._next, self._lock = interval, 0.0, threading.Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            t = max(now, self._next)
+            self._next = t + self.interval
+        if t > now:
+            time.sleep(t - now)
+
+
+_S2_RATE = _Rate(1.2)           # standard S2 key: 1 request/s (1.05 still drew 429s)
+_OA_RATE = _Rate(0.11)          # OpenAlex with a key: 10 requests/s
+
+
+def _s2(query: str) -> list:
+    if not S2_KEY:
+        return []
+    for attempt in range(4):
+        _S2_RATE.wait()
+        try:
+            r = httpx.get("https://api.semanticscholar.org/graph/v1/paper/search",
+                          params={"query": query[:250], "limit": 5,
+                                  "fields": "title,authors,year,externalIds,url,venue,journal,publicationTypes,"
+                                            "publicationDate,openAccessPdf"},
+                          headers={"x-api-key": S2_KEY}, timeout=30)
+        except Exception:
+            time.sleep(2)
+            continue
+        if r.status_code == 200:
+            out = []
+            for d in r.json().get("data") or []:
+                try:
+                    ref = _S2P._parse_paper(d)
+                    ref.url = ref.url or d.get("url")
+                    out.append(ref)
+                except Exception:
+                    pass
+            return out
+        if r.status_code == 429:
+            STATS["s2_429"] += 1
+            time.sleep(2 * (attempt + 1))
+            continue
+        return []
+    return []
+
+
+def _openalex(query: str) -> list:
+    if not OA_KEY:
+        return []
+    params = {"search": query[:250], "per-page": 5, "api_key": OA_KEY}
+    if OA_EMAIL:
+        params["mailto"] = OA_EMAIL
+    for attempt in range(3):
+        _OA_RATE.wait()
+        try:
+            r = httpx.get("https://api.openalex.org/works", params=params, timeout=30)
+        except Exception:
+            time.sleep(2)
+            continue
+        if r.status_code == 200:
+            out = []
+            for d in r.json().get("results") or []:
+                try:
+                    ref = _OAP._parse_work(d)
+                    ref.url = ref.url or (d.get("primary_location") or {}).get("landing_page_url") or d.get("id")
+                    out.append(ref)
+                except Exception:
+                    pass
+            return out
+        if r.status_code in (429, 503):
+            time.sleep(3 * (attempt + 1))
+            continue
+        STATS["oa_err"] += 1
+        return []
+    return []
 
 _STOP = {"the", "a", "an", "of", "in", "on", "and", "or", "to", "for", "with", "by", "from", "as", "at", "is",
          "are", "its", "into", "via", "de", "la", "le", "el", "der", "die", "das", "und", "do", "da", "dos", "em",
@@ -281,12 +379,26 @@ def score(seed, info: dict, cand) -> tuple[float, bool]:
     if st in ("book", "monograph") and ct in ("journal-article", "article"):
         veto = True
     raw = cand.title or ""
-    if ("<i>" in raw or re.match(r"^(?:[A-Z]\.\s?){1,3}[A-Z][\w'\-]+\s*(?:<i>|[.:])", raw))             and "<i>" not in (seed.title or "") and not _MARKER.search(_fold(seed.title or "")):
+    looks_review = ("<i>" in raw or re.match(r"^(?:[A-Z]\.\s?){1,3}[A-Z][\w'\-]+\s*(?:<i>|[.:])", raw)
+                    or re.match(r"^\s*(?:review|book review)\s*[:.]", raw, re.I))   # S2: "Review: A. G. Lunc, ..."
+    if looks_review and "<i>" not in (seed.title or "") and not _MARKER.search(_fold(seed.title or "")):
         p = min(p, JUDGE_P + 0.2)          # looks like a review of the work: the judge decides
     return p, veto
 
 
-def _work(rid: str):
+def _best(seed, info, cands, best, src):
+    for cand in cands:
+        p, veto = score(seed, info, cand)
+        if not veto and (best is None or p > best[0]):
+            best = (p, cand, src)
+    return best
+
+
+def _ident(cand) -> str | None:
+    return cand.doi or cand.arxiv_id or cand.pmid or cand.url or cand.oa_url
+
+
+def _work(rid: str, skip_crossref: bool = False):
     seed = P.DB.get(rid)
     if seed is None:
         return rid, "err", None, None, None
@@ -296,21 +408,45 @@ def _work(rid: str):
         return rid, "arxiv", info["arxiv"], None, info
     if info["doi"]:
         return rid, "doi", info["doi"], P._crossref_record(info["doi"]), info
+    if INCOMPLETE and not seed.authors:
+        # Authorless but identified: exact lookup, title-checked by _apply.
+        url = seed.url or ""
+        m = re.search(r"doi\.org/(10\.\d{4,9}/\S+)", url)
+        doi = seed.doi or (m.group(1).rstrip(".,;)") if m else None)
+        m = re.search(r"arxiv\.org/(?:abs|pdf)/([\w.\-/]+?\d)(?:v\d+)?(?:\.pdf)?$", url)
+        arx = seed.arxiv_id or (m.group(1) if m else None)
+        if arx:
+            return rid, "arxiv", arx, None, info
+        if doi:
+            return rid, "doi", doi, P._crossref_record(doi) or P._csl_record(doi), info
+        # The library's PDF names are "Surname_Year_words.pdf": an author hint.
+        m = re.match(r"([A-Z][A-Za-z'\-]{1,30})_((?:1[5-9]|20)\d\d)_",
+                     Path(str((seed.extras or {}).get("pdf_local") or "")).name)
+        if m and not info.get("author"):
+            info["author"] = m.group(1)
+            info["year"] = info.get("year") or int(m.group(2))
     if len(info["keywords"]) < 2:
         return rid, "no_keywords", None, None, info
     author = info.get("author") or R._first_author(seed)
-    cands = _crossref(" ".join(info["keywords"]) + (f" {info['year']}" if info.get("year") else ""), author)
+    q = " ".join(info["keywords"]) + (f" {info['year']}" if info.get("year") else "")
     best = None
-    for cand in cands:
-        p, veto = score(seed, info, cand)
-        if not veto and (best is None or p > best[0]):
-            best = (p, cand)
+    if not skip_crossref:
+        best = _best(seed, info, _crossref(q, author), best, "crossref")
+    if INCOMPLETE and (best is None or best[0] < ACCEPT_P):
+        wq = " ".join(filter(None, [author, " ".join(info["keywords"])]))
+        best = _best(seed, info, _openalex(wq), best, "openalex")
+        if best is None or best[0] < ACCEPT_P:
+            best = _best(seed, info, _s2(wq), best, "s2")
     if not best or best[0] < JUDGE_P:
         return rid, "no_record", None, None, info
     info["p"] = round(best[0], 3)
+    info["src"] = best[2]
     # two-keyword titles ("Quantum information") are too generic to auto-accept
-    ok = best[0] >= ACCEPT_P and len(info["keywords"]) >= 3
-    return rid, ("accept" if ok else "judge"), best[1].doi, best[1], info
+    # ...unless the whole title is identical ("O przedmiocie matematycznym": stopword-light languages)
+    fw = lambda t: re.sub(r"[^a-z0-9]+", " ", _fold(t or "")).split()          # noqa: E731
+    same = fw(seed.title) == fw(best[1].title) and len(fw(seed.title)) >= 3
+    ok = best[0] >= ACCEPT_P and (len(info["keywords"]) >= 3 or same) and bool(_ident(best[1]))
+    return rid, ("accept" if ok else "judge"), _ident(best[1]), best[1], info
 
 
 def main():
@@ -321,15 +457,34 @@ def main():
                  "scanned_at TEXT DEFAULT (datetime('now')))")
     conn.execute(f"CREATE TABLE IF NOT EXISTS pdf_id_bak_{stamp} (ref_id TEXT PRIMARY KEY, row_json TEXT)")
     conn.commit()
-    ids = [r[0] for r in conn.execute(
-        """SELECT id FROM refs WHERE COALESCE(status,'') != 'duplicate' AND COALESCE(completeness, 0) < 0.8
-             AND COALESCE(doi,'') = '' AND COALESCE(isbn,'') = '' AND COALESCE(arxiv_id,'') = ''
-             AND id NOT IN (SELECT ref_id FROM lossy_scan) ORDER BY RANDOM() LIMIT ?""", (LIMIT,))]
+    ledger = "lossy_scan2" if INCOMPLETE else "lossy_scan"
+    conn.execute("CREATE TABLE IF NOT EXISTS lossy_scan2 (ref_id TEXT PRIMARY KEY, result TEXT, found TEXT, "
+                 "source TEXT, scanned_at TEXT DEFAULT (datetime('now')))")
+    crossref_done: set = set()
+    if INCOMPLETE:
+        # Fails the definition and has a title. Rows the v1 pass still has queued
+        # are left to it (no two writers on one ref); rows it logged no_record
+        # skip Crossref (already asked).
+        ids = [r[0] for r in conn.execute(
+            f"""SELECT id FROM refs WHERE COALESCE(status,'') != 'duplicate' AND COALESCE(title,'') != ''
+                 AND NOT {RefDatabase.COMPLETE_SQL}
+                 AND id NOT IN (SELECT ref_id FROM lossy_scan2)
+                 AND NOT (COALESCE(completeness, 0) < 0.8 AND COALESCE(doi,'') = '' AND COALESCE(isbn,'') = ''
+                          AND COALESCE(arxiv_id,'') = '' AND id NOT IN (SELECT ref_id FROM lossy_scan))
+                 ORDER BY RANDOM() LIMIT ?""", (LIMIT,))]
+        crossref_done = {r[0] for r in conn.execute("SELECT ref_id FROM lossy_scan WHERE result='no_record'")}
+    else:
+        ids = [r[0] for r in conn.execute(
+            """SELECT id FROM refs WHERE COALESCE(status,'') != 'duplicate' AND COALESCE(completeness, 0) < 0.8
+                 AND COALESCE(doi,'') = '' AND COALESCE(isbn,'') = '' AND COALESCE(arxiv_id,'') = ''
+                 AND id NOT IN (SELECT ref_id FROM lossy_scan) ORDER BY RANDOM() LIMIT ?""", (LIMIT,))]
+    print(f"[lossy] sources: crossref{' + openalex' if INCOMPLETE and OA_KEY else ''}"
+          f"{' + semantic scholar' if INCOMPLETE and S2_KEY else ''} | ledger {ledger}", flush=True)
     print(f"[lossy] {len(ids):,} refs | {'WRITE' if WRITE else 'DRY-RUN'} | workers={WORKERS}", flush=True)
     t0 = time.time()
     arx: list = []
     with ThreadPoolExecutor(WORKERS) as pool:
-        futs = [pool.submit(_work, rid) for rid in ids]
+        futs = [pool.submit(_work, rid, rid in crossref_done) for rid in ids]
         for n, f in enumerate(as_completed(futs), 1):
             rid, kind, ident, cand, info = f.result()
             if kind == "arxiv":
@@ -341,6 +496,7 @@ def main():
                 P._apply(conn, stamp, rid, "doi", ident, cand)
             elif kind == "accept":
                 # our sorter matched the damaged title; _apply still checks year/authors
+                STATS["via_" + info.get("src", "crossref")] += 1
                 P._apply(conn, stamp, rid, "pdf_title", ident, cand, verified_title=True)
             elif kind == "judge":
                 STATS["judge"] += 1
@@ -348,12 +504,16 @@ def main():
                 STATS[kind if kind in STATS else "err"] = STATS.get(kind, 0) + 1
             if len(DECISIONS) < SHOW and kind in ("accept", "judge"):
                 seed_t = (P.DB.get(rid).title or "")[:50]
-                DECISIONS.append([kind, info.get("p"), seed_t, info.get("author"), info.get("year"),
+                DECISIONS.append([kind, info.get("p"), info.get("src"), seed_t, info.get("author"), info.get("year"),
                                   (cand.title or "")[:55], cand.year, ident])
             if WRITE:
                 found = json.dumps({"doi": ident, "p": info.get("p")}) if kind == "judge" and info else ident
-                conn.execute("INSERT OR REPLACE INTO lossy_scan (ref_id, result, found) VALUES (?,?,?)",
-                             (rid, kind, found))
+                if INCOMPLETE:
+                    conn.execute("INSERT OR REPLACE INTO lossy_scan2 (ref_id, result, found, source) VALUES (?,?,?,?)",
+                                 (rid, kind, found, (info or {}).get("src")))
+                else:
+                    conn.execute("INSERT OR REPLACE INTO lossy_scan (ref_id, result, found) VALUES (?,?,?)",
+                                 (rid, kind, found))
                 if n % 50 == 0:
                     conn.commit()
             if n % 200 == 0:
@@ -364,7 +524,7 @@ def main():
         for rid, ident in arx:
             P._apply(conn, stamp, rid, "arxiv", ident, recs.get(ident))
             if WRITE:
-                conn.execute("INSERT OR REPLACE INTO lossy_scan (ref_id, result, found) VALUES (?,?,?)",
+                conn.execute(f"INSERT OR REPLACE INTO {ledger} (ref_id, result, found) VALUES (?,?,?)",
                              (rid, "arxiv", ident))
     if WRITE:
         conn.commit()
