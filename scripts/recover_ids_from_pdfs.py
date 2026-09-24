@@ -299,21 +299,69 @@ def _scan(ref_id: str, drive_id: str | None, local: str | None) -> tuple[str, st
 
 
 def _arxiv_records(ids: list[str]) -> dict:
+    """Batch arXiv lookup. Two bugs cost the 2026-09-24 run all 2,600 arXiv ids:
+    httpx percent-encodes the comma in id_list and arXiv answers 406; and
+    Mouseion's parser leaves arxiv_id empty for old-style ids (math/0404258),
+    so records could not be mapped back. urllib sends the URL as written, and
+    the id is read from each entry's own <id> element."""
+    import subprocess
+    import xml.etree.ElementTree as ET
+    ns = "{http://www.w3.org/2005/Atom}"
     out = {}
     for i in range(0, len(ids), 50):
         chunk = ids[i:i + 50]
+        url = f"https://export.arxiv.org/api/query?id_list={','.join(chunk)}&max_results={len(chunk)}"
         for attempt in range(3):
-            r = httpx.get("https://export.arxiv.org/api/query",
-                          params={"id_list": ",".join(chunk), "max_results": len(chunk)}, timeout=60)
-            if r.status_code == 200:
-                for rec in ArXivProvider._parse_atom(r.text) or []:
-                    aid = re.sub(r"v\d+$", "", (rec.arxiv_id or "").strip())
-                    if aid:
-                        out[aid] = rec
+            try:
+                # curl, not Python's HTTP stack: arXiv's front end answered 406 to
+                # httpx (percent-encoded commas) and to urllib for batches > ~5 ids,
+                # while curl got 200 on every batch size (measured 2026-09-24)
+                r = subprocess.run(["curl", "-s", "-f", "-m", "90", "-A", "mouseion/0.2 (library enrichment)", url],
+                                   capture_output=True, timeout=120, creationflags=0x08000000)
+                if r.returncode != 0:
+                    raise RuntimeError(f"curl exit {r.returncode}")
+                root = ET.fromstring(r.stdout)
+                for entry in root.findall(f"{ns}entry"):
+                    raw = (entry.findtext(f"{ns}id") or "").split("/abs/")[-1]
+                    aid = re.sub(r"v\d+$", "", raw.strip())
+                    if not aid:
+                        continue
+                    rec = ArXivProvider._parse_entry(entry)
+                    rec.arxiv_id = rec.arxiv_id or aid
+                    out[aid] = rec
                 break
-            time.sleep(5 * (attempt + 1))
+            except Exception:
+                time.sleep(5 * (attempt + 1))
         time.sleep(3.1)                     # arXiv API etiquette: one request per 3 s
     return out
+
+
+def _csl_record(doi: str):
+    """doi.org content negotiation (CSL-JSON): Crossref AND DataCite DOIs
+    (arXiv's 10.48550, Zenodo, figshare...), which Crossref's API does not hold."""
+    from mouseion.models import Author, Reference
+    try:
+        r = httpx.get(f"https://doi.org/{doi}", timeout=30, follow_redirects=True,
+                      headers={"Accept": "application/vnd.citationstyles.csl+json",
+                               "User-Agent": "mouseion/0.2 (library enrichment)"})
+        if r.status_code != 200:
+            return None
+        j = r.json()
+    except Exception:
+        return None
+    parts = ((j.get("issued") or {}).get("date-parts") or [[None]])[0]
+    title = j.get("title")
+    title = title[0] if isinstance(title, list) and title else title
+    cont = j.get("container-title")
+    cont = cont[0] if isinstance(cont, list) and cont else cont
+    ref = Reference(
+        doi=(j.get("DOI") or doi).lower(), title=title, year=parts[0] if parts else None,
+        journal=cont or None, publisher=j.get("publisher"), volume=j.get("volume"), issue=j.get("issue"),
+        pages=j.get("page"), abstract=j.get("abstract"),
+        authors=[Author(family=a.get("family") or a.get("literal") or "", given=a.get("given") or "")
+                 for a in (j.get("author") or [])[:20]])
+    ref.sources = {"doi_org": 0.9}
+    return ref
 
 
 def _crossref_record(doi: str):
@@ -324,7 +372,7 @@ def _crossref_record(doi: str):
             return CrossRefProvider()._parse_work(r.json()["message"])
     except Exception:
         pass
-    return None
+    return _csl_record(doi)
 
 
 def _scan_and_resolve(ref_id, drive_id, local):
@@ -381,7 +429,35 @@ def _apply(conn, stamp, rid, kind, ident, cand):
                      (rid, f"{kind}:{result}", ident))
 
 
+def retry_logged():
+    """--retry: rows logged as arxiv:no_record / doi:no_record get re-resolved from
+    the identifier already found (no re-download)."""
+    stamp = time.strftime("%Y%m%d")
+    conn = sqlite3.connect(str(DB.path if hasattr(DB, "path") else DB._path), timeout=60)
+    conn.execute(f"CREATE TABLE IF NOT EXISTS pdf_id_bak_{stamp} (ref_id TEXT PRIMARY KEY, row_json TEXT)")
+    rows = conn.execute("SELECT ref_id, result, found_id FROM pdf_id_scan "
+                        "WHERE result IN ('arxiv:no_record', 'doi:no_record') AND found_id IS NOT NULL").fetchall()
+    print(f"[pdf-ids retry] {len(rows):,} logged ids | {'WRITE' if WRITE else 'DRY-RUN'}", flush=True)
+    t0 = time.time()
+    ax = _arxiv_records(sorted({i for _, r, i in rows if r.startswith("arxiv")}))
+    print(f"  arXiv records fetched: {len(ax):,}", flush=True)
+    for n, (rid, res, ident) in enumerate(rows, 1):
+        kind = res.split(":")[0]
+        cand = ax.get(ident) if kind == "arxiv" else _crossref_record(ident)
+        _apply(conn, stamp, rid, kind, ident, cand)
+        if n % 50 == 0 and WRITE:
+            conn.commit()
+        if n % 200 == 0:
+            print(f"  ... {n:,}/{len(rows):,} | improved {STATS['updated']:,}", flush=True)
+    if WRITE:
+        conn.commit()
+    STATS["seconds"] = int(time.time() - t0)
+    print(json.dumps(STATS, ensure_ascii=False, default=str), flush=True)
+
+
 def main():
+    if "--retry" in sys.argv:
+        return retry_logged()
     stamp = time.strftime("%Y%m%d")
     conn = sqlite3.connect(str(DB.path if hasattr(DB, "path") else DB._path), timeout=60)
     conn.execute("CREATE TABLE IF NOT EXISTS pdf_id_scan (ref_id TEXT PRIMARY KEY, result TEXT, found_id TEXT, "
