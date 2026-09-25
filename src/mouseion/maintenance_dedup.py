@@ -620,8 +620,8 @@ def _apply_pairs(conn: sqlite3.Connection, rule: str = "") -> Dict[str, int]:
     conn.execute("DELETE FROM refs_fts WHERE ref_id IN (SELECT keep_id FROM pairs)")
     conn.execute(
         """
-        INSERT INTO refs_fts (ref_id,title,abstract,authors_text,keywords_text,journal,identifiers)
-        SELECT id,title,abstract,
+        INSERT INTO refs_fts (rowid,ref_id,title,abstract,authors_text,keywords_text,journal,identifiers)
+        SELECT rowid,id,title,abstract,
                (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
                        IFNULL(json_extract(value, '$.given'), ''), ' ')
                 FROM json_each(IFNULL(refs.authors, '[]'))),

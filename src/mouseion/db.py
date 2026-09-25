@@ -490,6 +490,14 @@ class RefDatabase:
         created_at     TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_eq_status_prio ON enrich_queue (status, priority DESC);
+    -- Guards (2026-09-25): 11,208 refs once arrived with NULL ids -- unsearchable
+    -- and never enrichable (33,445 NULL queue rows). Reject both at the door.
+    CREATE TRIGGER IF NOT EXISTS refs_require_id BEFORE INSERT ON refs
+    WHEN NEW.id IS NULL OR NEW.id = ''
+    BEGIN SELECT RAISE(ABORT, 'refs.id is required (use mouseion.db._ref_id)'); END;
+    CREATE TRIGGER IF NOT EXISTS enrich_queue_require_ref BEFORE INSERT ON enrich_queue
+    WHEN NEW.ref_id IS NULL OR NEW.ref_id = ''
+    BEGIN SELECT RAISE(IGNORE); END;
 
     CREATE TABLE IF NOT EXISTS collections (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -667,8 +675,8 @@ class RefDatabase:
                         if ref_count > 0 and fts_count == 0:
                             _dbg(f"[db.open] rebuilding FTS index for {ref_count} refs…")
                             self._conn.execute("""
-                                INSERT INTO refs_fts (ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
-                                SELECT id, title, abstract,
+                                INSERT INTO refs_fts (rowid, ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
+                                SELECT rowid, id, title, abstract,
                                     (SELECT group_concat(json_extract(value, '$.family') || ' ' ||
                                                           IFNULL(json_extract(value, '$.given'), ''), ' ')
                                      FROM json_each(IFNULL(refs.authors, '[]'))),
@@ -1019,13 +1027,15 @@ class RefDatabase:
         Requires SQLite 3.23.0+ (released 2018-04-02).
         """
         with self._db() as conn:
-            conn.execute("INSERT INTO refs_fts(refs_fts) VALUES('delete-all')")
+            # 'delete-all' is only valid for contentless/external-content tables;
+            # refs_fts stores its own content, so it raised and the rebuild never ran.
+            conn.execute("DELETE FROM refs_fts")
             conn.execute(
                 """
                 INSERT INTO refs_fts
-                    (ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
+                    (rowid, ref_id, title, abstract, authors_text, keywords_text, journal, identifiers)
                 SELECT
-                    id, title, abstract,
+                    rowid, id, title, abstract,
                     (SELECT group_concat(
                         json_extract(value, '$.family') || ' ' ||
                         IFNULL(json_extract(value, '$.given'), ''), ' ')

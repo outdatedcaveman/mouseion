@@ -222,6 +222,27 @@ async def download_pdf(
     ref: Reference,
     client: Optional[httpx.AsyncClient] = None,
 ) -> Optional[str]:
+    """Download the PDF for a single reference; a newly fetched file is recorded
+    as a `hit` in the attempt ledger (only misses were, so "0 hits" in the
+    ledger could not tell a working finder from a dead one)."""
+    dest_existed = (get_pdf_dir() / sanitize_filename(ref)).exists()
+    result = await _download_pdf_impl(ref, client)
+    if result and not dest_existed:
+        try:
+            from .api_router import get_router
+            router = get_router()
+            rid = getattr(ref, "_db_id", None) or getattr(ref, "_batch_id", None) or (ref.doi or ref.arxiv_id or ref.title or "")
+            if rid:
+                router.record_attempt(rid, _pdf_ledger_key(), router.entry_hash(ref), "hit")
+        except Exception:
+            pass
+    return result
+
+
+async def _download_pdf_impl(
+    ref: Reference,
+    client: Optional[httpx.AsyncClient] = None,
+) -> Optional[str]:
     """Download the PDF for a single reference.
 
     Tries multiple strategies in order of reliability and legality:

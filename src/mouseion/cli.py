@@ -1043,6 +1043,23 @@ def drive_upload(delete_local, limit):
 # stats
 # ---------------------------------------------------------------------------
 
+@main.command("health")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+def health_cmd(as_json: bool):
+    """Check the library's invariants (search index, ids, Drive backup, PDF paths,
+    duplicates, queue, providers, PDF finder) and report what is failing."""
+    import json as _json
+    from .health import run
+    report = run()
+    if as_json:
+        click.echo(_json.dumps(report))
+        return
+    for c in report["checks"]:
+        mark = "[green]OK  [/green]" if c["ok"] else "[red]FAIL[/red]"
+        console.print(f"{mark} {c['check']:15s} {c['value']}  [dim]{c['detail']}[/dim]")
+    console.print(f"{report['refs']:,} refs · {report['complete_pct']}% complete · {len(report['failed'])} failing")
+
+
 @main.command("drive-auth")
 def drive_auth():
     """Renew Google Drive authorization (opens Google's consent page -- the only
