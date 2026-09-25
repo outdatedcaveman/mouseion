@@ -40,7 +40,13 @@ _USER_AGENT = (
 )
 
 # Concurrency limit for batch downloads
-_MAX_CONCURRENT = 20
+_MAX_CONCURRENT = int(os.environ.get("MOUSEION_PDF_CONCURRENCY", "20"))
+
+
+def _shadow_sources_on() -> bool:
+    """Sci-Hub / Anna's Archive strategies: on unless MOUSEION_PDF_SHADOW=0
+    (runs that must use licensed and open-access sources only)."""
+    return os.environ.get("MOUSEION_PDF_SHADOW", "1") != "0"
 
 
 _LEDGER_KEY_CACHE: list = [0.0, "pdf"]
@@ -63,7 +69,8 @@ def _pdf_ledger_key() -> str:
         except Exception:
             pass
         _LEDGER_KEY_CACHE[:] = [_t.time(), key]
-    return _LEDGER_KEY_CACHE[1]
+    # a run without the shadow sources must not mark refs as tried for runs with them
+    return _LEDGER_KEY_CACHE[1] + ("" if _shadow_sources_on() else "_open")
 
 
 class TemporaryDownloadError(Exception):
@@ -404,7 +411,7 @@ async def _download_pdf_impl(
                 temporary_failure = True
 
         # Strategy 7: Sci-Hub (with rate limiting to avoid bans)
-        if ref.doi:
+        if ref.doi and _shadow_sources_on():
             try:
                 scihub_result = await _scihub_lookup(client, ref.doi, dest)
                 if scihub_result:
@@ -415,14 +422,15 @@ async def _download_pdf_impl(
                 temporary_failure = True
 
         # Strategy 8: Anna's Archive (last resort, rate-limited)
-        try:
-            annas_result = await _annas_archive_lookup(client, ref, dest)
-            if annas_result:
-                ref.pdf_path = filename
-                return filename
-        except TemporaryDownloadError as e:
-            logger.info("Temporary failure using Anna's Archive: %s", e)
-            temporary_failure = True
+        if _shadow_sources_on():
+            try:
+                annas_result = await _annas_archive_lookup(client, ref, dest)
+                if annas_result:
+                    ref.pdf_path = filename
+                    return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using Anna's Archive: %s", e)
+                temporary_failure = True
 
         # Strategy 9: Web Search Fallback (DuckDuckGo Lite for direct PDF links)
         try:
@@ -1153,10 +1161,21 @@ def _drive_cache_write(drive_id: str, data: bytes, config) -> Path:
     return path
 
 
+# Circuit breaker for the web-search strategy: DuckDuckGo answered this network
+# with a challenge page for weeks, and every ref queued ~40 s behind its rate
+# lock for nothing (2026-09-25). After _WEB_TRIP empty searches in a row, skip
+# it for _WEB_COOLDOWN seconds; any result closes the breaker again.
+_WEB_TRIP, _WEB_COOLDOWN = 15, 3600
+_web_state = {"fails": 0, "open_until": 0.0}
+
+
 async def _ddg_pdf_search(
     client: httpx.AsyncClient, ref: Reference, dest: Path
 ) -> bool:
     """Search DuckDuckGo Lite for the paper title to find direct PDF download links."""
+    import time as _t
+    if _t.time() < _web_state["open_until"]:
+        return False
     from .web_search import _search_duckduckgo
     from .api_router import get_router
     from rapidfuzz import fuzz
@@ -1203,7 +1222,14 @@ async def _ddg_pdf_search(
         try:
             results = await _search_duckduckgo(query, client, max_results=5)
             if not results:
+                _web_state["fails"] += 1
+                if _web_state["fails"] >= _WEB_TRIP:
+                    _web_state["open_until"] = _t.time() + _WEB_COOLDOWN
+                    logger.warning("Web search returned nothing %d times in a row; pausing it for %d s",
+                                   _web_state["fails"], _WEB_COOLDOWN)
+                    return False
                 continue
+            _web_state["fails"] = 0
                 
             for res in results:
                 url = res.get("url", "")
