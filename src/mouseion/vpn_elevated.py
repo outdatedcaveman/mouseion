@@ -108,7 +108,7 @@ def _explain(out: str) -> str:
         return ("USP rejected the username/password (the gateway asked for the password again). "
                 "Check them in Settings > Institutional VPN -- the FortiGate login may differ from "
                 "the old Cisco one. Automatic retries are paused to protect the account.")
-    if "user input required" in low and ("token" in low or "code" in low):
+    if "user input required" in low:
         return ("The gateway asked for more than a password (e.g. a FortiToken code). "
                 "Automatic login can't answer that; tell Claude which prompt it shows.")
     if "login failed" in low or "invalid" in low and "password" in low or "authentication failed" in low \
