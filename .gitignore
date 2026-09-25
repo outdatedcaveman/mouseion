@@ -48,3 +48,4 @@ egon_context.json
 scratch_*.py
 old_builds/
 openconnect-gui/
+openconnect9/

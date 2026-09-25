@@ -26,8 +26,11 @@ _vpn_lock = threading.RLock()
 def find_openconnect_path() -> Optional[Path]:
     """Search for the openconnect.exe executable in common Windows paths."""
     # Try project-local unpacked GUI directory first
-    local_path = Path(__file__).resolve().parent.parent.parent / "openconnect-gui" / "openconnect.exe"
+    repo = Path(__file__).resolve().parent.parent.parent
+    local_path = repo / "openconnect-gui" / "openconnect.exe"
     search_paths = [
+        repo / "openconnect9" / "openconnect.exe",            # v9.x: fortinet protocol, Wintun
+        Path.home() / "Desktop" / "mnt" / "outputs" / "zoterpile-main" / "openconnect9" / "openconnect.exe",
         local_path,
         Path.home() / "Desktop" / "mnt" / "outputs" / "zoterpile-main" / "openconnect-gui" / "openconnect.exe",
         Path.home() / "Desktop" / "zoterpile-main" / "openconnect-gui" / "openconnect.exe",
@@ -40,6 +43,8 @@ def find_openconnect_path() -> Optional[Path]:
         search_paths.insert(0, exe_dir / "mnt" / "outputs" / "zoterpile-main" / "openconnect-gui" / "openconnect.exe")
         search_paths.insert(0, exe_dir / "zoterpile-main" / "openconnect-gui" / "openconnect.exe")
         search_paths.insert(0, exe_dir / "openconnect-gui" / "openconnect.exe")
+        search_paths.insert(0, exe_dir / "mnt" / "outputs" / "zoterpile-main" / "openconnect9" / "openconnect.exe")
+        search_paths.insert(0, exe_dir / "openconnect9" / "openconnect.exe")
 
     for p in search_paths:
         if p.exists():
@@ -181,8 +186,17 @@ def get_vpn_status() -> Dict[str, Any]:
     global _vpn_process, _vpn_last_error
     cfg = get_config()
     tunnel = is_vpn_connected_locally(cfg) if cfg.vpn_gateway else False
+    from . import vpn_elevated
+    epid = vpn_elevated.tunnel_pid()
     with _vpn_lock:
         proc = _vpn_process
+        if proc is None and epid:
+            if tunnel:
+                return {"status": "connected", "pid": epid, "via": "mouseion", "adapter": vpn_adapter_up()}
+            if time.time() - _vpn_start_time <= 45.0:
+                return {"status": "connecting", "pid": epid}
+            return {"status": "error", "pid": epid,
+                    "error": "The tunnel process is running but no VPN adapter is up. " + vpn_elevated.tunnel_output(6)}
         if proc is not None and proc.poll() is not None:
             code = proc.returncode
             _vpn_process = proc = None
@@ -197,8 +211,8 @@ def get_vpn_status() -> Dict[str, Any]:
                 return {"status": "connecting", "pid": proc.pid}
             return {"status": "error", "pid": proc.pid,
                     "error": "The VPN client is running but no tunnel came up. " + (_log_tail(6) or "")}
-        return {"status": "error" if _vpn_last_error else "disconnected", "pid": None,
-                "error": _vpn_last_error}
+        err = _vpn_last_error or vpn_elevated.last_error
+        return {"status": "error" if err else "disconnected", "pid": None, "error": err}
 
 
 def _ensure_vpn_adapters_enabled() -> None:
@@ -266,6 +280,19 @@ def _log_subprocess_output(proc: subprocess.Popen, log_path: Path) -> None:
 def start_vpn(cfg: Config) -> Dict[str, Any]:
     """Start the VPN tunnel using the configuration."""
     global _vpn_process, _vpn_start_time, _vpn_last_error
+    if sys.platform == "win32" and (cfg.vpn_type or "openconnect") == "openconnect":
+        exe9 = find_openconnect_path()
+        from . import vpn_elevated
+        if exe9 and vpn_elevated.is_v9(exe9):
+            if is_vpn_connected_locally(cfg):
+                return get_vpn_status()
+            if not cfg.vpn_gateway or not cfg.vpn_username:
+                raise ValueError("VPN gateway and username must be configured.")
+            _vpn_start_time = time.time()
+            logger.info("Starting OpenConnect 9 (elevated tunnel) to %s", cfg.vpn_gateway)
+            res = vpn_elevated.connect(cfg, exe9)
+            _vpn_last_error = res.get("error", "")
+            return res
     _ensure_vpn_adapters_enabled()
     with _vpn_lock:
         # If already running and healthy, return status
@@ -404,6 +431,11 @@ def start_vpn(cfg: Config) -> Dict[str, Any]:
 def stop_vpn() -> None:
     """Terminate the VPN connection process."""
     global _vpn_process
+    try:
+        from . import vpn_elevated
+        vpn_elevated.disconnect()
+    except Exception as e:
+        logger.warning("elevated tunnel stop failed: %s", e)
     with _vpn_lock:
         if _vpn_process is not None:
             logger.info("Stopping active VPN process (PID: %d)", _vpn_process.pid)
@@ -461,6 +493,9 @@ def initialize_vpn() -> None:
                     c = get_config()
                     if not c.vpn_enabled:
                         break  # stop watchdog if disabled dynamically
+                    from . import vpn_elevated
+                    if vpn_elevated.declined:
+                        continue
                     if get_vpn_status().get("status") not in ("disconnected", "error") or not c.vpn_gateway:
                         fails = 0
                         interval = 15.0
