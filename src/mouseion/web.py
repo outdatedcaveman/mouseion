@@ -4511,6 +4511,10 @@ kbd {
     <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Semantic Scholar API Key</label>
     <input type="password" class="modal-ta" id="cfg-s2-key" placeholder="(Optional but highly recommended)"
            style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">OpenAlex API Key
+      <a href="https://openalex.org/settings/api-key" target="_blank" rel="noopener" style="margin-left:6px">get a free key &#8599;</a></label>
+    <input type="password" class="modal-ta" id="cfg-oa-key" placeholder="Needed since 2025: keyless OpenAlex requests share a tiny daily budget"
+           style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
     <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">CrossRef / OpenAlex Email</label>
     <input type="email" class="modal-ta" id="cfg-cr-email" placeholder="Required for Polite Pool (faster limits)"
            style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:12px">
@@ -5172,6 +5176,7 @@ async function openSettings(msg) {
       document.getElementById('cfg-llm-provider').value = cd.llm_provider || 'openai';
       document.getElementById('cfg-llm-key').value = cd.llm_api_key || '';
       document.getElementById('cfg-s2-key').value = cd.semantic_scholar_api_key || '';
+      document.getElementById('cfg-oa-key').value = cd.openalex_api_key || '';
       document.getElementById('cfg-cr-email').value = cd.crossref_email || cd.openalex_email || '';
       
       // Load VPN configuration
@@ -5313,6 +5318,7 @@ function saveSettings() {
       llm_provider: document.getElementById('cfg-llm-provider').value,
       llm_api_key: document.getElementById('cfg-llm-key').value.trim(),
       semantic_scholar_api_key: document.getElementById('cfg-s2-key').value.trim(),
+      openalex_api_key: document.getElementById('cfg-oa-key').value.trim(),
       crossref_email: document.getElementById('cfg-cr-email').value.trim(),
       openalex_email: document.getElementById('cfg-cr-email').value.trim(),
       vpn_type: document.getElementById('cfg-vpn-type').value,

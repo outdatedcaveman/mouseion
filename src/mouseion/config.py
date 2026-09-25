@@ -179,64 +179,69 @@ def _load() -> Config:
     return cfg
 
 
+# Every [section] key the loader understands. _render_toml must write each one
+# back (tests/test_config_roundtrip.py): a key the writer forgot is silently
+# WIPED the next time Settings is saved (openalex_api_key was, until 2026-09-24).
+_TOML_MAP = {
+    "database":     {"path": "db_path"},
+    "providers":    {
+        "crossref_email": "crossref_email",
+        "semantic_scholar_api_key": "semantic_scholar_api_key",
+        "ncbi_api_key": "ncbi_api_key",
+        "openalex_email": "openalex_email",
+        "openalex_api_key": "openalex_api_key",
+    },
+    "llm": {
+        "api_key": "llm_api_key",
+        "provider": "llm_provider",
+    },
+    "pdf":          {"storage_path": "pdf_storage_path", "auto_fetch": "auto_fetch_pdfs", "institutional_proxy_url": "institutional_proxy_url"},
+    "notion":       {"api_key": "notion_api_key", "database_id": "notion_database_id"},
+    "zotero":       {
+        "api_key": "zotero_api_key",
+        "user_id": "zotero_user_id",
+        "library_type": "zotero_library_type",
+        "library_id": "zotero_library_id",
+        "collection_id": "zotero_collection_id",
+    },
+    "obsidian":     {
+        "vault_path": "obsidian_vault_path",
+        "notes_folder": "obsidian_notes_folder",
+        "filename_template": "obsidian_filename_template",
+    },
+    "google_drive": {
+        "credentials_path": "google_drive_credentials_path",
+        "folder_id": "google_drive_folder_id",
+        "sync_enabled": "google_drive_sync_enabled",
+        "sync_interval": "google_drive_sync_interval",
+        "pdf_streaming": "google_drive_pdf_streaming",
+        "local_cache_mb": "google_drive_local_cache_mb",
+    },
+    "instapaper":   {"username": "instapaper_username", "password": "instapaper_password"},
+    "auto_tag":     {
+        "tag_by_type": "tag_by_type",
+        "tag_open_access": "tag_open_access",
+        "tag_by_year": "tag_by_year",
+    },
+    "semantic":     {
+        "model": "semantic_model",
+        "index_path": "semantic_index_path",
+        "auto_index": "semantic_auto_index",
+    },
+    "vpn":          {
+        "enabled": "vpn_enabled",
+        "type": "vpn_type",
+        "protocol": "vpn_protocol",
+        "gateway": "vpn_gateway",
+        "username": "vpn_username",
+        "password": "vpn_password",
+    },
+}
+
+
 def _apply_toml(cfg: Config, raw: dict) -> None:
     """Apply a loaded TOML dict to a Config instance."""
-    simple_sections = {
-        "database":     {"path": "db_path"},
-        "providers":    {
-            "crossref_email": "crossref_email",
-            "semantic_scholar_api_key": "semantic_scholar_api_key",
-            "ncbi_api_key": "ncbi_api_key",
-            "openalex_email": "openalex_email",
-            "openalex_api_key": "openalex_api_key",
-        },
-        "llm": {
-            "api_key": "llm_api_key",
-            "provider": "llm_provider",
-        },
-        "pdf":          {"storage_path": "pdf_storage_path", "auto_fetch": "auto_fetch_pdfs", "institutional_proxy_url": "institutional_proxy_url"},
-        "notion":       {"api_key": "notion_api_key", "database_id": "notion_database_id"},
-        "zotero":       {
-            "api_key": "zotero_api_key",
-            "user_id": "zotero_user_id",
-            "library_type": "zotero_library_type",
-            "library_id": "zotero_library_id",
-            "collection_id": "zotero_collection_id",
-        },
-        "obsidian":     {
-            "vault_path": "obsidian_vault_path",
-            "notes_folder": "obsidian_notes_folder",
-            "filename_template": "obsidian_filename_template",
-        },
-        "google_drive": {
-            "credentials_path": "google_drive_credentials_path",
-            "folder_id": "google_drive_folder_id",
-            "sync_enabled": "google_drive_sync_enabled",
-            "sync_interval": "google_drive_sync_interval",
-            "pdf_streaming": "google_drive_pdf_streaming",
-            "local_cache_mb": "google_drive_local_cache_mb",
-        },
-        "instapaper":   {"username": "instapaper_username", "password": "instapaper_password"},
-        "auto_tag":     {
-            "tag_by_type": "tag_by_type",
-            "tag_open_access": "tag_open_access",
-            "tag_by_year": "tag_by_year",
-        },
-        "semantic":     {
-            "model": "semantic_model",
-            "index_path": "semantic_index_path",
-            "auto_index": "semantic_auto_index",
-        },
-        "vpn":          {
-            "enabled": "vpn_enabled",
-            "type": "vpn_type",
-            "protocol": "vpn_protocol",
-            "gateway": "vpn_gateway",
-            "username": "vpn_username",
-            "password": "vpn_password",
-        },
-    }
-    for section, mapping in simple_sections.items():
+    for section, mapping in _TOML_MAP.items():
         sec = raw.get(section, {})
         for toml_key, cfg_attr in mapping.items():
             if toml_key in sec:
@@ -317,7 +322,15 @@ def _read_toml(path: Path) -> dict:
 def _save(cfg: Config) -> None:
     _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     content = _render_toml(cfg)
+    if _CONFIG_PATH.exists():                      # one rolling copy: a bad save is recoverable
+        _CONFIG_PATH.with_name(_CONFIG_PATH.name + ".bak").write_bytes(_CONFIG_PATH.read_bytes())
     _CONFIG_PATH.write_text(content, encoding="utf-8")
+
+
+def _q(v) -> str:
+    """A TOML basic string (JSON string escapes are valid TOML escapes)."""
+    import json
+    return json.dumps("" if v is None else str(v), ensure_ascii=False)
 
 
 def _render_toml(cfg: Config) -> str:
@@ -328,14 +341,15 @@ def _render_toml(cfg: Config) -> str:
         "# All values can also be set via MOUSEION_* environment variables.",
         "",
         "[providers]",
-        f'crossref_email             = "{cfg.crossref_email}"  # your email for CrossRef polite pool',
-        f'semantic_scholar_api_key   = "{cfg.semantic_scholar_api_key}"',
-        f'ncbi_api_key               = "{cfg.ncbi_api_key}"',
-        f'openalex_email             = "{cfg.openalex_email}"',
+        f'crossref_email             = {_q(cfg.crossref_email)}  # your email for CrossRef polite pool',
+        f'semantic_scholar_api_key   = {_q(cfg.semantic_scholar_api_key)}',
+        f'ncbi_api_key               = {_q(cfg.ncbi_api_key)}',
+        f'openalex_email             = {_q(cfg.openalex_email)}',
+        f'openalex_api_key           = {_q(cfg.openalex_api_key)}',
         "",
         "[llm]",
-        f'api_key  = "{cfg.llm_api_key}"',
-        f'provider = "{cfg.llm_provider}"  # "openai", "google", or "ollama"',
+        f'api_key  = {_q(cfg.llm_api_key)}',
+        f'provider = {_q(cfg.llm_provider)}  # "openai", "google", or "ollama"',
         "",
         "[database]",
         f"path = '{cfg.db_path}'",
@@ -343,31 +357,31 @@ def _render_toml(cfg: Config) -> str:
         "[pdf]",
         f"storage_path = '{cfg.pdf_storage_path}'",
         f"auto_fetch   = {str(cfg.auto_fetch_pdfs).lower()}",
-        f'institutional_proxy_url = "{cfg.institutional_proxy_url}"',
+        f'institutional_proxy_url = {_q(cfg.institutional_proxy_url)}',
         "",
         "[notion]",
-        f'api_key     = "{cfg.notion_api_key}"',
-        f'database_id = "{cfg.notion_database_id}"  # Notion database page ID',
+        f'api_key     = {_q(cfg.notion_api_key)}',
+        f'database_id = {_q(cfg.notion_database_id)}  # Notion database page ID',
         "",
         "[zotero]",
-        f'api_key      = "{cfg.zotero_api_key}"',
-        f'user_id      = "{cfg.zotero_user_id}"',
-        f'library_type = "{cfg.zotero_library_type}"  # "user" or "group"',
-        f'library_id   = "{cfg.zotero_library_id}"',
-        f'collection_id = "{cfg.zotero_collection_id}"  # optional',
+        f'api_key      = {_q(cfg.zotero_api_key)}',
+        f'user_id      = {_q(cfg.zotero_user_id)}',
+        f'library_type = {_q(cfg.zotero_library_type)}  # "user" or "group"',
+        f'library_id   = {_q(cfg.zotero_library_id)}',
+        f'collection_id = {_q(cfg.zotero_collection_id)}  # optional',
         "",
         "[obsidian]",
         f"vault_path        = '{cfg.obsidian_vault_path}'",
-        f'notes_folder      = "{cfg.obsidian_notes_folder}"',
-        f'filename_template = "{cfg.obsidian_filename_template}"  # {{cite_key}} or {{author}} ({{year}}) {{title}}',
+        f'notes_folder      = {_q(cfg.obsidian_notes_folder)}',
+        f'filename_template = {_q(cfg.obsidian_filename_template)}  # {{cite_key}} or {{author}} ({{year}}) {{title}}',
         "",
         "[instapaper]",
-        f'username = "{cfg.instapaper_username}"',
-        f'password = "{cfg.instapaper_password}"',
+        f'username = {_q(cfg.instapaper_username)}',
+        f'password = {_q(cfg.instapaper_password)}',
         "",
         "[google_drive]",
         f"credentials_path = '{cfg.google_drive_credentials_path}'",
-        f'folder_id        = "{cfg.google_drive_folder_id}"  # last segment of Drive folder URL',
+        f'folder_id        = {_q(cfg.google_drive_folder_id)}  # last segment of Drive folder URL',
         f"sync_enabled     = {str(cfg.google_drive_sync_enabled).lower()}",
         f"sync_interval    = {cfg.google_drive_sync_interval}  # seconds between sync cycles",
         f"pdf_streaming    = {str(cfg.google_drive_pdf_streaming).lower()}  # stream PDFs from Drive",
@@ -375,11 +389,11 @@ def _render_toml(cfg: Config) -> str:
         "",
         "[vpn]",
         f"enabled  = {str(cfg.vpn_enabled).lower()}",
-        f'type     = "{cfg.vpn_type}"  # "openconnect" or "forticlient"',
-        f'protocol = "{cfg.vpn_protocol}"  # "anyconnect" or "fortinet" or "gp"',
-        f'gateway  = "{cfg.vpn_gateway}"',
-        f'username = "{cfg.vpn_username}"',
-        f'password = "{cfg.vpn_password}"',
+        f'type     = {_q(cfg.vpn_type)}  # "openconnect" or "forticlient"',
+        f'protocol = {_q(cfg.vpn_protocol)}  # "anyconnect" or "fortinet" or "gp"',
+        f'gateway  = {_q(cfg.vpn_gateway)}',
+        f'username = {_q(cfg.vpn_username)}',
+        f'password = {_q(cfg.vpn_password)}',
         "",
         "[auto_tag]",
         f"tag_by_type    = {str(cfg.tag_by_type).lower()}",
@@ -387,7 +401,7 @@ def _render_toml(cfg: Config) -> str:
         f"tag_by_year    = {str(cfg.tag_by_year).lower()}",
         "",
         "[semantic]",
-        f'model       = "{cfg.semantic_model}"   # sentence-transformers model',
+        f'model       = {_q(cfg.semantic_model)}   # sentence-transformers model',
         f"index_path  = '{cfg.semantic_index_path}'  # empty = default location",
         f"auto_index  = {str(cfg.semantic_auto_index).lower()}  # index on add/enrich",
         "",
@@ -409,14 +423,14 @@ def _render_toml(cfg: Config) -> str:
     for rule in cfg.auto_tag_rules:
         lines.append("[[auto_tag.rules]]")
         if rule.keywords:
-            kw = ", ".join(f'"{k}"' for k in rule.keywords)
+            kw = ", ".join(_q(k) for k in rule.keywords)
             lines.append(f"keywords = [{kw}]")
         if rule.journal_pattern:
-            lines.append(f'journal_pattern = "{rule.journal_pattern}"')
+            lines.append(f'journal_pattern = {_q(rule.journal_pattern)}')
         if rule.ref_type:
-            lines.append(f'ref_type = "{rule.ref_type}"')
+            lines.append(f'ref_type = {_q(rule.ref_type)}')
         if rule.tags:
-            tg = ", ".join(f'"{t}"' for t in rule.tags)
+            tg = ", ".join(_q(t) for t in rule.tags)
             lines.append(f"tags = [{tg}]")
         lines.append("")
     return "\n".join(lines)
