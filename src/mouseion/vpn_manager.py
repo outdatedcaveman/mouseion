@@ -290,6 +290,7 @@ def start_vpn(cfg: Config) -> Dict[str, Any]:
                 raise ValueError("VPN gateway and username must be configured.")
             _vpn_start_time = time.time()
             logger.info("Starting OpenConnect 9 (elevated tunnel) to %s", cfg.vpn_gateway)
+            vpn_elevated.auth_failed = False          # an explicit attempt clears the pause
             res = vpn_elevated.connect(cfg, exe9)
             _vpn_last_error = res.get("error", "")
             return res
@@ -494,8 +495,8 @@ def initialize_vpn() -> None:
                     if not c.vpn_enabled:
                         break  # stop watchdog if disabled dynamically
                     from . import vpn_elevated
-                    if vpn_elevated.declined:
-                        continue
+                    if vpn_elevated.declined or vpn_elevated.auth_failed:
+                        continue          # a click on Connect (or new credentials) resumes
                     if get_vpn_status().get("status") not in ("disconnected", "error") or not c.vpn_gateway:
                         fails = 0
                         interval = 15.0

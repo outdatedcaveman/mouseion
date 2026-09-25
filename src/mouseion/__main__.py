@@ -435,11 +435,14 @@ def main():
         logging.exception("PDF auto-start wiring failed")
 
     # Start VPN if configured to run on startup
-    try:
-        from mouseion.vpn_manager import initialize_vpn
-        initialize_vpn()
-    except Exception:
-        logging.exception("VPN failed to initialize")
+    def _vpn_start():
+        try:
+            from mouseion.vpn_manager import initialize_vpn
+            initialize_vpn()
+        except Exception:
+            logging.exception("VPN failed to initialize")
+    # Never make the window wait on a VPN login (up to ~2 min + a UAC prompt).
+    threading.Thread(target=_vpn_start, daemon=True, name="vpn-autostart").start()
 
     # Try to open a native desktop window; fall back to browser if pywebview
     # is not available (e.g. missing system dependencies)

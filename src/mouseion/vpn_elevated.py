@@ -37,6 +37,7 @@ _NO_WINDOW = 0x08000000
 
 last_error = ""
 declined = False                          # UAC refused: no automatic retries until a click
+auth_failed = False                       # login rejected: no automatic retries (account lockout)
 
 _RUNNER = r'''param([string]$Oc, [string]$Proto, [string]$Cert, [string]$Url, [string]$Ifname, [string]$Dir)
 $ErrorActionPreference = "Continue"
@@ -101,7 +102,13 @@ def _parse_auth(out: str) -> Dict[str, str]:
 
 def _explain(out: str) -> str:
     low = out.lower()
-    if "user input required" in low or "token" in low and "required" in low:
+    # After logincheck, FortiGate re-presents the login form when the credentials
+    # are wrong: openconnect then asks for "Password:" again (seen 2026-09-25).
+    if "logincheck" in low and "password:" in low and "token" not in low:
+        return ("USP rejected the username/password (the gateway asked for the password again). "
+                "Check them in Settings > Institutional VPN -- the FortiGate login may differ from "
+                "the old Cisco one. Automatic retries are paused to protect the account.")
+    if "user input required" in low and ("token" in low or "code" in low):
         return ("The gateway asked for more than a password (e.g. a FortiToken code). "
                 "Automatic login can't answer that; tell Claude which prompt it shows.")
     if "login failed" in low or "invalid" in low and "password" in low or "authentication failed" in low \
@@ -135,7 +142,9 @@ def connect(cfg, exe: Path) -> Dict[str, Any]:
     _append_log(cfg, "AUTH", shown)
     vals = _parse_auth(out)
     if not vals.get("COOKIE") or not vals.get("FINGERPRINT"):
-        last_error = _explain(out) + "\n" + "\n".join(l for l in shown.splitlines()[-4:] if l.strip())
+        global auth_failed
+        auth_failed = True                    # never auto-retry a rejected login
+        last_error = _explain(out)
         return {"status": "error", "error": last_error}
 
     # 2. elevated tunnel (one UAC prompt), fed the session cookie only

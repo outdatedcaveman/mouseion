@@ -24,3 +24,9 @@ def test_errors_are_explained():
 def test_runner_uses_cookie_not_password():
     assert "--cookie-on-stdin" in e._RUNNER and "passwd" not in e._RUNNER
     assert "stop.flag" in e._RUNNER
+
+
+def test_rejected_login_is_named_and_pauses_retries():
+    real = ("POST https://gw:31443/remote/logincheck\nPassword: fgetws (stdin): No error\n***\n"
+            "User input required in non-interactive mode\nFailed to complete authentication\n")
+    assert "rejected the username/password" in e._explain(real)

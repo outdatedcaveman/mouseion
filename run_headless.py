@@ -72,12 +72,15 @@ def main() -> None:
             time.sleep(0.1)
 
     # --- VPN Connection (if enabled) ---------------------------------------
-    try:
-        from mouseion.vpn_manager import initialize_vpn
-        initialize_vpn()
-        logging.info("HEADLESS: VPN initialization complete")
-    except Exception:
-        logging.exception("HEADLESS: VPN initialization failed")
+    def _vpn_start():
+        try:
+            from mouseion.vpn_manager import initialize_vpn
+            initialize_vpn()
+            logging.info("HEADLESS: VPN initialization complete")
+        except Exception:
+            logging.exception("HEADLESS: VPN initialization failed")
+    import threading as _th_vpn
+    _th_vpn.Thread(target=_vpn_start, daemon=True, name="vpn-autostart").start()   # never block startup
 
     # --- Enrichment daemon -------------------------------------------------
     try:
