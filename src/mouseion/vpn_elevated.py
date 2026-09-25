@@ -70,7 +70,7 @@ Remove-Item $cookie, $pidf, $stop -ErrorAction SilentlyContinue
 # as administrator.
 # ---------------------------------------------------------------------------
 TASK = "MouseionVPN"
-RUNNER_VERSION = "2"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
+RUNNER_VERSION = "3"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
 PROTECTED = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn"
 
 _TASK_RUNNER = r"""$ErrorActionPreference = 'Continue'
@@ -89,7 +89,10 @@ $stop = Join-Path $dir 'stop.flag'; $pidf = Join-Path $dir 'tunnel.pid'
 Remove-Item $stop -ErrorAction SilentlyContinue
 $a = @("--protocol=$($p.proto)", '--cookie-on-stdin', "--servercert=$($p.cert)", "--interface=$if",
        '--no-dtls', '--non-inter', '--timestamp', $p.url)
-$proc = Start-Process -FilePath $oc -ArgumentList $a -RedirectStandardInput (Join-Path $dir 'cookie.txt') `
+# Windows PowerShell's Start-Process joins -ArgumentList WITHOUT quoting: an
+# adapter named "Ethernet 7" became two arguments (2026-09-25). Quote each one.
+$argline = ($a | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+$proc = Start-Process -FilePath $oc -ArgumentList $argline -RedirectStandardInput (Join-Path $dir 'cookie.txt') `
         -RedirectStandardOutput (Join-Path $dir 'tunnel.log') -RedirectStandardError (Join-Path $dir 'tunnel.err') `
         -NoNewWindow -PassThru
 Set-Content -Path $pidf -Value $proc.Id
