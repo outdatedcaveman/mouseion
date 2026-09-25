@@ -4558,6 +4558,7 @@ kbd {
       <button class="btn btn-primary btn-sm" id="btn-vpn-toggle" onclick="toggleVpnActive()" style="flex:1">⚡ Connect VPN</button>
       <div id="vpn-status-badge" style="display:flex;align-items:center;font-size:11px;font-weight:600;height:28px;padding:0 10px;border-radius:4px;background:var(--border);color:var(--muted)">Disconnected</div>
     </div>
+    <div id="vpn-error-hint" style="font-size:11px;color:#ef4444;white-space:pre-wrap;margin:-4px 0 10px"></div>
     <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
     <div style="font-size:13px;font-weight:600;margin-bottom:8px">📄 PDF Management</div>
     <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">PDF storage directory</label>
@@ -5219,11 +5220,21 @@ async function updateVpnStatusBadge() {
       const btn = document.getElementById('btn-vpn-toggle');
       if (badge && btn) {
         if (status.status === 'connected') {
-          badge.textContent = 'Connected (PID: ' + status.pid + ')';
+          badge.textContent = status.via === 'system' ? 'Connected (' + (status.adapter || 'system VPN') + ')' : 'Connected (PID: ' + status.pid + ')';
+          const okHint = document.getElementById('vpn-error-hint'); if (okHint) okHint.textContent = '';
           badge.style.background = 'rgba(16, 185, 129, 0.2)';
           badge.style.color = '#10b981';
           btn.textContent = '⚡ Disconnect VPN';
           btn.className = 'btn btn-secondary btn-sm';
+        } else if (status.status === 'error') {
+          badge.textContent = 'Not connected';
+          badge.title = status.error || '';
+          badge.style.background = 'rgba(239, 68, 68, 0.2)';
+          badge.style.color = '#ef4444';
+          btn.textContent = '⚡ Connect VPN';
+          btn.className = 'btn btn-primary btn-sm';
+          const hint = document.getElementById('vpn-error-hint');
+          if (hint) hint.textContent = (status.error || '').slice(0, 400);
         } else if (status.status === 'connecting') {
           badge.textContent = 'Connecting...';
           badge.style.background = 'rgba(245, 158, 11, 0.2)';

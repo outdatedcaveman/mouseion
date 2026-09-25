@@ -62,6 +62,24 @@ def _acquire_instance_lock():
             return False
 
 
+def _window_failed(url: str, why: str) -> None:
+    """The owner's standing rule: Mouseion NEVER opens a browser tab. If the
+    native window cannot open, say so in a native message box (and the log);
+    the server keeps running at `url` for anyone who wants it."""
+    logging.error("Desktop window unavailable (%s); server stays at %s", why, url)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                f"Mouseion's window could not open ({why}).\n\nThe library server is still "
+                f"running at {url}.\nClose this and start Mouseion again; if it keeps "
+                f"happening, check that Microsoft Edge WebView2 Runtime is installed.",
+                "Mouseion", 0x30)          # MB_ICONWARNING
+        except Exception:
+            pass
+
+
 def _focus_existing_window():
     """Try to bring an existing Mouseion window to the foreground (Windows)."""
     if sys.platform != "win32":
@@ -298,12 +316,7 @@ def main():
             webview.start()
             sys.exit(0)
         except Exception as e:
-            logging.warning("Failed to open webview window for existing instance: %s. Falling back to browser.", e)
-            try:
-                import webbrowser
-                webbrowser.open(url)
-            except Exception:
-                pass
+            _window_failed(url, f"{type(e).__name__}: {e}")
             sys.exit(0)
 
     # If no responsive server is running, kill any hung processes holding our ports
@@ -438,14 +451,11 @@ def main():
         logging.info("Webview window loaded successfully.")
 
     def _webview_watchdog():
-        time.sleep(8.0)
+        # A slow first paint (large library, busy disk) is NOT a failure: this
+        # watchdog used to open a browser tab after 8 s, on top of the window.
+        time.sleep(60.0)
         if not _window_loaded:
-            logging.warning("Webview window failed to load in 8 seconds. Opening in browser as fallback.")
-            try:
-                import webbrowser
-                webbrowser.open(url)
-            except Exception:
-                logging.exception("Failed to open fallback browser")
+            logging.warning("Webview window has not reported 'loaded' after 60 s (still waiting; no browser).")
 
     try:
         import webview
@@ -464,19 +474,16 @@ def main():
 
         webview.start()
     except ImportError:
-        _safe_print(f"  pywebview not available — opening in browser")
-        _safe_print(f"  -> {url}")
-        import webbrowser
-        webbrowser.open(url)
+        _safe_print(f"  pywebview not available -- server at {url} (no browser is opened)")
+        _window_failed(url, "pywebview missing")
         # Keep the process alive until Ctrl+C
         try:
             server_thread.join()
         except KeyboardInterrupt:
             pass
     except Exception as e:
-        _safe_print(f"  Desktop window failed ({e}), opening in browser")
-        import webbrowser
-        webbrowser.open(url)
+        _safe_print(f"  Desktop window failed ({e}) -- server at {url} (no browser is opened)")
+        _window_failed(url, f"{type(e).__name__}: {e}")
         try:
             server_thread.join()
         except KeyboardInterrupt:

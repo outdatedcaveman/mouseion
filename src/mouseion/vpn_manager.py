@@ -100,75 +100,105 @@ def is_vpn_connected_locally(cfg: Config) -> bool:
                 ]
             
             for ip in ips:
-                # USP public subnet
+                # USP address space: only a tunnel (or being on campus) gives one
                 if ip.startswith("143.107."):
                     return True
-                # Private subnets common for VPN interfaces (10.0.0.0/8, 172.16.0.0/12)
-                if ip.startswith("10."):
-                    return True
-                if ip.startswith("172."):
-                    try:
-                        second_octet = int(ip.split(".")[1])
-                        if 16 <= second_octet <= 31:
-                            return True
-                    except Exception:
-                        pass
+            # A VPN adapter (FortiClient, OpenConnect's TAP/Wintun, AnyConnect)
+            # that is UP and has an IPv4 address. The old 10.x/172.16-31.x rule
+            # matched WSL/Hyper-V virtual switches and reported a tunnel that
+            # did not exist.
+            if vpn_adapter_up():
+                return True
         except Exception as e:
             logger.error("Error checking local IPs: %s", e)
-            
-        # Fallback: try connecting to a USP internal DNS server over UDP (DNS default)
-        try:
-            import socket
-            packet = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03usp\x02br\x00\x00\x01\x00\x01"
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(2.0)
-            s.sendto(packet, ("143.107.253.3", 53))
-            data, addr = s.recvfrom(512)
-            s.close()
-            if len(data) >= 12 and data[:2] == b"\x12\x34":
-                return True
-        except Exception:
-            pass
-            
+        # (The old UDP probe of USP's DNS is gone: 143.107.253.3 answers from
+        # the public internet, so it "proved" a tunnel that was not there.)
         return False
         
     return True
 
 
+_ADAPTER_DESC: Dict[str, str] = {}
+_ADAPTER_DESC_AT = 0.0
+_VPN_WORDS = ("fortinet", "fortissl", "tap-windows", "tap-", "wintun", "openconnect", "anyconnect", "cisco")
+
+
+def _adapter_descriptions() -> Dict[str, str]:
+    """{interface friendly name: adapter description}, cached 5 min (wmic is slow)."""
+    global _ADAPTER_DESC, _ADAPTER_DESC_AT
+    if sys.platform != "win32":
+        return {}
+    if time.time() - _ADAPTER_DESC_AT < 300 and _ADAPTER_DESC:
+        return _ADAPTER_DESC
+    try:
+        out = subprocess.check_output(
+            ["wmic", "nic", "where", "NetConnectionID is not null", "get", "NetConnectionID,Description", "/format:csv"],
+            text=True, errors="ignore", timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+        import csv
+        import io
+        rows = csv.DictReader(io.StringIO("\n".join(l for l in out.splitlines() if l.strip())))
+        _ADAPTER_DESC = {r["NetConnectionID"]: r.get("Description") or "" for r in rows if r.get("NetConnectionID")}
+        _ADAPTER_DESC_AT = time.time()
+    except Exception as e:
+        logger.debug("adapter descriptions unavailable: %s", e)
+    return _ADAPTER_DESC
+
+
+def vpn_adapter_up() -> Optional[str]:
+    """Name of a VPN adapter that is up with an IPv4 address, else None."""
+    try:
+        import socket
+        import psutil
+        stats = psutil.net_if_stats()
+        addrs = psutil.net_if_addrs()
+        desc = _adapter_descriptions()
+        for name, st in stats.items():
+            label = f"{name} {desc.get(name, '')}".lower()
+            if not st.isup or not any(w in label for w in _VPN_WORDS):
+                continue
+            if any(a.family == socket.AF_INET and not a.address.startswith("169.254.") for a in addrs.get(name, [])):
+                return name
+    except Exception as e:
+        logger.debug("vpn adapter check failed: %s", e)
+    return None
+
+
+def _log_tail(n: int = 12) -> str:
+    try:
+        cfg = get_config()
+        lines = (Path(cfg.db_path).parent / "vpn_stdout.log").read_text(encoding="utf-8", errors="ignore").splitlines()
+        body = [l for l in lines if l.strip() and not l.startswith("--- VPN SESSION")]
+        return "\n".join(body[-n:])
+    except Exception:
+        return ""
+
+
+_vpn_last_error = ""
+
+
 def get_vpn_status() -> Dict[str, Any]:
     """Return the current VPN connection status."""
-    global _vpn_process
+    global _vpn_process, _vpn_last_error
+    cfg = get_config()
+    tunnel = is_vpn_connected_locally(cfg) if cfg.vpn_gateway else False
     with _vpn_lock:
-        if _vpn_process is None:
-            return {"status": "disconnected", "pid": None}
-        
-        # Check if process is still running
-        poll = _vpn_process.poll()
-        if poll is not None:
-            # Process terminated
-            code = _vpn_process.returncode
-            _vpn_process = None
+        proc = _vpn_process
+        if proc is not None and proc.poll() is not None:
+            code = proc.returncode
+            _vpn_process = proc = None
+            _vpn_last_error = (f"VPN client exited (code {code}). " + _log_tail(6)).strip()
             logger.warning("VPN process terminated with code %d", code)
-            return {"status": "disconnected", "pid": None, "exit_code": code}
-            
-        # Network level check
-        cfg = get_config()
-        if cfg.vpn_enabled and not is_vpn_connected_locally(cfg):
-            # Grace period of 30 seconds to allow the connection to be established
-            if time.time() - _vpn_start_time > 30.0:
-                logger.warning("VPN process is running (PID: %d) but network connection is inactive/dropped.", _vpn_process.pid)
-                return {"status": "disconnected", "pid": _vpn_process.pid, "network_dropped": True}
-            else:
-                return {
-                    "status": "connected",
-                    "pid": _vpn_process.pid,
-                    "connecting": True,
-                }
-            
-        return {
-            "status": "connected",
-            "pid": _vpn_process.pid,
-        }
+        if tunnel:
+            # Ours, or one another client (FortiClient, AnyConnect) holds open.
+            return {"status": "connected", "pid": proc.pid if proc else None,
+                    "via": "mouseion" if proc else "system", "adapter": vpn_adapter_up()}
+        if proc is not None:
+            if time.time() - _vpn_start_time <= 30.0:
+                return {"status": "connecting", "pid": proc.pid}
+            return {"status": "error", "pid": proc.pid,
+                    "error": "The VPN client is running but no tunnel came up. " + (_log_tail(6) or "")}
+        return {"status": "error" if _vpn_last_error else "disconnected", "pid": None,
+                "error": _vpn_last_error}
 
 
 def _ensure_vpn_adapters_enabled() -> None:
@@ -235,7 +265,7 @@ def _log_subprocess_output(proc: subprocess.Popen, log_path: Path) -> None:
 
 def start_vpn(cfg: Config) -> Dict[str, Any]:
     """Start the VPN tunnel using the configuration."""
-    global _vpn_process, _vpn_start_time
+    global _vpn_process, _vpn_start_time, _vpn_last_error
     _ensure_vpn_adapters_enabled()
     with _vpn_lock:
         # If already running and healthy, return status
@@ -276,6 +306,7 @@ def start_vpn(cfg: Config) -> Dict[str, Any]:
                     f"--protocol={protocol}",
                     "-u", cfg.vpn_username,
                     "--passwd-on-stdin",
+                    "--non-inter",          # exit with a message instead of waiting on a prompt forever
                     cfg.vpn_gateway
                 ]
 
@@ -295,6 +326,7 @@ def start_vpn(cfg: Config) -> Dict[str, Any]:
                 if cfg.vpn_password:
                     proc.stdin.write(cfg.vpn_password + "\n")
                     proc.stdin.flush()
+                proc.stdin.close()
 
             elif vpn_type == "forticlient":
                 exe_path = find_forticlient_path()
@@ -351,6 +383,7 @@ def start_vpn(cfg: Config) -> Dict[str, Any]:
 
             _vpn_process = proc
             _vpn_start_time = time.time()
+            _vpn_last_error = ""
 
             # Wait for connection to establish locally
             logger.info("Waiting for VPN connection to establish locally...")
@@ -362,9 +395,8 @@ def start_vpn(cfg: Config) -> Dict[str, Any]:
                     break
                 time.sleep(1.0)
             else:
-                logger.warning("VPN process started, but local connection check timed out (25s). Proceeding anyway...")
-
-            return {"status": "connected", "pid": proc.pid}
+                logger.warning("VPN process started, but no tunnel after 25 s.")
+            return get_vpn_status()
         finally:
             pass
 
@@ -388,11 +420,11 @@ def stop_vpn() -> None:
         if sys.platform == "win32":
             try:
                 import psutil
-                names = {"openconnect.exe", "fortisslvpnclient.exe"}
+                ours = {str(p).lower() for p in (find_openconnect_path(), find_forticlient_path()) if p}
                 victims = [
                     proc
-                    for proc in psutil.process_iter(["name"])
-                    if (proc.info["name"] or "").lower() in names
+                    for proc in psutil.process_iter(["name", "exe"])
+                    if (proc.info.get("exe") or "").lower() in ours
                 ]
                 for proc in victims:
                     proc.terminate()
@@ -429,7 +461,7 @@ def initialize_vpn() -> None:
                     c = get_config()
                     if not c.vpn_enabled:
                         break  # stop watchdog if disabled dynamically
-                    if get_vpn_status().get("status") != "disconnected" or not c.vpn_gateway:
+                    if get_vpn_status().get("status") not in ("disconnected", "error") or not c.vpn_gateway:
                         fails = 0
                         interval = 15.0
                         continue
