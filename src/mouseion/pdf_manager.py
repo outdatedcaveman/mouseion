@@ -43,6 +43,29 @@ _USER_AGENT = (
 _MAX_CONCURRENT = 20
 
 
+_LEDGER_KEY_CACHE: list = [0.0, "pdf"]
+
+
+def _pdf_ledger_key() -> str:
+    """The attempt ledger remembers misses per NETWORK: a miss from the open
+    internet must not block a retry through the institution's tunnel, where
+    subscription PDFs resolve (2026-09-25: every ref had been tried without
+    USP access, so connecting the VPN would have changed nothing)."""
+    import time as _t
+    if _t.time() - _LEDGER_KEY_CACHE[0] > 60:
+        key = "pdf"
+        try:
+            from .config import get_config
+            from .vpn_manager import vpn_adapter_up
+            cfg = get_config()
+            if cfg.vpn_enabled and cfg.vpn_gateway and vpn_adapter_up():
+                key = "pdf_inst"
+        except Exception:
+            pass
+        _LEDGER_KEY_CACHE[:] = [_t.time(), key]
+    return _LEDGER_KEY_CACHE[1]
+
+
 class TemporaryDownloadError(Exception):
     """Exception raised when a PDF download strategy fails due to transient reasons (rate limits, timeouts, etc.)."""
     pass
@@ -232,7 +255,8 @@ async def download_pdf(
     _router = get_router()
     _rid = getattr(ref, "_db_id", None) or getattr(ref, "_batch_id", None) or (ref.doi or ref.arxiv_id or ref.title or "")
     _eh = _router.entry_hash(ref)
-    if _rid and _router.was_tried(_rid, "pdf", _eh):
+    _ledger = _pdf_ledger_key()
+    if _rid and _router.was_tried(_rid, _ledger, _eh):
         return None
 
     from .config import get_config
@@ -394,7 +418,7 @@ async def download_pdf(
         # again.  Without this, refs where gray sources (Sci-Hub/CORE/Anna's)
         # are all dead get re-attempted every sweep forever.
         if _rid:
-            _router.record_attempt(_rid, "pdf", _eh, "miss")
+            _router.record_attempt(_rid, _ledger, _eh, "miss")
         if temporary_failure:
             logger.info("All strategies exhausted (some had temporary failures) for ref: %s", _rid)
         return None
