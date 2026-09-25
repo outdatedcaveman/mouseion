@@ -1,8 +1,15 @@
 """Bulk deduplication maintenance routines.
 
 The UI merge path is intentionally careful and row-oriented. This module is
-for large maintenance passes: it creates a restore point, then applies
-set-based safe merges with reports.
+for large maintenance passes: set-based safe merges with reports.
+
+Nothing is destroyed (2026-09-25): a merged-away row moves to the
+``refs_duplicates`` archive (with ``duplicate_of`` = the row it merged into)
+and every keeper's pre-merge row is copied to ``refs_dedup_keep_bak``, so any
+merge can be undone in SQL -- no 1 GB database copy per run. Every identifier
+merge must also pass a title-agreement veto: book chapters share their book's
+ISBN and URL ("Scientific Realism" + Boyd's and McMullin's chapters), and a
+wrongly assigned DOI must not fuse two works.
 """
 
 from __future__ import annotations
@@ -77,6 +84,85 @@ def _recreate_fts_triggers(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
 
 
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _norm_title(t: Any) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", _TAG.sub(" ", str(t or "")))
+    t = "".join(ch for ch in t if not unicodedata.combining(ch)).lower()
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", t).split())
+
+
+def _type_family(t: Any) -> str:
+    t = str(t or "").lower()
+    if t in ("book", "monograph", "edited-book", "reference-book"):
+        return "book"
+    if t in ("book-chapter", "chapter", "book-section", "reference-entry"):
+        return "chapter"
+    return "other"
+
+
+def _veto_pairs(conn: sqlite3.Connection, strict: bool) -> int:
+    """Drop pairs whose titles disagree. Lenient (DOI/PMID/arXiv): shared words
+    must dominate -- subtitles and casing differ between sources. Strict
+    (ISBN/URL, which chapters share with their book): near-identical titles and
+    the same kind of item."""
+    try:
+        from rapidfuzz import fuzz
+        set_ratio, sort_ratio = fuzz.token_set_ratio, fuzz.token_sort_ratio
+    except Exception:                                  # pragma: no cover - rapidfuzz ships with Mouseion
+        from difflib import SequenceMatcher
+        set_ratio = sort_ratio = lambda a, b: 100 * SequenceMatcher(None, a, b).ratio()  # noqa: E731
+    rows = conn.execute(
+        "SELECT p.keep_id, p.drop_id, k.title, d.title, k.ref_type, d.ref_type "
+        "FROM pairs p JOIN refs k ON k.id = p.keep_id JOIN refs d ON d.id = p.drop_id").fetchall()
+    bad = []
+    for keep, drop, kt, dt, ktype, dtype in rows:
+        a, b = _norm_title(kt), _norm_title(dt)
+        if strict:
+            ok = bool(a and b) and sort_ratio(a, b) >= 92 and _type_family(ktype) == _type_family(dtype)
+        else:
+            ok = not a or not b or set_ratio(a, b) >= 60 and sort_ratio(a, b) >= 45
+        if not ok:
+            bad.append((keep, drop))
+    conn.executemany("DELETE FROM pairs WHERE keep_id = ? AND drop_id = ?", bad)
+    return len(bad)
+
+
+def _ensure_archive(conn: sqlite3.Connection) -> list[str]:
+    """refs_duplicates mirrors refs (+ duplicate_of, archived_at, archive_rule);
+    refs_dedup_keep_bak holds keepers' pre-merge rows. Returns refs' columns."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(refs)")]
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='refs_duplicates'").fetchone():
+        conn.execute("CREATE TABLE refs_duplicates AS SELECT * FROM refs WHERE 0")
+        for extra in ("duplicate_of", "archived_at", "archive_rule"):
+            conn.execute(f"ALTER TABLE refs_duplicates ADD COLUMN {extra} TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS refs_duplicates_id ON refs_duplicates(id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS refs_duplicates_of ON refs_duplicates(duplicate_of)")
+    have = {r[1] for r in conn.execute("PRAGMA table_info(refs_duplicates)")}
+    for c in cols:                                     # refs gained a column since: follow it
+        if c not in have:
+            conn.execute(f"ALTER TABLE refs_duplicates ADD COLUMN {c}")
+    conn.execute("CREATE TABLE IF NOT EXISTS refs_dedup_keep_bak "
+                 "(id TEXT, row_json TEXT, backed_up_at TEXT DEFAULT (datetime('now')))")
+    return cols
+
+
+def _archive_marked(conn: sqlite3.Connection) -> int:
+    """Rows already flagged status='duplicate' (earlier repairs) join the archive."""
+    cols = _ensure_archive(conn)
+    n = _scalar(conn, "SELECT COUNT(*) FROM refs WHERE status = 'duplicate'")
+    if n:
+        cl = ", ".join(cols)
+        conn.execute(f"INSERT INTO refs_duplicates ({cl}, duplicate_of, archived_at, archive_rule) "
+                     f"SELECT {cl}, NULL, datetime('now'), 'marked-duplicate' FROM refs WHERE status = 'duplicate'")
+        conn.execute("DELETE FROM enrich_queue WHERE ref_id IN (SELECT id FROM refs WHERE status = 'duplicate')")
+        conn.execute("DELETE FROM refs_fts WHERE ref_id IN (SELECT id FROM refs WHERE status = 'duplicate')")
+        conn.execute("DELETE FROM refs WHERE status = 'duplicate'")
+    return n
+
+
 def _run_url_title_year_batch(conn: sqlite3.Connection, max_merges: int) -> Dict[str, int]:
     """Merge exact URL + exact title + same year groups in one set-based batch."""
     conn.execute("DROP TABLE IF EXISTS temp.work")
@@ -121,7 +207,7 @@ def _run_url_title_year_batch(conn: sqlite3.Connection, max_merges: int) -> Dict
         SELECT keep_id, id AS drop_id FROM ranked WHERE rn > 1 LIMIT {int(max_merges)}
         """
     )
-    return _apply_pairs(conn)
+    return _apply_pairs(conn, rule="same_url_title_year")
 
 
 def _run_url_batch(conn: sqlite3.Connection, max_merges: int) -> Dict[str, int]:
@@ -171,7 +257,10 @@ def _run_url_batch(conn: sqlite3.Connection, max_merges: int) -> Dict[str, int]:
         SELECT keep_id, id AS drop_id FROM ranked WHERE rn > 1 LIMIT {int(max_merges)}
         """
     )
-    return _apply_pairs(conn)
+    vetoed = _veto_pairs(conn, strict=True)
+    stats = _apply_pairs(conn, rule="same_url")
+    stats["vetoed_title_mismatch"] = vetoed
+    return stats
 
 
 def _run_title_year_author_batch(conn: sqlite3.Connection, max_merges: int) -> Dict[str, int]:
@@ -225,7 +314,7 @@ def _run_title_year_author_batch(conn: sqlite3.Connection, max_merges: int) -> D
         SELECT keep_id, id AS drop_id FROM ranked WHERE rn > 1 LIMIT {int(max_merges)}
         """
     )
-    return _apply_pairs(conn)
+    return _apply_pairs(conn, rule="same_title_year_first_author")
 
 
 def _run_identifier_batch(conn: sqlite3.Connection, identifier: str, max_merges: int) -> Dict[str, int]:
@@ -264,7 +353,10 @@ def _run_identifier_batch(conn: sqlite3.Connection, identifier: str, max_merges:
         SELECT keep_id, id AS drop_id FROM ranked WHERE rn > 1 LIMIT {int(max_merges)}
         """
     )
-    return _apply_pairs(conn)
+    vetoed = _veto_pairs(conn, strict=(identifier == "isbn"))
+    stats = _apply_pairs(conn, rule=f"same_{identifier}")
+    stats["vetoed_title_mismatch"] = vetoed
+    return stats
 
 
 def _json_dict(value: Any) -> dict:
@@ -400,7 +492,7 @@ def _write_consolidated_rows(conn: sqlite3.Connection, rows: list[dict]) -> int:
     return written
 
 
-def _apply_pairs(conn: sqlite3.Connection) -> Dict[str, int]:
+def _apply_pairs(conn: sqlite3.Connection, rule: str = "") -> Dict[str, int]:
     selected = _scalar(conn, "SELECT COUNT(*) FROM pairs")
     if selected <= 0:
         return {"selected": 0, "merged": 0, "skipped_conflicts": 0}
@@ -423,6 +515,13 @@ def _apply_pairs(conn: sqlite3.Connection) -> Dict[str, int]:
             """
         )
     after_conflicts = _scalar(conn, "SELECT COUNT(*) FROM pairs")
+    if after_conflicts <= 0:
+        return {"selected": selected, "merged": 0, "skipped_conflicts": selected}
+    cols = _ensure_archive(conn)
+    conn.execute(
+        "INSERT INTO refs_dedup_keep_bak (id, row_json) SELECT r.id, json_object("
+        + ", ".join(f"'{c}', r.{c}" for c in cols)
+        + ") FROM refs r WHERE r.id IN (SELECT DISTINCT keep_id FROM pairs)")
     consolidated_rows = _build_consolidated_rows(conn)
 
     for col in FILL_COLS:
@@ -511,7 +610,12 @@ def _apply_pairs(conn: sqlite3.Connection) -> Dict[str, int]:
     conn.execute("DELETE FROM ref_tags WHERE ref_id IN (SELECT drop_id FROM pairs)")
     conn.execute("DELETE FROM ref_collections WHERE ref_id IN (SELECT drop_id FROM pairs)")
     conn.execute("DELETE FROM refs_fts WHERE ref_id IN (SELECT drop_id FROM pairs) OR ref_id IN (SELECT keep_id FROM pairs)")
-    conn.execute("DELETE FROM refs WHERE id IN (SELECT drop_id FROM pairs)")
+    cl = ", ".join(cols)
+    conn.execute(
+        f"INSERT INTO refs_duplicates ({cl}, duplicate_of, archived_at, archive_rule) "
+        f"SELECT {', '.join('r.' + c for c in cols)}, p.keep_id, datetime('now'), ? "
+        f"FROM refs r JOIN pairs p ON p.drop_id = r.id", (rule,))
+    conn.execute("DELETE FROM refs WHERE id IN (SELECT drop_id FROM pairs)")   # archived above
     consolidated = _write_consolidated_rows(conn, consolidated_rows)
     conn.execute("DELETE FROM refs_fts WHERE ref_id IN (SELECT keep_id FROM pairs)")
     conn.execute(
@@ -568,6 +672,7 @@ def run_dedup_all(
     conn.execute("DROP TRIGGER IF EXISTS refs_ad")
     conn.execute("DROP TRIGGER IF EXISTS refs_au")
     try:
+        passes.append({"rule": "archive_marked_duplicates", "merged": _archive_marked(conn)})
         for ident in ("doi", "pmid", "pmcid", "arxiv_id", "isbn"):
             if remaining <= 0:
                 break

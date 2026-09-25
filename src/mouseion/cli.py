@@ -1055,7 +1055,7 @@ def dedup_all(max_merges: int, yes: bool):
             abort=True,
         )
     from .maintenance_dedup import run_dedup_all
-    report = run_dedup_all(max_merges=max_merges, mode="safe", restore_point=True)
+    report = run_dedup_all(max_merges=max_merges, mode="safe", restore_point=False)   # merges are archived (refs_duplicates), no 1 GB copy
     console.print(f"[green]Dedup complete[/green]: merged {report['merged']:,} refs")
     console.print(f"Restore point: {report.get('restore_point')}")
     console.print(f"Report: {report.get('report_path')}")

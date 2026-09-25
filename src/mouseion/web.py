@@ -1240,7 +1240,7 @@ def run_dedup_job():
     def _worker():
         try:
             from .maintenance_dedup import run_dedup_all
-            report = run_dedup_all(max_merges=max_merges, mode=mode, restore_point=True)
+            report = run_dedup_all(max_merges=max_merges, mode=mode, restore_point=False)   # merges are archived (refs_duplicates), no 1 GB copy
             _update_job(
                 job_id,
                 status="done",
