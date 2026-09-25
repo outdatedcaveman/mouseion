@@ -70,6 +70,7 @@ Remove-Item $cookie, $pidf, $stop -ErrorAction SilentlyContinue
 # as administrator.
 # ---------------------------------------------------------------------------
 TASK = "MouseionVPN"
+RUNNER_VERSION = "2"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
 PROTECTED = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn"
 
 _TASK_RUNNER = r"""$ErrorActionPreference = 'Continue'
@@ -81,10 +82,12 @@ if ($p.proto -notin @('fortinet','anyconnect','gp','nc','pulse','f5','array')) {
 if ($p.cert -notmatch '^(pin-sha256:[A-Za-z0-9+/=]{20,100}|sha1:[0-9a-fA-F]{40}|sha256:[0-9a-fA-F]{64}|[0-9a-fA-F]{40})$') { exit 3 }
 if ($p.url -notmatch '^https://([A-Za-z0-9.-]+)(:\d{1,5})?(/[A-Za-z0-9._~/?=&%-]*)?$') { exit 4 }
 if ($Matches[1].ToLower() -ne $allowed) { exit 5 }
+$if = if ($p.ifname) { [string]$p.ifname } else { 'openconnect-mouseion' }
+if ($if -notmatch '^[A-Za-z0-9 ._()-]{1,64}$') { exit 6 }
 $oc = Join-Path $prot 'openconnect\openconnect.exe'
 $stop = Join-Path $dir 'stop.flag'; $pidf = Join-Path $dir 'tunnel.pid'
 Remove-Item $stop -ErrorAction SilentlyContinue
-$a = @("--protocol=$($p.proto)", '--cookie-on-stdin', "--servercert=$($p.cert)", '--interface=openconnect-mouseion',
+$a = @("--protocol=$($p.proto)", '--cookie-on-stdin', "--servercert=$($p.cert)", "--interface=$if",
        '--no-dtls', '--non-inter', '--timestamp', $p.url)
 $proc = Start-Process -FilePath $oc -ArgumentList $a -RedirectStandardInput (Join-Path $dir 'cookie.txt') `
         -RedirectStandardOutput (Join-Path $dir 'tunnel.log') -RedirectStandardError (Join-Path $dir 'tunnel.err') `
@@ -98,7 +101,7 @@ Start-Sleep -Milliseconds 500
 Remove-Item (Join-Path $dir 'cookie.txt'), $pidf, $stop -ErrorAction SilentlyContinue
 """
 
-_SETUP = r"""param([string]$Src, [string]$Prot, [string]$HostName, [string]$User)
+_SETUP = r"""param([string]$Src, [string]$Prot, [string]$HostName, [string]$User, [string]$Version)
 $ErrorActionPreference = 'Stop'
 $log = Join-Path $Src 'setup.log'
 try {
@@ -111,6 +114,7 @@ try {
   Copy-Item -Path (Join-Path $Src 'openconnect') -Destination $Prot -Recurse -Force
   Copy-Item -Path (Join-Path $Src 'runner.ps1') -Destination (Join-Path $Prot 'runner.ps1') -Force
   Set-Content -Path (Join-Path $Prot 'allowed_host.txt') -Value $HostName -Encoding ASCII
+  Set-Content -Path (Join-Path $Prot 'runner_version.txt') -Value $Version -Encoding ASCII
   # folder: admins + SYSTEM write, users read; files inherit it (OI/CI flags only mean
   # something on a folder -- applied to files they left them unreadable, 2026-09-25)
   & icacls $Prot /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null
@@ -128,9 +132,33 @@ def task_installed() -> bool:
     try:
         r = subprocess.run(["schtasks", "/query", "/tn", TASK], capture_output=True, text=True, timeout=20,
                            creationflags=_NO_WINDOW)
-        return r.returncode == 0 and (PROTECTED / "runner.ps1").exists()
+        if r.returncode != 0 or not (PROTECTED / "runner.ps1").exists():
+            return False
+        return (PROTECTED / "runner_version.txt").read_text(encoding="utf-8-sig").strip() == RUNNER_VERSION
     except Exception:
         return False
+
+
+def pick_adapter() -> str:
+    """openconnect's Wintun support is experimental: its vpnc-script cannot set the
+    address on a fresh Wintun adapter ("did not complete within 10 seconds",
+    netsh error 123 -- vpnc-scripts#30). A TAP-Windows adapter works; use a free one
+    (not another VPN product's), else fall back to Wintun."""
+    try:
+        out = subprocess.check_output(
+            ["wmic", "nic", "where", "NetConnectionID is not null", "get", "NetConnectionID,Description", "/format:csv"],
+            text=True, errors="ignore", timeout=15, creationflags=_NO_WINDOW)
+        import csv
+        import io
+        rows = csv.DictReader(io.StringIO("\n".join(l for l in out.splitlines() if l.strip())))
+        for r in rows:
+            desc = (r.get("Description") or "").lower()
+            name = r.get("NetConnectionID") or ""
+            if desc.startswith("tap-windows adapter") and re.fullmatch(r"[A-Za-z0-9 ._()-]{1,64}", name):
+                return name
+    except Exception:
+        pass
+    return IFNAME
 
 
 def _allowed_host() -> str:
@@ -161,7 +189,7 @@ def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
     (stage / "setup.ps1").write_text(_SETUP, encoding="utf-8")
     user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
     params = (f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{stage / "setup.ps1"}" '
-              f'-Src "{stage}" -Prot "{PROTECTED}" -HostName "{gateway_host}" -User "{user}"')
+              f'-Src "{stage}" -Prot "{PROTECTED}" -HostName "{gateway_host}" -User "{user}" -Version "{RUNNER_VERSION}"')
     rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", params, None, 0)
     if rc <= 32:
         return False, ("Windows admin permission was declined -- the one-time VPN setup was not installed."
@@ -284,8 +312,8 @@ def connect(cfg, exe: Path) -> Dict[str, Any]:
                 pass
             return {"status": "error", "error": last_error}
     import json as _json
-    (RUN_DIR / "params.json").write_text(_json.dumps({"proto": proto, "cert": vals["FINGERPRINT"], "url": url}),
-                                         encoding="utf-8")
+    (RUN_DIR / "params.json").write_text(_json.dumps({"proto": proto, "cert": vals["FINGERPRINT"], "url": url,
+                                                      "ifname": pick_adapter()}), encoding="utf-8")
     r = subprocess.run(["schtasks", "/run", "/tn", TASK], capture_output=True, text=True, timeout=30,
                        creationflags=_NO_WINDOW)
     if r.returncode == 0:
@@ -315,7 +343,7 @@ def connect(cfg, exe: Path) -> Dict[str, Any]:
 def _await_tunnel() -> Dict[str, Any]:
     global last_error
     last_error = ""
-    for _ in range(40):                               # adapter + routes take a few seconds
+    for _ in range(90):                               # adapter + routes take a while
         time.sleep(1)
         from .vpn_manager import vpn_adapter_up
         if vpn_adapter_up():
