@@ -706,6 +706,18 @@ def run_dedup_all(
                 if stats["merged"] == 0:
                     break
 
+        # A keeper merged away by a later pass leaves chains: point every
+        # archived row at the record that survived.
+        for _ in range(8):
+            changed = conn.execute(
+                """UPDATE refs_duplicates SET duplicate_of = (
+                       SELECT d2.duplicate_of FROM refs_duplicates d2
+                       WHERE d2.id = refs_duplicates.duplicate_of LIMIT 1)
+                   WHERE duplicate_of IS NOT NULL
+                     AND duplicate_of NOT IN (SELECT id FROM refs)
+                     AND duplicate_of IN (SELECT id FROM refs_duplicates)""").rowcount
+            if not changed:
+                break
         # Recreate triggers using the canonical DB DDL.
         _recreate_fts_triggers(conn)
         conn.commit()
