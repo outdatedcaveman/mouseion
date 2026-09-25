@@ -45,7 +45,7 @@ $cookie = Join-Path $Dir "cookie.txt"
 $stop   = Join-Path $Dir "stop.flag"
 $pidf   = Join-Path $Dir "tunnel.pid"
 Remove-Item $stop -ErrorAction SilentlyContinue
-$a = @("--protocol=$Proto", "--cookie-on-stdin", "--servercert=$Cert", "--interface=$Ifname", "--non-inter", "--timestamp", $Url)
+$a = @("--protocol=$Proto", "--cookie-on-stdin", "--servercert=$Cert", "--interface=$Ifname", "--no-dtls", "--non-inter", "--timestamp", $Url)
 $p = Start-Process -FilePath $Oc -ArgumentList $a -RedirectStandardInput $cookie `
      -RedirectStandardOutput (Join-Path $Dir "tunnel.log") -RedirectStandardError (Join-Path $Dir "tunnel.err") `
      -NoNewWindow -PassThru
@@ -57,6 +57,102 @@ while (-not $p.HasExited) {
 Start-Sleep -Milliseconds 500
 Remove-Item $cookie, $pidf, $stop -ErrorAction SilentlyContinue
 '''
+
+
+# ---------------------------------------------------------------------------
+# No prompt per connect (2026-09-25: a UAC prompt on every reconnect "every
+# minute"). One elevated setup installs a runner in an admin-only folder and a
+# scheduled task that runs it elevated ON DEMAND; afterwards Mouseion starts the
+# tunnel with `schtasks /run` -- no prompt. The runner accepts only validated
+# values from the user's folder (protocol allow-list, fingerprint and URL
+# patterns) and only the gateway host recorded at setup, with the openconnect
+# binary from its own protected copy: it cannot be used to run anything else
+# as administrator.
+# ---------------------------------------------------------------------------
+TASK = "MouseionVPN"
+PROTECTED = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn"
+
+_TASK_RUNNER = r"""$ErrorActionPreference = 'Continue'
+$prot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$dir  = Join-Path $env:LOCALAPPDATA 'mouseion\vpn'
+$p = Get-Content (Join-Path $dir 'params.json') -Raw | ConvertFrom-Json
+$allowed = (Get-Content (Join-Path $prot 'allowed_host.txt') -Raw).Trim().ToLower()
+if ($p.proto -notin @('fortinet','anyconnect','gp','nc','pulse','f5','array')) { exit 2 }
+if ($p.cert -notmatch '^(pin-sha256:[A-Za-z0-9+/=]{20,100}|sha1:[0-9a-fA-F]{40}|sha256:[0-9a-fA-F]{64}|[0-9a-fA-F]{40})$') { exit 3 }
+if ($p.url -notmatch '^https://([A-Za-z0-9.-]+)(:\d{1,5})?(/[A-Za-z0-9._~/?=&%-]*)?$') { exit 4 }
+if ($Matches[1].ToLower() -ne $allowed) { exit 5 }
+$oc = Join-Path $prot 'openconnect\openconnect.exe'
+$stop = Join-Path $dir 'stop.flag'; $pidf = Join-Path $dir 'tunnel.pid'
+Remove-Item $stop -ErrorAction SilentlyContinue
+$a = @("--protocol=$($p.proto)", '--cookie-on-stdin', "--servercert=$($p.cert)", '--interface=openconnect-mouseion',
+       '--no-dtls', '--non-inter', '--timestamp', $p.url)
+$proc = Start-Process -FilePath $oc -ArgumentList $a -RedirectStandardInput (Join-Path $dir 'cookie.txt') `
+        -RedirectStandardOutput (Join-Path $dir 'tunnel.log') -RedirectStandardError (Join-Path $dir 'tunnel.err') `
+        -NoNewWindow -PassThru
+Set-Content -Path $pidf -Value $proc.Id
+while (-not $proc.HasExited) {
+    if (Test-Path $stop) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; break }
+    Start-Sleep -Milliseconds 1000
+}
+Start-Sleep -Milliseconds 500
+Remove-Item (Join-Path $dir 'cookie.txt'), $pidf, $stop -ErrorAction SilentlyContinue
+"""
+
+_SETUP = r"""param([string]$Src, [string]$Prot, [string]$HostName, [string]$User)
+$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Force -Path $Prot | Out-Null
+Copy-Item -Path (Join-Path $Src 'openconnect') -Destination $Prot -Recurse -Force
+Copy-Item -Path (Join-Path $Src 'runner.ps1') -Destination (Join-Path $Prot 'runner.ps1') -Force
+Set-Content -Path (Join-Path $Prot 'allowed_host.txt') -Value $HostName
+& icacls $Prot /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /T /Q | Out-Null
+$act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $Prot 'runner.ps1') + '"')
+$pri = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 30) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName 'MouseionVPN' -Action $act -Principal $pri -Settings $set -Force | Out-Null
+Set-Content -Path (Join-Path $Src 'setup.ok') -Value 'ok'
+"""
+
+
+def task_installed() -> bool:
+    try:
+        r = subprocess.run(["schtasks", "/query", "/tn", TASK], capture_output=True, text=True, timeout=20,
+                           creationflags=_NO_WINDOW)
+        return r.returncode == 0 and (PROTECTED / "runner.ps1").exists()
+    except Exception:
+        return False
+
+
+def _allowed_host() -> str:
+    try:
+        return (PROTECTED / "allowed_host.txt").read_text(encoding="utf-8-sig").strip().lower()
+    except OSError:
+        return ""
+
+
+def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
+    """The one elevated step: protected runner + on-demand scheduled task."""
+    import ctypes
+    import shutil
+    stage = RUN_DIR / "setup"
+    if stage.exists():
+        shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(exe.parent, stage / "openconnect")
+    (stage / "runner.ps1").write_text(_TASK_RUNNER, encoding="utf-8")
+    (stage / "setup.ps1").write_text(_SETUP, encoding="utf-8")
+    user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
+    params = (f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{stage / "setup.ps1"}" '
+              f'-Src "{stage}" -Prot "{PROTECTED}" -HostName "{gateway_host}" -User "{user}"')
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", params, None, 0)
+    if rc <= 32:
+        return False, ("Windows admin permission was declined -- the one-time VPN setup was not installed."
+                       if rc == 5 else f"Could not start the one-time VPN setup (code {rc}).")
+    for _ in range(90):
+        if (stage / "setup.ok").exists() and task_installed():
+            shutil.rmtree(stage, ignore_errors=True)
+            return True, "installed"
+        time.sleep(1)
+    return False, "The one-time VPN setup did not finish (90 s)."
 
 
 def is_v9(exe: Path) -> bool:
@@ -154,9 +250,27 @@ def connect(cfg, exe: Path) -> Dict[str, Any]:
             (RUN_DIR / stale).unlink()
         except FileNotFoundError:
             pass
+    url = vals.get("CONNECT_URL") or cfg.vpn_gateway
+    host = re.sub(r"^https?://", "", url).split("/")[0].split(":")[0].lower()
+    if not task_installed() or _allowed_host() != host:
+        ok, why = install_task(exe, host)             # the one prompt, once per gateway
+        if not ok:
+            declined = "declined" in why
+            last_error = why
+            try:
+                (RUN_DIR / "cookie.txt").unlink()
+            except FileNotFoundError:
+                pass
+            return {"status": "error", "error": last_error}
+    import json as _json
+    (RUN_DIR / "params.json").write_text(_json.dumps({"proto": proto, "cert": vals["FINGERPRINT"], "url": url}),
+                                         encoding="utf-8")
+    r = subprocess.run(["schtasks", "/run", "/tn", TASK], capture_output=True, text=True, timeout=30,
+                       creationflags=_NO_WINDOW)
+    if r.returncode == 0:
+        return _await_tunnel()
     script = RUN_DIR / "tunnel_runner.ps1"
     script.write_text(_RUNNER, encoding="utf-8")
-    url = vals.get("CONNECT_URL") or cfg.vpn_gateway
     params = (f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script}" '
               f'-Oc "{exe}" -Proto "{proto}" -Cert "{vals["FINGERPRINT"]}" -Url "{url}" '
               f'-Ifname "{IFNAME}" -Dir "{RUN_DIR}"')
@@ -174,6 +288,11 @@ def connect(cfg, exe: Path) -> Dict[str, Any]:
             last_error = f"Could not start the elevated VPN runner (ShellExecute code {rc})."
         return {"status": "error", "error": last_error}
     declined = False
+    return _await_tunnel()
+
+
+def _await_tunnel() -> Dict[str, Any]:
+    global last_error
     last_error = ""
     for _ in range(40):                               # adapter + routes take a few seconds
         time.sleep(1)
