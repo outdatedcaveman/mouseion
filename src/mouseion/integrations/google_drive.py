@@ -47,7 +47,35 @@ _MIME_SQLITE = "application/x-sqlite3"
 _folder_cache: Dict[str, str] = {}  # path-like key -> Drive folder ID
 
 
-def _build_service():
+def _find_client_secret(configured: str) -> Optional[Path]:
+    """The configured credentials file, or -- when that path went stale (Google
+    Drive moved from ~/Google Drive to "G:/My Drive", 2026-08: the Drive backup
+    then failed silently for five weeks) -- a client_secret*.json in the places
+    Mouseion keeps it."""
+    if configured:
+        p = Path(configured).expanduser()
+        if p.exists():
+            return p
+    from ..config import get_config
+    cfg = get_config()
+    roots = [Path("~/.config/mouseion").expanduser(), Path("G:/My Drive/Mouseion PDFs"),
+             Path("~/Google Drive/Mouseion PDFs").expanduser(), Path("~/My Drive/Mouseion PDFs").expanduser()]
+    if configured:
+        roots.insert(0, Path(configured).expanduser().parent)
+    if cfg.pdf_storage_path:
+        roots.append(Path(cfg.pdf_storage_path))
+    for root in roots:
+        try:
+            hits = sorted(root.glob("client_secret*.json"))
+        except OSError:
+            continue
+        if hits:
+            logger.warning("Drive credentials not at %s; using %s", configured, hits[0])
+            return hits[0]
+    return None
+
+
+def _build_service(interactive: bool = False):
     """Return an authenticated Drive v3 service client.
 
     Prefers the GOOGLE_DRIVE_CREDENTIALS_JSON env var (suitable for secrets
@@ -83,9 +111,9 @@ def _build_service():
                 "google_drive_credentials_path in config.toml."
             )
         
-        full_path = Path(path).expanduser()
-        if not full_path.exists():
-            raise FileNotFoundError(f"Credentials file not found at {full_path}")
+        full_path = _find_client_secret(path)
+        if full_path is None:
+            raise FileNotFoundError(f"Credentials file not found at {Path(path).expanduser()}")
 
         with open(str(full_path), "r") as f:
             creds_data = json.load(f)
@@ -112,6 +140,13 @@ def _build_service():
                         creds = None
                 
                 if not creds or not creds.valid:
+                    # The consent flow opens a browser tab: only on an explicit
+                    # request (`mouseion drive-auth`), never from a background
+                    # sync -- Mouseion must not open a browser on its own.
+                    if not (interactive or os.environ.get("MOUSEION_DRIVE_AUTH") == "1"):
+                        raise PermissionError(
+                            "Google Drive authorization expired. Run `mouseion drive-auth` "
+                            "(or re-authorize Drive) to renew it.")
                     flow = InstalledAppFlow.from_client_secrets_file(
                         str(full_path), _SCOPES
                     )
@@ -350,7 +385,8 @@ def upload_db_backup(local_path: Path, service=None) -> str:
     existing = service.files().list(q=q, fields="files(id)").execute().get("files", [])
 
     for f in existing:
-        # Rename to refs_backup_prev.db (delete any existing _prev first)
+        # Rename to refs_backup_prev.db; the older _prev goes to Drive's trash
+        # (recoverable for 30 days), never a permanent delete
         q_prev = (
             f"'{db_folder}' in parents and name = 'refs_backup_prev.db' "
             f"and trashed = false"
@@ -358,7 +394,7 @@ def upload_db_backup(local_path: Path, service=None) -> str:
         prev = service.files().list(q=q_prev, fields="files(id)").execute().get("files", [])
         for p in prev:
             try:
-                service.files().delete(fileId=p["id"]).execute()
+                service.files().update(fileId=p["id"], body={"trashed": True}).execute()
             except Exception:
                 pass
         try:

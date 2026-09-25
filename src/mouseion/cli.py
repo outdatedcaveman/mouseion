@@ -1043,6 +1043,16 @@ def drive_upload(delete_local, limit):
 # stats
 # ---------------------------------------------------------------------------
 
+@main.command("drive-auth")
+def drive_auth():
+    """Renew Google Drive authorization (opens Google's consent page -- the only
+    place Mouseion ever opens a browser, and only because you asked)."""
+    from .integrations.google_drive import _build_service
+    svc = _build_service(interactive=True)
+    who = svc.about().get(fields="user(emailAddress)").execute()["user"]["emailAddress"]
+    console.print(f"[green]✓[/green] Google Drive authorized ({who.split('@')[0][:2]}***)")
+
+
 @main.command("dedup-all")
 @click.option("--max-merges", default=50_000, show_default=True,
               help="Maximum rows to merge in this run")
