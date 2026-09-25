@@ -100,16 +100,27 @@ Remove-Item (Join-Path $dir 'cookie.txt'), $pidf, $stop -ErrorAction SilentlyCon
 
 _SETUP = r"""param([string]$Src, [string]$Prot, [string]$HostName, [string]$User)
 $ErrorActionPreference = 'Stop'
-New-Item -ItemType Directory -Force -Path $Prot | Out-Null
-Copy-Item -Path (Join-Path $Src 'openconnect') -Destination $Prot -Recurse -Force
-Copy-Item -Path (Join-Path $Src 'runner.ps1') -Destination (Join-Path $Prot 'runner.ps1') -Force
-Set-Content -Path (Join-Path $Prot 'allowed_host.txt') -Value $HostName
-& icacls $Prot /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /T /Q | Out-Null
-$act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $Prot 'runner.ps1') + '"')
-$pri = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
-$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 30) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName 'MouseionVPN' -Action $act -Principal $pri -Settings $set -Force | Out-Null
-Set-Content -Path (Join-Path $Src 'setup.ok') -Value 'ok'
+$log = Join-Path $Src 'setup.log'
+try {
+  if (Test-Path $Prot) {
+    # an earlier setup may have left files with no readable ACL: take them back first
+    & takeown /f $Prot /r /d y | Out-Null
+    & icacls $Prot /reset /T /Q | Out-Null
+  }
+  New-Item -ItemType Directory -Force -Path $Prot | Out-Null
+  Copy-Item -Path (Join-Path $Src 'openconnect') -Destination $Prot -Recurse -Force
+  Copy-Item -Path (Join-Path $Src 'runner.ps1') -Destination (Join-Path $Prot 'runner.ps1') -Force
+  Set-Content -Path (Join-Path $Prot 'allowed_host.txt') -Value $HostName -Encoding ASCII
+  # folder: admins + SYSTEM write, users read; files inherit it (OI/CI flags only mean
+  # something on a folder -- applied to files they left them unreadable, 2026-09-25)
+  & icacls $Prot /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null
+  & icacls (Join-Path $Prot '*') /reset /T /Q | Out-Null
+  $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $Prot 'runner.ps1') + '"')
+  $pri = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+  $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 30) -MultipleInstances IgnoreNew
+  Register-ScheduledTask -TaskName 'MouseionVPN' -Action $act -Principal $pri -Settings $set -Force | Out-Null
+  Set-Content -Path (Join-Path $Src 'setup.ok') -Value 'ok'
+} catch { Set-Content -Path $log -Value ($_ | Out-String) }
 """
 
 
@@ -129,8 +140,16 @@ def _allowed_host() -> str:
         return ""
 
 
+_setup_attempted = False
+
+
 def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
-    """The one elevated step: protected runner + on-demand scheduled task."""
+    """The one elevated step: protected runner + on-demand scheduled task.
+    At most once per session: a setup that did not take must not prompt again."""
+    global _setup_attempted
+    if _setup_attempted:
+        return False, "The one-time VPN setup already ran this session and did not complete; see setup.log."
+    _setup_attempted = True
     import ctypes
     import shutil
     stage = RUN_DIR / "setup"
@@ -147,12 +166,14 @@ def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
     if rc <= 32:
         return False, ("Windows admin permission was declined -- the one-time VPN setup was not installed."
                        if rc == 5 else f"Could not start the one-time VPN setup (code {rc}).")
-    for _ in range(90):
-        if (stage / "setup.ok").exists() and task_installed():
+    for _ in range(120):
+        if (stage / "setup.ok").exists() and task_installed() and _allowed_host() == gateway_host:
             shutil.rmtree(stage, ignore_errors=True)
             return True, "installed"
+        if (stage / "setup.log").exists():
+            return False, "The one-time VPN setup failed: " + (stage / "setup.log").read_text(errors="ignore")[:300]
         time.sleep(1)
-    return False, "The one-time VPN setup did not finish (90 s)."
+    return False, "The one-time VPN setup did not finish (120 s)."
 
 
 def is_v9(exe: Path) -> bool:
