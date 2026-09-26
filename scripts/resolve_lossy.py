@@ -461,6 +461,14 @@ def main():
     conn.execute("CREATE TABLE IF NOT EXISTS lossy_scan2 (ref_id TEXT PRIMARY KEY, result TEXT, found TEXT, "
                  "source TEXT, scanned_at TEXT DEFAULT (datetime('now')))")
     crossref_done: set = set()
+    unresolved_pdfs = []
+    if INCOMPLETE:
+        # Entries the PDF ingest could not identify (tag pdf:unresolved): they pass the
+        # completeness definition through their PDF, but have no real record yet.
+        unresolved_pdfs = [r[0] for r in conn.execute(
+            """SELECT rt.ref_id FROM ref_tags rt JOIN tags t ON t.id = rt.tag_id
+               WHERE t.name = 'pdf:unresolved' AND rt.ref_id NOT IN (SELECT ref_id FROM lossy_scan2)
+               LIMIT ?""", (LIMIT,))]
     if INCOMPLETE:
         # Fails the definition and has a title. Rows the v1 pass still has queued
         # are left to it (no two writers on one ref); rows it logged no_record
@@ -473,6 +481,7 @@ def main():
                           AND COALESCE(arxiv_id,'') = '' AND id NOT IN (SELECT ref_id FROM lossy_scan))
                  ORDER BY RANDOM() LIMIT ?""", (LIMIT,))]
         crossref_done = {r[0] for r in conn.execute("SELECT ref_id FROM lossy_scan WHERE result='no_record'")}
+        ids = list(dict.fromkeys(unresolved_pdfs + ids))[:LIMIT]
     else:
         ids = [r[0] for r in conn.execute(
             """SELECT id FROM refs WHERE COALESCE(status,'') != 'duplicate' AND COALESCE(completeness, 0) < 0.8
