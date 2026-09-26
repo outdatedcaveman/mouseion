@@ -32,3 +32,18 @@ def test_rejected_login_is_named_and_pauses_retries():
     real = ("POST https://gw:31443/remote/logincheck\nPassword: fgetws (stdin): No error\n***\n"
             "User input required in non-interactive mode\nFailed to complete authentication\n")
     assert "rejected the username/password" in e._explain(real)
+
+
+def test_launcher_compiles_and_returns_at_once_for_connect(tmp_path, monkeypatch):
+    import os, subprocess, sys, time
+    if sys.platform != "win32":
+        return
+    oc = tmp_path / "vpn" / "openconnect"; oc.mkdir(parents=True); (tmp_path / "vpn-run").mkdir()
+    exe = oc / "cscript.exe"
+    assert e._compile_launcher(exe), "csc could not build the launcher"
+    (tmp_path / "vpn" / "slow.js").write_text("WScript.Sleep(5000);")
+    env = dict(os.environ, reason="connect")
+    t = time.time()
+    subprocess.run([str(exe), "/e:JScript", str(tmp_path / "vpn" / "slow.js")], env=env, timeout=30)
+    assert time.time() - t < 5, "connect must not wait for the script"
+    assert "started in background" in (tmp_path / "vpn-run" / "launcher.log").read_text()

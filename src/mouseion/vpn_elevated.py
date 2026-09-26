@@ -52,7 +52,7 @@ auth_failed = False                       # login rejected: no automatic retries
 # as administrator.
 # ---------------------------------------------------------------------------
 TASK = "MouseionVPN"
-RUNNER_VERSION = "6"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
+RUNNER_VERSION = "7"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
 PROTECTED = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn"
 
 _TASK_RUNNER = r"""// Mouseion VPN runner v5 (JScript): run by the SYSTEM task, starts in a fraction of a
@@ -187,6 +187,70 @@ log("returning");
 WScript.Quit(0);
 """
 
+# Native stand-in for cscript.exe in openconnect's folder (see its header).
+_LAUNCHER_CS = r"""// Mouseion VPN script launcher, installed as "cscript.exe" next to openconnect.exe.
+//
+// openconnect runs its configuration script as `cscript.exe /e:JScript "<script>"` and
+// waits at most 10 s. Windows resolves "cscript.exe" in openconnect's own folder first,
+// so this small native program answers instead: it starts the real
+// %SystemRoot%\System32\cscript.exe with the same arguments and environment and, for
+// connect/reconnect, returns at once. Why (2026-09-26): under the SYSTEM task, script
+// hosts started by openconnect were held ~25 s before running (the first one was not),
+// so openconnect gave up, the adapter stayed unconfigured and the peer was declared dead.
+// Every call is logged with timings to ..\..\vpn-run\launcher.log.
+using System;
+using System.Diagnostics;
+using System.IO;
+
+class MouseionScriptLauncher
+{
+    static string RunDir()
+    {
+        string exeDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
+        return Path.Combine(Directory.GetParent(Directory.GetParent(exeDir).FullName).FullName, "vpn-run");
+    }
+
+    static void Log(string msg)
+    {
+        try { File.AppendAllText(Path.Combine(RunDir(), "launcher.log"), DateTime.Now.ToString("HH:mm:ss.fff") + "  " + msg + Environment.NewLine); }
+        catch { }
+    }
+
+    static string ArgsAfterExe(string cmdline)
+    {
+        cmdline = cmdline.TrimStart();
+        int i;
+        if (cmdline.StartsWith("\"")) i = cmdline.IndexOf('"', 1) + 1;
+        else { i = cmdline.IndexOf(' '); if (i < 0) i = cmdline.Length; }
+        return cmdline.Substring(i).TrimStart();
+    }
+
+    static int Main()
+    {
+        string reason = Environment.GetEnvironmentVariable("reason") ?? "";
+        string real = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cscript.exe");
+        string args = "//nologo " + ArgsAfterExe(Environment.CommandLine);
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var psi = new ProcessStartInfo(real, args) { UseShellExecute = false, CreateNoWindow = true };
+            Process p = Process.Start(psi);
+            bool background = reason == "connect" || reason == "reconnect";
+            string exit = "";
+            if (!background && p.WaitForExit(9000)) exit = " exit " + p.ExitCode;
+            Log(reason + ": " + (background ? "started in background" : "done/waited" + exit) + " in " +
+                sw.ElapsedMilliseconds + " ms  [" + real + " " + args + "]");
+        }
+        catch (Exception e)
+        {
+            Log(reason + ": FAILED " + e.Message);
+        }
+        return 0;
+    }
+}
+"""
+
+
 _SETUP = r"""param([string]$Src, [string]$Prot, [string]$HostName, [string]$User, [string]$Version)
 $ErrorActionPreference = 'Stop'
 $log = Join-Path $Src 'setup.log'
@@ -280,6 +344,27 @@ def _allowed_host() -> str:
 _setup_attempted = False
 
 
+def _compile_launcher(out: Path) -> bool:
+    """Build the native cscript stand-in with the .NET Framework compiler every
+    Windows 10/11 ships. Without it setup still works (openconnect then waits on
+    the real script host), so a failure is logged, not fatal."""
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    for fw in ("Framework64", "Framework"):
+        csc = Path(windir) / "Microsoft.NET" / fw / "v4.0.30319" / "csc.exe"
+        if csc.exists():
+            src = out.with_name("vpn_launcher.cs")
+            src.write_text(_LAUNCHER_CS, encoding="utf-8")
+            r = subprocess.run([str(csc), "/nologo", "/target:exe", "/optimize+", f"/out:{out}", str(src)],
+                               capture_output=True, text=True, timeout=120, creationflags=_NO_WINDOW)
+            src.unlink(missing_ok=True)
+            if r.returncode == 0 and out.exists():
+                return True
+            logger.warning("VPN launcher did not compile: %s", (r.stdout + r.stderr)[-400:])
+            return False
+    logger.warning("VPN launcher: no .NET compiler found")
+    return False
+
+
 def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
     """The one elevated step: protected runner + on-demand scheduled task.
     At most once per session: a setup that did not take must not prompt again."""
@@ -294,6 +379,7 @@ def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
         shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True, exist_ok=True)
     shutil.copytree(exe.parent, stage / "openconnect")
+    _compile_launcher(stage / "openconnect" / "cscript.exe")
     (stage / "runner.js").write_text(_TASK_RUNNER, encoding="utf-8")
     (stage / "vpnc-wrapper.js").write_text(_WRAPPER, encoding="utf-8")
     (stage / "setup.ps1").write_text(_SETUP, encoding="utf-8")
