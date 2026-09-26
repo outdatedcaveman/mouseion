@@ -47,6 +47,10 @@ def measure() -> dict:
     m["lossy_scanned"] = q(c, "SELECT COUNT(*) FROM lossy_scan2")
     m["queue_pending"] = q(c, "SELECT COUNT(*) FROM enrich_queue WHERE status='pending'")
     m["queue_done"] = q(c, "SELECT COUNT(*) FROM enrich_queue WHERE status='done'")
+    try:
+        m["ingest"] = dict(c.execute("SELECT action, COUNT(*) FROM pdf_ingest_log GROUP BY 1").fetchall())
+    except sqlite3.Error:
+        m["ingest"] = {}
     c.close()
     try:
         m["sources_all"] = json.loads((DATA / "pdf_source_stats.json").read_text(encoding="utf-8"))
@@ -68,7 +72,7 @@ def measure() -> dict:
                               "get", "commandline"], capture_output=True, text=True, timeout=30,
                              creationflags=0x08000000).stdout
         jobs = {"Mouseion app": "Mouseion.exe" in out}
-        for name in ("resolve_lossy", "recover_isbn", "recover_ids_from_pdfs", "pdf_sweep", "egon_core"):
+        for name in ("resolve_lossy", "recover_isbn", "recover_ids_from_pdfs", "pdf_sweep", "ingest_folder", "egon_core"):
             jobs[name] = name in out
         m["jobs"] = jobs
     except Exception:
@@ -100,6 +104,11 @@ def report(now: dict, prev: dict) -> str:
     L.append(f"Enrichment: title-fixer accepts {fmt(now['lossy_accepts'])}{delta(now, prev, 'lossy_accepts')} of "
              f"{fmt(now['lossy_scanned'])} scanned{delta(now, prev, 'lossy_scanned')} | queue done "
              f"{fmt(now['queue_done'])}{delta(now, prev, 'queue_done')}, pending {fmt(now['queue_pending'])}")
+    ing, ping = now.get("ingest") or {}, prev.get("ingest") or {}
+    if ing:
+        tot, ptot = sum(ing.values()), sum(ping.values())
+        L.append(f"PDF archive ingest: {fmt(tot)} files processed (+{fmt(tot - ptot)}) | " + ", ".join(
+            f"{k} {fmt(v)} (+{fmt(v - ping.get(k, 0))})" for k, v in sorted(ing.items(), key=lambda kv: -kv[1])))
     srcs = now.get("sources_all") or {}
     psrc = prev.get("sources_all") or {}
     rows = []
