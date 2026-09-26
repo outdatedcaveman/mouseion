@@ -1577,6 +1577,23 @@ def fetch_all_pdfs():
                             continue
                         targets.append(ref)
 
+            # Rotate across sources (DOI prefix = publisher; else the OA-link host):
+            # tier-first order spent hours on stale 'open-access' links that never
+            # yield (1 PDF in 277, 2026-09-26), and each publisher host is paced
+            # anyway, so a batch of one publisher's refs would just queue.
+            from collections import OrderedDict as _OD
+            from urllib.parse import urlparse as _up
+            _q = _OD()
+            for _r in targets:
+                _k = (_r.doi or "").lower().split("/")[0] or (_up(_r.oa_url or _r.url or "").netloc or "-")
+                _q.setdefault(_k, []).append(_r)
+            targets = []
+            while _q:
+                for _k in list(_q):
+                    targets.append(_q[_k].pop(0))
+                    if not _q[_k]:
+                        del _q[_k]
+
             total = len(targets)
             with _jobs_lock:
                 _jobs[job_id]["message"] = f"Fetching PDFs for {total} refs…"
