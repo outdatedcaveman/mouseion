@@ -43,6 +43,12 @@ _USER_AGENT = (
 _MAX_CONCURRENT = int(os.environ.get("MOUSEION_PDF_CONCURRENCY", "20"))
 
 
+# Bump when the fetcher gains a way to find PDFs: refs missed by an older fetcher
+# become eligible again (v2, 2026-09-26: Crossref full-text links, publisher TDM
+# APIs, per-publisher pacing and bot-check back-off).
+FETCHER_VERSION = "v2"
+
+
 def _shadow_sources_on() -> bool:
     """Sci-Hub / Anna's Archive strategies: on unless MOUSEION_PDF_SHADOW=0
     (runs that must use licensed and open-access sources only)."""
@@ -70,7 +76,7 @@ def _pdf_ledger_key() -> str:
             pass
         _LEDGER_KEY_CACHE[:] = [_t.time(), key]
     # a run without the shadow sources must not mark refs as tried for runs with them
-    return _LEDGER_KEY_CACHE[1] + ("" if _shadow_sources_on() else "_open")
+    return _LEDGER_KEY_CACHE[1] + ("" if _shadow_sources_on() else "_open") + "_" + FETCHER_VERSION
 
 
 class TemporaryDownloadError(Exception):
@@ -308,6 +314,7 @@ async def _download_pdf_impl(
         client = httpx.AsyncClient(**client_kwargs)
 
     temporary_failure = False
+    blocked = False
 
     try:
         # Strategy 1: Use oa_url already on the reference
@@ -375,10 +382,26 @@ async def _download_pdf_impl(
             logger.info("Temporary failure using CORE: %s", e)
             temporary_failure = True
 
+        # Strategy 5.2: full-text links the publisher registered with Crossref (Nature,
+        # APS, ... serve PDFs there), incl. the Elsevier / Wiley text-mining APIs when a
+        # key is configured -- the sanctioned channel for machine access.
+        if ref.doi:
+            try:
+                for link_url, hdrs in await _crossref_fulltext_links(client, ref.doi, cfg):
+                    if await _stream_download(client, link_url, dest, follow_html_links=False, headers=hdrs):
+                        ref.pdf_path = filename
+                        return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using Crossref full-text links: %s", e)
+                temporary_failure = True
+            except _publisher_blocked() as e:
+                logger.info("Publisher paused (bot check): %s", e)
+                blocked = True
+
         # Strategy 5.5: Direct DOI/Publisher URL download (takes advantage of VPN direct access)
         if ref.doi:
             try:
-                doi_url = f"https://doi.org/{ref.doi}"
+                doi_url = await _doi_target(client, ref.doi) or f"https://doi.org/{ref.doi}"
                 result = await _stream_download(client, doi_url, dest)
                 if result:
                     ref.pdf_path = filename
@@ -386,6 +409,9 @@ async def _download_pdf_impl(
             except TemporaryDownloadError as e:
                 logger.info("Temporary failure using Direct DOI: %s", e)
                 temporary_failure = True
+            except _publisher_blocked() as e:
+                logger.info("Publisher paused (bot check): %s", e)
+                blocked = True
 
         if ref.url and not ref.doi:
             try:
@@ -446,7 +472,7 @@ async def _download_pdf_impl(
         # changes if enrichment adds an oa_url/doi, making the ref eligible
         # again.  Without this, refs where gray sources (Sci-Hub/CORE/Anna's)
         # are all dead get re-attempted every sweep forever.
-        if _rid:
+        if _rid and not blocked:        # a bot check is "not now", not "no PDF"
             _router.record_attempt(_rid, _ledger, _eh, "miss")
         if temporary_failure:
             logger.info("All strategies exhausted (some had temporary failures) for ref: %s", _rid)
@@ -465,6 +491,7 @@ async def _stream_download(
     url: str,
     dest: Path,
     follow_html_links: bool = True,
+    headers: Optional[dict] = None,
 ) -> bool:
     """Stream-download a URL to *dest*.  Returns True on success.
 
@@ -475,9 +502,16 @@ async def _stream_download(
     and download candidate PDF links from the page.
     """
     html_content = None
+    from . import publisher_gate as _gate
+    _host = _gate.host_of(url)
+    _resolver = _host in ("doi.org", "dx.doi.org")      # never pace or block the resolver itself
+    if not _resolver:
+        if _gate.is_blocked(_host):
+            raise _gate.PublisherBlocked(_host)
+        await _gate.pace(_host)
     try:
         async with network_slot("pdf_stream", bucket=bucket_from_url(url), min_interval=0.05):
-            async with client.stream("GET", url, timeout=25.0) as resp:
+            async with client.stream("GET", url, timeout=25.0, headers=headers) as resp:
                 if resp.status_code in (429, 503, 504):
                     raise TemporaryDownloadError(f"HTTP {resp.status_code} rate limit/server error during stream download")
                 if resp.status_code != 200:
@@ -486,10 +520,15 @@ async def _stream_download(
                 
                 # Check if it's HTML
                 if "html" in content_type.lower() or "text/xml" in content_type.lower():
-                    if not follow_html_links:
-                        return False
                     body_bytes = await resp.aread()
                     html_content = body_bytes.decode("utf-8", errors="ignore")
+                    if _gate.looks_like_bot_check(html_content):
+                        _final = _gate.host_of(str(resp.url))   # the host that actually answered
+                        if _final not in ("doi.org", "dx.doi.org"):
+                            _gate.mark_blocked(_final)   # the publisher says "not like this": back off
+                        raise _gate.PublisherBlocked(_final)
+                    if not follow_html_links:
+                        return False
                 else:
                     is_pdf = "pdf" in content_type.lower() or url.lower().endswith(".pdf")
                     bytes_written = 0
@@ -511,7 +550,7 @@ async def _stream_download(
                         dest.unlink(missing_ok=True)
                         return False
                     return True
-    except TemporaryDownloadError:
+    except (TemporaryDownloadError, _gate.PublisherBlocked):
         dest.unlink(missing_ok=True)
         raise
     except httpx.RequestError as exc:
@@ -554,10 +593,69 @@ async def _stream_download(
                 # Attempt to download the candidate (do not follow nested HTML pages)
                 if await _stream_download(client, cand_url, dest, follow_html_links=False):
                     return True
+            except _gate.PublisherBlocked:
+                raise
             except Exception:
                 pass
                 
     return False
+
+
+async def _doi_target(client: httpx.AsyncClient, doi: str) -> Optional[str]:
+    """The publisher URL a DOI points to, from the doi.org handle API -- no request
+    reaches the publisher, so pacing and back-off can be applied to the right host."""
+    try:
+        r = await client.get(f"https://doi.org/api/handles/{doi}", timeout=15.0)
+        if r.status_code == 200:
+            for v in r.json().get("values") or []:
+                if v.get("type") == "URL":
+                    url = (v.get("data") or {}).get("value") or ""
+                    if url.startswith("http"):
+                        return url
+    except (httpx.RequestError, ValueError):
+        pass
+    return None
+
+
+def _publisher_blocked():
+    from .publisher_gate import PublisherBlocked
+    return PublisherBlocked
+
+
+_KEY_API = {"api.elsevier.com": "elsevier", "api.wiley.com": "wiley"}
+
+
+async def _crossref_fulltext_links(client: httpx.AsyncClient, doi: str, cfg) -> List[Tuple[str, dict]]:
+    """[(url, headers)] from the Crossref record's `link` list: PDFs first, then
+    unspecified types; key-gated text-mining APIs only when their key is set."""
+    try:
+        async with network_slot("pdf_lookup", bucket="crossref"):
+            r = await client.get(f"https://api.crossref.org/works/{doi}",
+                                 params={"mailto": cfg.crossref_email or cfg.openalex_email or ""}, timeout=20.0)
+        if r.status_code != 200:
+            return []
+        links = r.json().get("message", {}).get("link") or []
+    except (httpx.RequestError, ValueError):
+        return []
+    out: List[Tuple[str, dict]] = []
+    for l in sorted(links, key=lambda x: 0 if "pdf" in (x.get("content-type") or "") else 1):
+        url = l.get("URL") or ""
+        host = url.split("/")[2].lower() if url.count("/") >= 2 else ""
+        kind = _KEY_API.get(host)
+        if kind == "elsevier":
+            if not cfg.elsevier_api_key:
+                continue
+            url = f"https://api.elsevier.com/content/article/doi/{doi}?httpAccept=application/pdf"
+            hdrs = {"X-ELS-APIKey": cfg.elsevier_api_key, "Accept": "application/pdf"}
+        elif kind == "wiley":
+            if not cfg.wiley_tdm_token:
+                continue
+            hdrs = {"Wiley-TDM-Client-Token": cfg.wiley_tdm_token}
+        else:
+            hdrs = {"Accept": "application/pdf,*/*;q=0.8"}
+        if url.startswith("http") and (url, hdrs) not in out:
+            out.append((url, hdrs))
+    return out[:4]
 
 
 async def _unpaywall_lookup(

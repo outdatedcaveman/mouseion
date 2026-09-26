@@ -68,6 +68,8 @@ class Config:
     ncbi_api_key: str = ""
     openalex_email: str = ""
     openalex_api_key: str = ""
+    elsevier_api_key: str = ""      # Elsevier TDM (dev.elsevier.com): full text to subscribers
+    wiley_tdm_token: str = ""       # Wiley TDM client token: full text to subscribers
 
     # --- LLM ---
     llm_api_key: str = ""
@@ -190,6 +192,8 @@ _TOML_MAP = {
         "ncbi_api_key": "ncbi_api_key",
         "openalex_email": "openalex_email",
         "openalex_api_key": "openalex_api_key",
+        "elsevier_api_key": "elsevier_api_key",
+        "wiley_tdm_token": "wiley_tdm_token",
     },
     "llm": {
         "api_key": "llm_api_key",
@@ -269,6 +273,8 @@ _ENV_MAP: Dict[str, str] = {
     "MOUSEION_NCBI_API_KEY":               "ncbi_api_key",
     "MOUSEION_OPENALEX_EMAIL":             "openalex_email",
     "MOUSEION_OPENALEX_API_KEY":           "openalex_api_key",
+    "MOUSEION_ELSEVIER_API_KEY":           "elsevier_api_key",
+    "MOUSEION_WILEY_TDM_TOKEN":            "wiley_tdm_token",
     "MOUSEION_LLM_API_KEY":                "llm_api_key",
     "MOUSEION_LLM_PROVIDER":               "llm_provider",
     "MOUSEION_NOTION_API_KEY":             "notion_api_key",
@@ -346,6 +352,8 @@ def _render_toml(cfg: Config) -> str:
         f'ncbi_api_key               = {_q(cfg.ncbi_api_key)}',
         f'openalex_email             = {_q(cfg.openalex_email)}',
         f'openalex_api_key           = {_q(cfg.openalex_api_key)}',
+        f'elsevier_api_key           = {_q(cfg.elsevier_api_key)}',
+        f'wiley_tdm_token            = {_q(cfg.wiley_tdm_token)}',
         "",
         "[llm]",
         f'api_key  = {_q(cfg.llm_api_key)}',

@@ -41,12 +41,24 @@ DISK_FLOOR_GB = float(os.environ.get("MOUSEION_SWEEP_DISK_FLOOR_GB", "12"))
 def main() -> None:
     cfg = get_config()
     c = sqlite3.connect(f"file:{cfg.db_path}?mode=ro", uri=True, timeout=60)
-    ids = [r[0] for r in c.execute(
-        """SELECT id FROM refs
+    rows = c.execute(
+        """SELECT id, lower(COALESCE(doi,'')) FROM refs
            WHERE COALESCE(pdf_local,'') = '' AND COALESCE(pdf_drive_id,'') = ''
              AND (COALESCE(oa_url,'') != '' OR COALESCE(arxiv_id,'') != '' OR COALESCE(doi,'') != '')
-           ORDER BY (COALESCE(oa_url,'') != '') DESC, (COALESCE(arxiv_id,'') != '') DESC, year DESC
-           LIMIT ?""", (LIMIT,))]
+           ORDER BY (COALESCE(oa_url,'') != '') DESC, (COALESCE(arxiv_id,'') != '') DESC, year DESC""").fetchall()
+    # Round-robin across publishers (DOI prefix): each publisher host is paced
+    # (publisher_gate), so a batch of one publisher's refs would just queue.
+    from collections import OrderedDict
+    queues: "OrderedDict[str, list]" = OrderedDict()
+    for rid, doi in rows:
+        queues.setdefault(doi.split("/")[0] if doi else "-", []).append(rid)
+    ids = []
+    while queues and len(ids) < LIMIT:
+        for k in list(queues):
+            ids.append(queues[k].pop(0))
+            if not queues[k]:
+                del queues[k]
+    ids = ids[:LIMIT]
     c.close()
     pdf_dir = get_pdf_dir()
     print(f"[pdf-sweep] {len(ids):,} refs | shadow sources {'ON' if os.environ['MOUSEION_PDF_SHADOW'] != '0' else 'off'} "
