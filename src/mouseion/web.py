@@ -4583,7 +4583,7 @@ kbd {
     <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Google Drive credentials JSON path</label>
     <input type="text" class="modal-ta" id="cfg-drive-creds" placeholder="path/to/service-account.json"
            style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
-    <button class="btn btn-ghost btn-sm" onclick="fetchAllPdfs()" style="margin-bottom:8px">📥 Download all available PDFs now</button>
+    <button class="btn btn-ghost btn-sm" onclick="fetchAllPdfs()" style="margin-bottom:8px">📥 Find PDFs for references that lack one (all sources)</button>
     <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
     <div style="font-size:13px;font-weight:600;margin-bottom:8px">💾 Database Backup</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
@@ -5363,8 +5363,8 @@ async function fetchAllPdfs() {
     const r = await apiFetch('/api/pdfs/fetch-all', { method: 'POST' });
     const data = await r.json();
     if (data.job_id) {
-      showToast('PDF download started in background — check progress via the job ID');
-      pollJob(data.job_id);
+      showToast('Finding PDFs in the background — progress is shown in the PDFs panel');
+      document.getElementById('btn-pdf-engine').click();   // open the panel with live counts
     }
   } catch(e) { alert('Error: ' + e.message); }
 }
