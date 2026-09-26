@@ -15,7 +15,7 @@ import sqlite3
 import sys
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -60,32 +60,31 @@ def main() -> None:
     stats: Counter = Counter()
     t0 = time.time()
 
-    def work(item):
-        p = item[0]
-        try:
-            f = PI.extract(p)
-            keep, why = PI.relevance(f)
-            if not keep:
-                return item, f, None, (None, ""), why
-            rec, via = PI.resolve(f, cfg)
-            return item, f, keep, (rec, via), ""
-        except Exception as e:
-            return item, None, None, (None, ""), f"error: {type(e).__name__}: {str(e)[:80]}"
-
     import shutil
     floor = float(os.environ.get("MOUSEION_INGEST_DISK_FLOOR_GB", "12"))
 
     def guarded():
         # Drive for desktop stages each file it streams on the system disk: stop early, resume later
         for i, item in enumerate(todo):
-            if i % 50 == 0 and shutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\").free / 1024 ** 3 < floor:
+            if i % 200 == 0 and shutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\").free / 1024 ** 3 < floor:
                 print(f"  stopping: system disk below {floor} GB free (resumes on the next run)", flush=True)
                 return
             yield item
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for n, (item, f, keep, (rec, via), why) in enumerate(pool.map(work, guarded()), 1):
+    def results_stream(pool):
+        # chunks of 200 so the disk guard is re-checked as Drive stages files
+        gen = guarded()
+        while True:
+            chunk = [it for _, it in zip(range(200), gen)]
+            if not chunk:
+                return
+            yield from zip(chunk, pool.map(PI.process_file, [it[0] for it in chunk], chunksize=4))
+
+    with ProcessPoolExecutor(max_workers=WORKERS) as pool:   # PDF parsing holds the GIL: processes, not threads
+        for n, (item, (f, keep, why, rec, via, err)) in enumerate(results_stream(pool), 1):
             p, size, mtime = item
+            if err:
+                why = "error: " + err
             if f is None or not keep:
                 action = "error" if why.startswith("error") else "skipped"
                 res = PI.IngestResult(action, detail=why)
@@ -122,4 +121,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

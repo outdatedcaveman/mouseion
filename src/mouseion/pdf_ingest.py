@@ -609,3 +609,18 @@ def ingest(path: str, db, index: LibraryIndex, tag: str, cfg=None, write: bool =
         db.update_integration_ids(rid, pdf_local=path, pdf_path=Path(path).name)
         index.add(rid, ref, True)
     return IngestResult("created" if rec else "created_unresolved", rid, "", via or "pdf-only", ref)
+
+
+def process_file(path: str):
+    """Extract + relevance + resolve for one file, in a worker PROCESS (PDF parsing holds
+    the GIL, so threads serialise it). -> (facts, keep, reason, record, via, error)."""
+    try:
+        f = extract(path)
+        keep, why = relevance(f)
+        if not keep:
+            return f, False, why, None, "", ""
+        rec, via = resolve(f)
+        f.text = f.text[:4000]          # keep the pickle small
+        return f, True, "", rec, via, ""
+    except Exception as e:
+        return None, False, "", None, "", f"{type(e).__name__}: {str(e)[:80]}"
