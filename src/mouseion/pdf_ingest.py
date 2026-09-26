@@ -750,8 +750,10 @@ def archive_course_material(conn, write: bool = True) -> list:
             if has_log:      # the ingest remembers the file as skipped, so it is not re-added
                 conn.execute("UPDATE pdf_ingest_log SET action='skipped', ref_id='', detail=? WHERE ref_id = ?",
                              ("course material: " + m, rid))
+            # FTS by rowid (O(1)); by the UNINDEXED ref_id it scans the whole index and holds the lock
             for sql in ("DELETE FROM ref_tags WHERE ref_id = ?", "DELETE FROM enrich_queue WHERE ref_id = ?",
-                        "DELETE FROM refs_fts WHERE ref_id = ?", "DELETE FROM refs WHERE id = ?"):
+                        "DELETE FROM refs_fts WHERE rowid = (SELECT rowid FROM refs WHERE id = ?)",
+                        "DELETE FROM refs WHERE id = ?"):
                 conn.execute(sql, (rid,))
         conn.execute("COMMIT")
     except Exception:

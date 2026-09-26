@@ -80,6 +80,17 @@ def main() -> None:
                 return
             yield from zip(chunk, pool.map(PI.process_file, [it[0] for it in chunk], chunksize=4))
 
+    def retry(fn, *a, **k):
+        # other writers (the app, the title-fixer, maintenance) can hold the lock
+        # past sqlite's 30 s wait: wait them out instead of dying mid-run
+        for attempt in range(40):
+            try:
+                return fn(*a, **k)
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) or attempt == 39:
+                    raise
+                time.sleep(min(60, 5 * (attempt + 1)))
+
     with ProcessPoolExecutor(max_workers=WORKERS) as pool:   # PDF parsing holds the GIL: processes, not threads
         for n, (item, (f, keep, why, rec, via, err)) in enumerate(results_stream(pool), 1):
             p, size, mtime = item
@@ -96,20 +107,20 @@ def main() -> None:
                     res = PI.IngestResult("exists", hit[0], "library already has a PDF", via)
                 elif hit:
                     if WRITE:
-                        db.update_integration_ids(hit[0], pdf_local=p, pdf_path=Path(p).name)
+                        retry(db.update_integration_ids, hit[0], pdf_local=p, pdf_path=Path(p).name)
                         index.add(hit[0], ref, True)
                     res = PI.IngestResult("attached", hit[0], "", via)
                 else:
                     rid = ""
                     if WRITE:
                         ref.sources = {**(ref.sources or {}), "archive_pdf": 0.9 if rec else 0.4}
-                        rid = db.upsert(ref, tags=[f"archive:{TAG}"] + ([] if rec else ["pdf:unresolved"]))
-                        db.update_integration_ids(rid, pdf_local=p, pdf_path=Path(p).name)
+                        rid = retry(db.upsert, ref, tags=[f"archive:{TAG}"] + ([] if rec else ["pdf:unresolved"]))
+                        retry(db.update_integration_ids, rid, pdf_local=p, pdf_path=Path(p).name)
                         index.add(rid, ref, True)
                     res = PI.IngestResult("created" if rec else "created_unresolved", rid, "", via or "pdf-only")
             stats[res.action] += 1
             if WRITE:
-                conn.execute("INSERT OR REPLACE INTO pdf_ingest_log (path,size,mtime,action,ref_id,via,detail,tag) "
+                retry(conn.execute, "INSERT OR REPLACE INTO pdf_ingest_log (path,size,mtime,action,ref_id,via,detail,tag) "
                              "VALUES (?,?,?,?,?,?,?,?)", (p, size, mtime, res.action, res.ref_id, res.via,
                                                           res.detail[:200], TAG))
             elif n <= 60:
@@ -119,7 +130,7 @@ def main() -> None:
                 print(f"  ... {n:,}/{len(todo):,} | {dict(stats)} | {n / (time.time() - t0):.2f}/s", flush=True)
     print(f"done: {dict(stats)} in {time.time() - t0:.0f}s", flush=True)
     if WRITE:   # course material created before the filter existed, or by older runs
-        gone = PI.archive_course_material(conn, True)
+        gone = retry(PI.archive_course_material, conn, True)
         print(f"course material archived: {len(gone)}", flush=True)
 
 
