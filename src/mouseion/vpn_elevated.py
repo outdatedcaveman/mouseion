@@ -300,7 +300,7 @@ def task_installed() -> bool:
 
 
 def _option(key: str, default: str) -> str:
-    """Tunables for the runner, from %LOCALAPPDATA%\mouseion\vpn\options.txt (key=value);
+    r"""Tunables for the runner, from %LOCALAPPDATA%\mouseion\vpn\options.txt (key=value);
     the runner accepts only its built-in values, so this file cannot inject anything."""
     try:
         for line in (STAGE_DIR / "options.txt").read_text(encoding="utf-8").splitlines():
