@@ -316,7 +316,7 @@ def _title_search(client: httpx.Client, f: PdfFacts, mailto: str, oa_key: str) -
         if s < 0.9 and len(ct) >= 25 and (ct in nt or nt in ct) and                 min(len(ct), len(nt)) >= 0.75 * max(len(ct), len(nt)):
             s = 0.9
         # front-matter years in books are copyright/reprint years: trust only a folder year there
-        y = f.year_hint or (_year_from_text(f.text) if f.pages < 80 else None)
+        y = f.year_hint
         if y and c.year and abs(int(c.year) - y) > 2:
             continue
         if s > best_s:
@@ -324,9 +324,24 @@ def _title_search(client: httpx.Client, f: PdfFacts, mailto: str, oa_key: str) -
     return best if best_s >= 0.9 else None
 
 
+def clean_filename(stem: str) -> str:
+    """A file name as a title: download-site tags, leading document numbers,
+    copy counters and underscores/hyphens-for-spaces removed."""
+    s = re.sub(r"\((?:z-?lib(?:\.org)?|libgen[^)]*|b-ok[^)]*|pdfdrive[^)]*|\d+)\)", " ", stem, flags=re.I)
+    s = re.sub(r"(z-?lib\.org|libgen(\.\w+)?|www\.\S+)", " ", s, flags=re.I)
+    s = re.sub(r"^\d{6,}[-_ ]+", "", s)                  # "356062879-Livro-..." (Scribd ids)
+    if s.count(" ") < 2 and (s.count("-") >= 3 or s.count("_") >= 3):
+        s = re.sub(r"[-_]+", " ", s)
+    s = re.sub(r"_+", " ", s)
+    return " ".join(s.split()).strip(" -.,")
+
+
 def _split_title_author(stem: str) -> Tuple[str, str]:
-    """"Probability, A. N. Shiryaev" / "Title - Author" / "[Author] Title" -> (title, author)."""
-    stem = re.sub(r"[_]+", " ", stem)
+    """"Probability, A. N. Shiryaev" / "Title - Author" / "[Author] Title" / "Title (Author)" -> (title, author)."""
+    stem = clean_filename(stem)
+    m = re.match(r"^(.*\S)\s*\(((?:[A-Z][\w.'\-]*\s*){2,4})\)$", stem)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
     stem = re.sub(r"\((?:\d\w*\s*ed\.?|[^)]*(?:series|studies|texts|graduate|lecture)[^)]*)\)", " ", stem, flags=re.I)
     m = re.match(r"^\[([^\]]+)\]\s*(.+)$", stem)
     if m:
@@ -435,7 +450,7 @@ def resolve(f: PdfFacts, cfg=None) -> Tuple[Optional[Reference], str]:
             rec = _book_search(client, f, mailto)
             if rec:
                 return rec, "book"
-        fname = re.sub(r"[_]+", " ", Path(f.path).stem).strip()
+        fname = _split_title_author(Path(f.path).stem)[0]
         if len(_norm(fname).split()) >= 4 and _norm(fname) != _norm(f.title):
             alt = PdfFacts(path=f.path, text=f.text, meta_title=fname, year_hint=f.year_hint,
                            journal_hint=f.journal_hint)
