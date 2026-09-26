@@ -49,6 +49,66 @@ _MAX_CONCURRENT = int(os.environ.get("MOUSEION_PDF_CONCURRENCY", "20"))
 FETCHER_VERSION = "v2"
 
 
+# ---- per-source tally: which strategy was tried and which one found the PDF ----
+import contextvars as _cv
+import threading as _th
+
+_SRC: "_cv.ContextVar[str]" = _cv.ContextVar("pdf_source", default="")
+_TALLY_LOCK = _th.Lock()
+_RUN_TALLY: dict = {}          # this process (this run)
+_ALL_TALLY: Optional[dict] = None
+_TALLY_DIRTY = [0]
+
+
+def _tally_file() -> Path:
+    try:
+        from .config import get_config
+        return Path(get_config().db_path).expanduser().parent / "pdf_source_stats.json"
+    except Exception:
+        return Path.home() / ".local" / "share" / "mouseion" / "pdf_source_stats.json"
+
+
+def _tally_bump(source: str, key: str) -> None:
+    global _ALL_TALLY
+    with _TALLY_LOCK:
+        if _ALL_TALLY is None:
+            try:
+                import json as _json
+                _ALL_TALLY = _json.loads(_tally_file().read_text(encoding="utf-8"))
+            except Exception:
+                _ALL_TALLY = {}
+        for t in (_RUN_TALLY, _ALL_TALLY):
+            d = t.setdefault(source, {"tried": 0, "found": 0})
+            d[key] = d.get(key, 0) + 1
+        _TALLY_DIRTY[0] += 1
+        if key == "found" or _TALLY_DIRTY[0] >= 25:
+            _TALLY_DIRTY[0] = 0
+            try:
+                import json as _json
+                _tally_file().write_text(_json.dumps(_ALL_TALLY, indent=1), encoding="utf-8")
+            except OSError:
+                pass
+
+
+def _src(source: str) -> None:
+    """Mark the strategy about to be tried (the one credited if a PDF arrives)."""
+    _SRC.set(source)
+    _tally_bump(source, "tried")
+
+
+def source_stats() -> dict:
+    """{'run': {source: {tried, found}}, 'all': {...}} for the PDFs panel."""
+    with _TALLY_LOCK:
+        all_ = _ALL_TALLY
+    if all_ is None:
+        try:
+            import json as _json
+            all_ = _json.loads(_tally_file().read_text(encoding="utf-8"))
+        except Exception:
+            all_ = {}
+    return {"run": dict(_RUN_TALLY), "all": dict(all_)}
+
+
 def _shadow_sources_on() -> bool:
     """Sci-Hub / Anna's Archive strategies: on unless MOUSEION_PDF_SHADOW=0
     (runs that must use licensed and open-access sources only)."""
@@ -239,7 +299,10 @@ async def download_pdf(
     as a `hit` in the attempt ledger (only misses were, so "0 hits" in the
     ledger could not tell a working finder from a dead one)."""
     dest_existed = (get_pdf_dir() / sanitize_filename(ref)).exists()
+    _SRC.set("")
     result = await _download_pdf_impl(ref, client)
+    if result and not dest_existed and _SRC.get():
+        _tally_bump(_SRC.get(), "found")
     if result and not dest_existed:
         try:
             from .api_router import get_router
@@ -319,6 +382,7 @@ async def _download_pdf_impl(
     try:
         # Strategy 1: Use oa_url already on the reference
         if ref.oa_url:
+            _src("Known open-access link")
             try:
                 result = await _stream_download(client, ref.oa_url, dest)
                 if result:
@@ -330,6 +394,7 @@ async def _download_pdf_impl(
 
         # Strategy 2: arXiv PDF
         if ref.arxiv_id:
+            _src("arXiv")
             try:
                 url = f"https://arxiv.org/pdf/{ref.arxiv_id}"
                 result = await _stream_download(client, url, dest)
@@ -344,6 +409,7 @@ async def _download_pdf_impl(
         if ref.doi:
             email = cfg.openalex_email or cfg.crossref_email
             if email:
+                _src("Unpaywall")
                 try:
                     oa_url = await _unpaywall_lookup(client, ref.doi, email)
                     if oa_url:
@@ -357,6 +423,7 @@ async def _download_pdf_impl(
                     temporary_failure = True
 
         # Strategy 4: Semantic Scholar openAccessPdf
+        _src("Semantic Scholar")
         try:
             s2_url = await _s2_oa_lookup(client, ref, cfg)
             if s2_url:
@@ -370,6 +437,7 @@ async def _download_pdf_impl(
             temporary_failure = True
 
         # Strategy 5: CORE.ac.uk
+        _src("CORE")
         try:
             core_url = await _core_lookup(client, ref)
             if core_url:
@@ -386,6 +454,7 @@ async def _download_pdf_impl(
         # APS, ... serve PDFs there), incl. the Elsevier / Wiley text-mining APIs when a
         # key is configured -- the sanctioned channel for machine access.
         if ref.doi:
+            _src("Publisher full-text API (Crossref links, Wiley/Elsevier TDM)")
             try:
                 for link_url, hdrs in await _crossref_fulltext_links(client, ref.doi, cfg):
                     if await _stream_download(client, link_url, dest, follow_html_links=False, headers=hdrs):
@@ -400,6 +469,7 @@ async def _download_pdf_impl(
 
         # Strategy 5.5: Direct DOI/Publisher URL download (takes advantage of VPN direct access)
         if ref.doi:
+            _src("Publisher site via USP VPN" if _pdf_ledger_key().startswith("pdf_inst") else "Publisher site (no VPN)")
             try:
                 doi_url = await _doi_target(client, ref.doi) or f"https://doi.org/{ref.doi}"
                 result = await _stream_download(client, doi_url, dest)
@@ -414,6 +484,7 @@ async def _download_pdf_impl(
                 blocked = True
 
         if ref.url and not ref.doi:
+            _src("Reference URL")
             try:
                 result = await _stream_download(client, ref.url, dest)
                 if result:
@@ -425,6 +496,7 @@ async def _download_pdf_impl(
 
         # Strategy 6: DOI Proxy Download (EZproxy/Institutional Proxy prepending)
         if ref.doi and proxy_url and not use_network_proxy:
+            _src("Institutional proxy")
             try:
                 target_url = f"https://doi.org/{ref.doi}"
                 url = f"{proxy_url}{target_url}"
@@ -438,6 +510,7 @@ async def _download_pdf_impl(
 
         # Strategy 7: Sci-Hub (with rate limiting to avoid bans)
         if ref.doi and _shadow_sources_on():
+            _src("Sci-Hub")
             try:
                 scihub_result = await _scihub_lookup(client, ref.doi, dest)
                 if scihub_result:
@@ -449,6 +522,7 @@ async def _download_pdf_impl(
 
         # Strategy 8: Anna's Archive (last resort, rate-limited)
         if _shadow_sources_on():
+            _src("Anna's Archive")
             try:
                 annas_result = await _annas_archive_lookup(client, ref, dest)
                 if annas_result:
@@ -459,6 +533,7 @@ async def _download_pdf_impl(
                 temporary_failure = True
 
         # Strategy 9: Web Search Fallback (DuckDuckGo Lite for direct PDF links)
+        _src("Web search")
         try:
             ddg_result = await _ddg_pdf_search(client, ref, dest)
             if ddg_result:

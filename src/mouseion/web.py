@@ -1389,6 +1389,11 @@ def get_pdf_status():
     with _pdf_status_lock:
         status_copy = dict(_pdf_fetch_status)
     status_copy["tiers"] = _get_pdf_tier_breakdown()
+    try:
+        from .pdf_manager import source_stats as _source_stats
+        status_copy["sources"] = _source_stats()
+    except Exception:
+        status_copy["sources"] = {}
     
     import time
     now = time.time()
@@ -4822,6 +4827,7 @@ kbd {
     </div>
     
     <!-- Tier Breakdown Panel -->
+    <div id="pdf-source-stats" style="margin-bottom:12px"></div>
     <div id="pdf-tier-breakdown" style="margin-bottom:16px;padding:12px 14px;background:var(--panel);border:1px solid var(--border);border-radius:8px"></div>
 
     <!-- Tier Focus Settings -->
@@ -6003,6 +6009,23 @@ async function refreshPdfProgress() {
       }
       html += '</table>';
       tierDiv.innerHTML = '<div style="font-size:10px;color:var(--muted);font-weight:600;margin-bottom:4px">MISSING PDF BREAKDOWN BY TIER</div>' + html;
+    }
+
+    // Per-source results: this run and all-time (which sources actually deliver)
+    const srcDiv = document.getElementById('pdf-source-stats');
+    if (srcDiv && data.sources) {
+      const run = data.sources.run || {}, all = data.sources.all || {};
+      const names = Array.from(new Set([...Object.keys(all), ...Object.keys(run)]));
+      names.sort((a, b) => ((all[b]||{}).found||0) - ((all[a]||{}).found||0));
+      const cell = (d) => { d = d || {tried:0, found:0};
+        const pct = d.tried ? (100 * d.found / d.tried).toFixed(1) + '%' : '—';
+        return '<td style="text-align:right;padding:2px 6px">' + (d.found||0).toLocaleString() + ' / ' + (d.tried||0).toLocaleString()
+          + '</td><td style="text-align:right;padding:2px 6px;font-weight:600">' + pct + '</td>'; };
+      let h = '<div style="font-size:10px;color:var(--muted);font-weight:600;margin-bottom:4px">RESULTS BY SOURCE (found / tried)</div>'
+        + '<table style="width:100%;font-size:11px;border-collapse:collapse"><tr style="color:var(--muted)"><td></td>'
+        + '<td style="text-align:right;padding:2px 6px">this run</td><td></td><td style="text-align:right;padding:2px 6px">all time</td><td></td></tr>';
+      for (const n of names) h += '<tr><td style="padding:2px 4px">' + esc(n) + '</td>' + cell(run[n]) + cell(all[n]) + '</tr>';
+      srcDiv.innerHTML = names.length ? h + '</table>' : '<div style="font-size:11px;color:var(--muted)">Per-source results appear once a run starts.</div>';
     }
 
     // Determine current focus max tier from active class
