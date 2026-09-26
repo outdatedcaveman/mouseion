@@ -52,7 +52,7 @@ auth_failed = False                       # login rejected: no automatic retries
 # as administrator.
 # ---------------------------------------------------------------------------
 TASK = "MouseionVPN"
-RUNNER_VERSION = "5"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
+RUNNER_VERSION = "6"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
 PROTECTED = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn"
 
 _TASK_RUNNER = r"""// Mouseion VPN runner v5 (JScript): run by the SYSTEM task, starts in a fraction of a
@@ -103,7 +103,7 @@ var q = '"';
 var oc = prot + "\\openconnect\\openconnect.exe";
 var line = q + oc + q + " --protocol=" + kv.proto + " --cookie-on-stdin --servercert=" + kv.cert +
     " " + q + "--interface=" + ifname + q + " " + q + "--script=" + prot + "\\vpnc-wrapper.js" + q +
-    " --no-dtls --non-inter --timestamp " + kv.url +
+    " --no-dtls --non-inter --timestamp " + (kv.verbose == "1" ? "-v " : "") + kv.url +
     " < " + q + cookie + q + " > " + q + run + "\\tunnel.log" + q + " 2> " + q + run + "\\tunnel.err" + q;
 // cmd /c "<line>": cmd strips the outer quotes and keeps the inner ones
 ws.Run('%ComSpec% /c "' + line + '"', 0, false);
@@ -141,14 +141,49 @@ WScript.Quit(0);
 # the environment; vpnc-script-win.js needs longer on a busy machine (a dozen netsh
 # calls) and then the tunnel is declared dead. The wrapper starts it hidden in the
 # background -- children inherit the environment -- and returns at once.
-_WRAPPER = r"""var ws = WScript.CreateObject("WScript.Shell");
+_WRAPPER = r"""// Mouseion vpnc wrapper v6. openconnect waits at most 10 s for its script; the real
+// vpnc-script-win.js can take longer, so connect/reconnect start it in the background.
+// The launch method is one of three built-in modes, chosen in vpn-run\params.txt
+// (wrapmode=exec|run|sync; anything else -> exec): which one behaves under SYSTEM can
+// then be switched without re-installing (2026-09-26: Run(no-wait) hung >10 s there).
+// Every call is timestamped in vpn-run\wrapper.log.
+var fso = new ActiveXObject("Scripting.FileSystemObject");
+var ws = new ActiveXObject("WScript.Shell");
+var t0 = new Date().getTime();
+var dir = fso.GetParentFolderName(WScript.ScriptFullName);
+var run = fso.GetParentFolderName(dir) + "\\vpn-run";
 var reason = ws.Environment("Process")("reason");
-var dir = WScript.ScriptFullName.replace(/[^\\]+$/, "");
-var real = dir + "openconnect\\vpnc-script-win.js";
-var log = dir.replace(/\\vpn\\$/, "\\vpn-run\\") + "script.log";
-var cmd = "%ComSpec% /c cscript.exe //nologo /e:JScript \"" + real + "\" >> \"" + log + "\" 2>&1";
+function log(msg) {
+    try {
+        var f = fso.OpenTextFile(run + "\\wrapper.log", 8, true);
+        f.WriteLine(new Date().toString() + " +" + (new Date().getTime() - t0) + "ms  " + reason + ": " + msg);
+        f.Close();
+    } catch (e) {}
+}
+var mode = "exec";
+try {
+    var f = fso.OpenTextFile(run + "\\params.txt", 1);
+    var lines = (f.AtEndOfStream ? "" : f.ReadAll()).split(/\r?\n/);
+    f.Close();
+    for (var i = 0; i < lines.length; i++) {
+        var m = /^wrapmode=(exec|run|sync)$/.exec(lines[i]);
+        if (m) mode = m[1];
+    }
+} catch (e) {}
+log("start, mode=" + mode);
+var real = dir + "\\openconnect\\vpnc-script-win.js";
+var cmd = ws.ExpandEnvironmentStrings("%ComSpec%") + " /c cscript.exe //nologo /e:JScript \"" + real +
+          "\" >> \"" + run + "\\script.log\" 2>&1";
 var background = (reason == "connect" || reason == "reconnect");
-ws.Run(cmd, 0, !background);
+if (!background || mode == "sync") {
+    ws.Run(cmd, 0, true);
+} else if (mode == "run") {
+    ws.Run(cmd, 0, false);
+} else {
+    var x = ws.Exec(cmd);          // CreateProcess directly (no shell): returns at once
+    try { x.StdIn.Close(); } catch (e) {}
+}
+log("returning");
 WScript.Quit(0);
 """
 
@@ -198,6 +233,19 @@ def task_installed() -> bool:
         return (PROTECTED / "runner_version.txt").read_text(encoding="utf-8-sig").strip() == RUNNER_VERSION
     except Exception:
         return False
+
+
+def _option(key: str, default: str) -> str:
+    """Tunables for the runner, from %LOCALAPPDATA%\mouseion\vpn\options.txt (key=value);
+    the runner accepts only its built-in values, so this file cannot inject anything."""
+    try:
+        for line in (STAGE_DIR / "options.txt").read_text(encoding="utf-8").splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == key and re.fullmatch(r"[a-z0-9]{1,8}", v.strip()):
+                return v.strip()
+    except OSError:
+        pass
+    return os.environ.get("MOUSEION_VPN_" + key.upper(), default)
 
 
 def pick_adapter() -> str:
@@ -291,7 +339,7 @@ def tunnel_pid() -> Optional[int]:
 
 def tunnel_output(n: int = 8) -> str:
     lines: list[str] = []
-    for name in ("tunnel.log", "tunnel.err"):
+    for name in ("tunnel.log", "tunnel.err", "wrapper.log"):
         try:
             lines += (RUN_DIR / name).read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
@@ -372,7 +420,8 @@ def connect(cfg, exe: Path) -> Dict[str, Any]:
             pass
     import json as _json
     (RUN_DIR / "cookie.txt").write_text(vals["COOKIE"] + "\n", encoding="ascii")
-    params = {"proto": proto, "cert": vals["FINGERPRINT"], "url": url, "ifname": pick_adapter()}
+    params = {"proto": proto, "cert": vals["FINGERPRINT"], "url": url, "ifname": pick_adapter(),
+              "wrapmode": _option("wrapmode", "exec"), "verbose": _option("verbose", "1")}
     (RUN_DIR / "params.json").write_text(_json.dumps(params), encoding="utf-8")
     (RUN_DIR / "params.txt").write_text("".join(f"{k}={v}" + chr(10) for k, v in params.items()), encoding="ascii")
     r = subprocess.run(["schtasks", "/run", "/tn", TASK], capture_output=True, text=True, timeout=30,
