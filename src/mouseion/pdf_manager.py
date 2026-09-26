@@ -46,7 +46,7 @@ _MAX_CONCURRENT = int(os.environ.get("MOUSEION_PDF_CONCURRENCY", "20"))
 # Bump when the fetcher gains a way to find PDFs: refs missed by an older fetcher
 # become eligible again (v2, 2026-09-26: Crossref full-text links, publisher TDM
 # APIs, per-publisher pacing and bot-check back-off).
-FETCHER_VERSION = "v2"
+FETCHER_VERSION = "v3"   # v3: every repository copy (OpenAlex locations, Europe PMC, Unpaywall all)
 
 
 # ---- per-source tally: which strategy was tried and which one found the PDF ----
@@ -422,6 +422,21 @@ async def _download_pdf_impl(
                     logger.info("Temporary failure using Unpaywall: %s", e)
                     temporary_failure = True
 
+        # Strategy 3.5: every repository copy (author manuscripts, PMC, arXiv, Zenodo, SciELO ...)
+        if ref.doi or ref.pmid:
+            _src("Repositories (OpenAlex, Europe PMC, all Unpaywall copies)")
+            try:
+                for rep_url in await _repository_copies(client, ref, cfg):
+                    if await _stream_download(client, rep_url, dest):
+                        ref.pdf_path = filename
+                        ref.oa_url = ref.oa_url or rep_url
+                        return filename
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using repositories: %s", e)
+                temporary_failure = True
+            except _publisher_blocked() as e:
+                logger.info("Repository host paused: %s", e)
+
         # Strategy 4: Semantic Scholar openAccessPdf
         _src("Semantic Scholar")
         try:
@@ -733,6 +748,91 @@ async def _crossref_fulltext_links(client: httpx.AsyncClient, doi: str, cfg) -> 
         if url.startswith("http") and (url, hdrs) not in out:
             out.append((url, hdrs))
     return out[:4]
+
+
+async def _repository_copies(client: httpx.AsyncClient, ref: Reference, cfg) -> List[str]:
+    """EVERY free copy the open indexes know of, not just the 'best' one:
+    OpenAlex locations (author manuscripts in university repositories, arXiv,
+    Zenodo, SciELO, PMC ...), Unpaywall oa_locations, Europe PMC full text.
+    Funder mandates (e.g. the US 2022 public-access policy) put accepted
+    manuscripts exactly there. PDF links first, then landing pages (whose
+    citation_pdf_url _stream_download follows)."""
+    pdfs: List[str] = []
+    pages: List[str] = []
+
+    def add(pdf=None, page=None):
+        for u, bucket in ((pdf, pdfs), (page, pages)):
+            if u and u.startswith("http") and u not in pdfs and u not in pages:
+                bucket.append(u)
+
+    doi = (ref.doi or "").strip()
+    pmcids: List[str] = []
+    # OpenAlex: all locations
+    try:
+        params = {"select": "locations,best_oa_location,ids"}
+        if getattr(cfg, "openalex_api_key", ""):
+            params["api_key"] = cfg.openalex_api_key
+        if cfg.openalex_email:
+            params["mailto"] = cfg.openalex_email
+        key = f"doi:{doi}" if doi else (f"pmid:{ref.pmid}" if ref.pmid else "")
+        if key:
+            async with network_slot("pdf_lookup", bucket="openalex"):
+                r = await client.get(f"https://api.openalex.org/works/{key}", params=params, timeout=20.0)
+            if r.status_code == 200:
+                w = r.json()
+                locs = w.get("locations") or []
+                locs.sort(key=lambda l: (not l.get("is_oa"), l.get("version") != "publishedVersion"))
+                for l in locs:
+                    if l.get("is_oa") or l.get("pdf_url"):
+                        add(pdf=l.get("pdf_url"), page=l.get("landing_page_url") if l.get("is_oa") else None)
+                pmcid = ((w.get("ids") or {}).get("pmcid") or "").rstrip("/").split("/")[-1]
+                if pmcid:
+                    pmcids.append(pmcid)
+    except (httpx.RequestError, ValueError):
+        pass
+    # Unpaywall: all oa_locations (the old lookup used only best_oa_location)
+    email = cfg.openalex_email or cfg.crossref_email
+    if doi and email:
+        try:
+            async with network_slot("pdf_lookup", bucket="unpaywall"):
+                r = await client.get(f"https://api.unpaywall.org/v2/{doi}", params={"email": email}, timeout=20.0)
+            if r.status_code == 200:
+                for l in r.json().get("oa_locations") or []:
+                    add(pdf=l.get("url_for_pdf"), page=l.get("url_for_landing_page"))
+        except (httpx.RequestError, ValueError):
+            pass
+    # Europe PMC: open full text by DOI
+    if doi:
+        try:
+            async with network_slot("pdf_lookup", bucket="europepmc"):
+                r = await client.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                                     params={"query": f'DOI:"{doi}"', "format": "json", "resultType": "core"},
+                                     timeout=20.0)
+            if r.status_code == 200:
+                for res in (r.json().get("resultList") or {}).get("result") or []:
+                    if res.get("pmcid"):
+                        pmcids.append(res["pmcid"])
+                    for u in ((res.get("fullTextUrlList") or {}).get("fullTextUrl") or []):
+                        if u.get("availabilityCode") in ("OA", "F") and u.get("documentStyle") == "pdf":
+                            add(pdf=u.get("url"))
+        except (httpx.RequestError, ValueError):
+            pass
+    # PubMed Central open-access PDFs: the PMC Article Dataset on AWS open data (the
+    # PMC OA web service was retired 2026-08-25; Europe PMC's PDF links now sit
+    # behind a bot check). One public listing call per article, no key.
+    for pmcid in list(dict.fromkeys(pmcids))[:2]:
+        pmcid = pmcid if pmcid.upper().startswith("PMC") else f"PMC{pmcid}"
+        try:
+            r = await client.get("https://pmc-oa-opendata.s3.amazonaws.com/",
+                                 params={"list-type": "2", "prefix": f"{pmcid}.", "max-keys": "50"}, timeout=20.0)
+            keys = re.findall(r"<Key>([^<]+)</Key>", r.text) if r.status_code == 200 else []
+            main = sorted((k for k in keys if re.fullmatch(rf"{pmcid}\.\d+/{pmcid}\.\d+\.pdf", k)),
+                          key=lambda k: int(k.split("/")[0].rsplit(".", 1)[1]))
+            if main:
+                pdfs.insert(0, "https://pmc-oa-opendata.s3.amazonaws.com/" + main[-1])
+        except (httpx.RequestError, ValueError):
+            pass
+    return (pdfs + pages)[:8]
 
 
 async def _unpaywall_lookup(

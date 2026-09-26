@@ -116,12 +116,24 @@ def looks_like_bot_check(text: str) -> bool:
     return bool(_BOT_CHECK.search(text[:20000]))
 
 
+# Open repositories / archives are built for this traffic: a short spacing only.
+REPOSITORY_HOSTS = ("pmc-oa-opendata.s3.amazonaws.com", "europepmc.org", "ncbi.nlm.nih.gov", "arxiv.org", "zenodo.org", "osf.io", "scielo",
+                    "hal.science", "archives-ouvertes.fr", "core.ac.uk", "semanticscholar.org", "biorxiv.org",
+                    "medrxiv.org", "researchgate.net", "philarchive.org", "philpapers.org", "ssrn.com",
+                    "repositorio", "repository", "eprints", "dspace", "handle.net", "digital.library")
+REPO_PACE_S = float(os.environ.get("MOUSEION_REPOSITORY_PACE_S", "1.5"))
+
+
+def is_repository(host: str) -> bool:
+    return any(k in host for k in REPOSITORY_HOSTS) or host.endswith(".edu") or ".edu." in host
+
+
 async def pace(host: str) -> None:
     """Reserve this host's next slot; concurrent tasks queue up behind each other."""
     with _lock:
         now = time.time()
         slot = max(now, _next_slot.get(host, 0.0))
-        _next_slot[host] = slot + PACE_S
+        _next_slot[host] = slot + (REPO_PACE_S if is_repository(host) else PACE_S)
     if slot > now:
         await asyncio.sleep(slot - now)
 
