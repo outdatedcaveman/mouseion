@@ -87,6 +87,7 @@ class PdfFacts:
     year_hint: Optional[int] = None
     journal_hint: str = ""
     error: str = ""
+    ocr: bool = False
 
     @property
     def title(self) -> str:
@@ -126,6 +127,27 @@ def extract(path: str | Path, data: bytes | None = None) -> PdfFacts:
         f.error = f"{type(e).__name__}: {str(e)[:80]}"
     finally:
         doc.close()
+    if len(f.text.strip()) < 100 and not f.error:
+        # a scan without a text layer: OCR page 1 (Windows' built-in engine), and take
+        # its first substantial lines as the title when nothing better exists
+        try:
+            from .ocr import ocr_pdf_pages
+            ocr_text = ocr_pdf_pages(str(path), pages=1, data=data)
+        except Exception:
+            ocr_text = ""
+        if ocr_text:
+            f.text = ocr_text
+            f.ocr = True
+            if not f.font_title:
+                lines = [ln.strip() for ln in ocr_text.splitlines() if len(ln.strip()) > 3]
+                head = []
+                for ln in lines[:4]:
+                    if re.match(r"^(by|par|von|por)|abstract|summary|resumo", ln, re.I):
+                        break
+                    head.append(ln)
+                    if len(" ".join(head)) > 60:
+                        break
+                f.font_title = " ".join(head)[:300]
     m = ARXIV_RE.search(f.text)
     if m:
         f.arxiv = m.group(1)
