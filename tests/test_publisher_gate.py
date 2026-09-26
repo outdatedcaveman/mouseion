@@ -28,3 +28,14 @@ def test_pacing_spaces_one_host(monkeypatch):
         await g.pace("h.example"); await g.pace("h.example")
         return time.time() - t
     assert asyncio.run(two()) >= 0.25
+
+
+def test_backoff_escalates_and_resets(monkeypatch, tmp_path):
+    monkeypatch.setattr(g, "_state_file", lambda: tmp_path / "gate.json")
+    g.mark_blocked("p.example")
+    first = g.blocked_until("p.example") - time.time()
+    g.mark_blocked("p.example")
+    second = g.blocked_until("p.example") - time.time()
+    assert 0.9 * 3600 < first < 1.1 * 3600 and second > 1.8 * 3600      # 1 h, then 2 h
+    g.mark_ok("p.example")
+    assert not g.is_blocked("p.example")

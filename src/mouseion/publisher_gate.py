@@ -27,7 +27,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 PACE_S = float(os.environ.get("MOUSEION_PUBLISHER_PACE_S", "15"))
-COOLDOWN_H = float(os.environ.get("MOUSEION_PUBLISHER_COOLDOWN_H", "12"))
+# escalating back-off: 1 h after a first bot check, doubling while the host keeps
+# challenging (2, 4, 8 ... capped), back to zero after a successful download
+COOLDOWN_BASE_H = float(os.environ.get("MOUSEION_PUBLISHER_COOLDOWN_H", "1"))
+COOLDOWN_MAX_H = float(os.environ.get("MOUSEION_PUBLISHER_COOLDOWN_MAX_H", "12"))
 
 _BOT_CHECK = re.compile(r"<title>\s*(Just a moment|Client Challenge|Attention Required|Access Denied)|"
                         r"challenge-platform|cf-chl-|/cdn-cgi/challenge|captcha-delivery|px-captcha", re.I)
@@ -59,19 +62,48 @@ def host_of(url: str) -> str:
     return urlparse(url).netloc.lower()
 
 
+def _entry(state: dict, host: str) -> dict:
+    v = state.get(host)
+    if isinstance(v, (int, float)):            # old format: just a timestamp
+        v = {"until": float(v), "strikes": 1}
+    return v or {"until": 0.0, "strikes": 0}
+
+
 def blocked_until(host: str) -> float:
-    return float(_load().get(host, 0))
+    return float(_entry(_load(), host)["until"])
 
 
 def is_blocked(host: str) -> bool:
     return blocked_until(host) > time.time()
 
 
+def _save(state: dict) -> None:
+    try:
+        p = _state_file()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def mark_ok(host: str) -> None:
+    """A PDF came through: the host is fine again, forget its strikes."""
+    with _lock:
+        state = _load()
+        if host in state:
+            del state[host]
+            _save(state)
+
+
 def mark_blocked(host: str) -> None:
     with _lock:
         state = _load()
-        state[host] = time.time() + COOLDOWN_H * 3600
-        state = {h: t for h, t in state.items() if t > time.time()}
+        e = _entry(state, host)
+        strikes = int(e.get("strikes", 0)) + 1
+        hours = min(COOLDOWN_MAX_H, COOLDOWN_BASE_H * 2 ** (strikes - 1))
+        state[host] = {"until": time.time() + hours * 3600, "strikes": strikes}
+        # keep strikes for a day after a pause ends, so a host that challenges again escalates
+        state = {h: v for h, v in state.items() if _entry(state, h)["until"] > time.time() - 86400}
         try:
             p = _state_file()
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -97,4 +129,5 @@ async def pace(host: str) -> None:
 def status() -> dict:
     """Hosts currently paused, with hours left (for health / UI)."""
     now = time.time()
-    return {h: round((t - now) / 3600, 1) for h, t in _load().items() if t > now}
+    st = _load()
+    return {h: round((_entry(st, h)["until"] - now) / 3600, 1) for h in st if _entry(st, h)["until"] > now}

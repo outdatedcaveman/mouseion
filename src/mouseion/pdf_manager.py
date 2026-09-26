@@ -549,6 +549,8 @@ async def _stream_download(
                     if not is_pdf or bytes_written < 1024:
                         dest.unlink(missing_ok=True)
                         return False
+                    if not _resolver:
+                        _gate.mark_ok(_gate.host_of(str(resp.url)))
                     return True
     except (TemporaryDownloadError, _gate.PublisherBlocked):
         dest.unlink(missing_ok=True)
