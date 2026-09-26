@@ -52,38 +52,89 @@ auth_failed = False                       # login rejected: no automatic retries
 # as administrator.
 # ---------------------------------------------------------------------------
 TASK = "MouseionVPN"
-RUNNER_VERSION = "4"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
+RUNNER_VERSION = "5"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
 PROTECTED = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn"
 
-_TASK_RUNNER = r"""$ErrorActionPreference = 'Continue'
-$prot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$dir  = Join-Path (Split-Path -Parent $prot) 'vpn-run'
-$p = Get-Content (Join-Path $dir 'params.json') -Raw | ConvertFrom-Json
-$allowed = (Get-Content (Join-Path $prot 'allowed_host.txt') -Raw).Trim().ToLower()
-if ($p.proto -notin @('fortinet','anyconnect','gp','nc','pulse','f5','array')) { exit 2 }
-if ($p.cert -notmatch '^(pin-sha256:[A-Za-z0-9+/=]{20,100}|sha1:[0-9a-fA-F]{40}|sha256:[0-9a-fA-F]{64}|[0-9a-fA-F]{40})$') { exit 3 }
-if ($p.url -notmatch '^https://([A-Za-z0-9.-]+)(:\d{1,5})?(/[A-Za-z0-9._~/?=&%-]*)?$') { exit 4 }
-if ($Matches[1].ToLower() -ne $allowed) { exit 5 }
-$if = if ($p.ifname) { [string]$p.ifname } else { 'openconnect-mouseion' }
-if ($if -notmatch '^[A-Za-z0-9 ._()-]{1,64}$') { exit 6 }
-$oc = Join-Path $prot 'openconnect\openconnect.exe'
-$stop = Join-Path $dir 'stop.flag'; $pidf = Join-Path $dir 'tunnel.pid'
-Remove-Item $stop -ErrorAction SilentlyContinue
-$a = @("--protocol=$($p.proto)", '--cookie-on-stdin', "--servercert=$($p.cert)", "--interface=$if",
-       "--script=$(Join-Path $prot 'vpnc-wrapper.js')", '--no-dtls', '--non-inter', '--timestamp', $p.url)
-# Windows PowerShell's Start-Process joins -ArgumentList WITHOUT quoting: an
-# adapter named "Ethernet 7" became two arguments (2026-09-25). Quote each one.
-$argline = ($a | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
-$proc = Start-Process -FilePath $oc -ArgumentList $argline -RedirectStandardInput (Join-Path $dir 'cookie.txt') `
-        -RedirectStandardOutput (Join-Path $dir 'tunnel.log') -RedirectStandardError (Join-Path $dir 'tunnel.err') `
-        -WindowStyle Hidden -PassThru
-Set-Content -Path $pidf -Value $proc.Id
-while (-not $proc.HasExited) {
-    if (Test-Path $stop) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; break }
-    Start-Sleep -Milliseconds 1000
+_TASK_RUNNER = r"""// Mouseion VPN runner v5 (JScript): run by the SYSTEM task, starts in a fraction of a
+// second (Windows PowerShell as SYSTEM took ~30-80 s, and FortiGate dropped the unused
+// login session meanwhile, 2026-09-25). Accepts only validated values from vpn-run\params.txt,
+// connects only to the host recorded at setup, uses only its own protected openconnect.
+var fso = new ActiveXObject("Scripting.FileSystemObject");
+var ws = new ActiveXObject("WScript.Shell");
+var prot = fso.GetParentFolderName(WScript.ScriptFullName);
+var run = fso.GetParentFolderName(prot) + "\\vpn-run";
+
+function read(p) {
+    if (!fso.FileExists(p)) return "";
+    var f = fso.OpenTextFile(p, 1);
+    var t = f.AtEndOfStream ? "" : f.ReadAll();
+    f.Close();
+    return t;
 }
-Start-Sleep -Milliseconds 500
-Remove-Item (Join-Path $dir 'cookie.txt'), $pidf, $stop -ErrorAction SilentlyContinue
+function log(msg) {
+    var f = fso.OpenTextFile(run + "\\runner.log", 8, true);
+    f.WriteLine(new Date().toString() + "  " + msg);
+    f.Close();
+}
+function del(p) { try { if (fso.FileExists(p)) fso.DeleteFile(p, true); } catch (e) {} }
+
+var kv = {};
+var lines = read(run + "\\params.txt").split(/\r?\n/);
+for (var i = 0; i < lines.length; i++) {
+    var k = lines[i].indexOf("=");
+    if (k > 0) kv[lines[i].substr(0, k)] = lines[i].substr(k + 1);
+}
+var allowed = read(prot + "\\allowed_host.txt").replace(/\s+/g, "").toLowerCase();
+var urlm = /^https:\/\/([A-Za-z0-9.-]+)(:\d{1,5})?(\/[A-Za-z0-9._~\/?=&%-]*)?$/.exec(kv.url || "");
+if (!/^(fortinet|anyconnect|gp|nc|pulse|f5|array)$/.test(kv.proto || "")) { log("bad proto"); WScript.Quit(2); }
+if (!/^(pin-sha256:[A-Za-z0-9+\/=]{20,100}|sha1:[0-9a-fA-F]{40}|sha256:[0-9a-fA-F]{64}|[0-9a-fA-F]{40})$/.test(kv.cert || "")) { log("bad cert"); WScript.Quit(3); }
+if (!urlm) { log("bad url"); WScript.Quit(4); }
+if (urlm[1].toLowerCase() != allowed) { log("host not allowed: " + urlm[1]); WScript.Quit(5); }
+var ifname = kv.ifname || "openconnect-mouseion";
+if (!/^[A-Za-z0-9 ._()-]{1,64}$/.test(ifname)) { log("bad ifname"); WScript.Quit(6); }
+
+// the login may still be finishing: wait for the session cookie (up to 90 s)
+var cookie = run + "\\cookie.txt";
+for (i = 0; i < 180 && !fso.FileExists(cookie); i++) WScript.Sleep(500);
+if (!fso.FileExists(cookie)) { log("no cookie"); WScript.Quit(7); }
+
+del(run + "\\stop.flag");
+var q = '"';
+var oc = prot + "\\openconnect\\openconnect.exe";
+var line = q + oc + q + " --protocol=" + kv.proto + " --cookie-on-stdin --servercert=" + kv.cert +
+    " " + q + "--interface=" + ifname + q + " " + q + "--script=" + prot + "\\vpnc-wrapper.js" + q +
+    " --no-dtls --non-inter --timestamp " + kv.url +
+    " < " + q + cookie + q + " > " + q + run + "\\tunnel.log" + q + " 2> " + q + run + "\\tunnel.err" + q;
+// cmd /c "<line>": cmd strips the outer quotes and keeps the inner ones
+ws.Run('%ComSpec% /c "' + line + '"', 0, false);
+log("started openconnect for " + urlm[1] + " on " + ifname);
+
+var wmi = GetObject("winmgmts:\\\\.\\root\\cimv2");
+function ocPid() {
+    var e = new Enumerator(wmi.ExecQuery("SELECT ProcessId, ExecutablePath FROM Win32_Process WHERE Name='openconnect.exe'"));
+    for (; !e.atEnd(); e.moveNext()) {
+        var p = e.item();
+        if (p.ExecutablePath && p.ExecutablePath.toLowerCase() == oc.toLowerCase()) return p.ProcessId;
+    }
+    return 0;
+}
+var pid = 0;
+for (i = 0; i < 40 && !pid; i++) { WScript.Sleep(250); pid = ocPid(); }
+if (pid) {
+    var f = fso.CreateTextFile(run + "\\tunnel.pid", true);
+    f.Write(String(pid));
+    f.Close();
+    while (ocPid() == pid) {
+        if (fso.FileExists(run + "\\stop.flag")) { ws.Run("taskkill /f /pid " + pid, 0, true); break; }
+        WScript.Sleep(1000);
+    }
+    log("openconnect ended");
+} else {
+    log("openconnect did not start");
+}
+WScript.Sleep(500);
+del(cookie); del(run + "\\tunnel.pid"); del(run + "\\stop.flag");
+WScript.Quit(0);
 """
 
 # openconnect waits at most 10 s for its script and runs it with the VPN settings in
@@ -112,7 +163,7 @@ try {
   }
   New-Item -ItemType Directory -Force -Path $Prot | Out-Null
   Copy-Item -Path (Join-Path $Src 'openconnect') -Destination $Prot -Recurse -Force
-  Copy-Item -Path (Join-Path $Src 'runner.ps1') -Destination (Join-Path $Prot 'runner.ps1') -Force
+  Copy-Item -Path (Join-Path $Src 'runner.js') -Destination (Join-Path $Prot 'runner.js') -Force
   Copy-Item -Path (Join-Path $Src 'vpnc-wrapper.js') -Destination (Join-Path $Prot 'vpnc-wrapper.js') -Force
   Set-Content -Path (Join-Path $Prot 'allowed_host.txt') -Value $HostName -Encoding ASCII
   Set-Content -Path (Join-Path $Prot 'runner_version.txt') -Value $Version -Encoding ASCII
@@ -124,7 +175,7 @@ try {
   New-Item -ItemType Directory -Force -Path $run | Out-Null
   $sid = (New-Object System.Security.Principal.NTAccount($User)).Translate([System.Security.Principal.SecurityIdentifier]).Value
   & icacls $run /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' ('*' + $sid + ':(OI)(CI)M') /Q | Out-Null
-  $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $Prot 'runner.ps1') + '"')
+  $act = New-ScheduledTaskAction -Execute 'cscript.exe' -Argument ('//nologo //e:JScript "' + (Join-Path $Prot 'runner.js') + '"')
   # SYSTEM: runs in session 0, so no window from openconnect, cscript or netsh can
   # ever reach the desktop (the per-user task flashed console windows, 2026-09-25)
   $pri = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -142,7 +193,7 @@ def task_installed() -> bool:
     try:
         r = subprocess.run(["schtasks", "/query", "/tn", TASK], capture_output=True, text=True, timeout=20,
                            creationflags=_NO_WINDOW)
-        if r.returncode != 0 or not (PROTECTED / "runner.ps1").exists():
+        if r.returncode != 0 or not (PROTECTED / "runner.js").exists():
             return False
         return (PROTECTED / "runner_version.txt").read_text(encoding="utf-8-sig").strip() == RUNNER_VERSION
     except Exception:
@@ -195,7 +246,7 @@ def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
         shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True, exist_ok=True)
     shutil.copytree(exe.parent, stage / "openconnect")
-    (stage / "runner.ps1").write_text(_TASK_RUNNER, encoding="utf-8")
+    (stage / "runner.js").write_text(_TASK_RUNNER, encoding="utf-8")
     (stage / "vpnc-wrapper.js").write_text(_WRAPPER, encoding="utf-8")
     (stage / "setup.ps1").write_text(_SETUP, encoding="utf-8")
     user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
@@ -321,8 +372,9 @@ def connect(cfg, exe: Path) -> Dict[str, Any]:
             pass
     import json as _json
     (RUN_DIR / "cookie.txt").write_text(vals["COOKIE"] + "\n", encoding="ascii")
-    (RUN_DIR / "params.json").write_text(_json.dumps({"proto": proto, "cert": vals["FINGERPRINT"], "url": url,
-                                                      "ifname": pick_adapter()}), encoding="utf-8")
+    params = {"proto": proto, "cert": vals["FINGERPRINT"], "url": url, "ifname": pick_adapter()}
+    (RUN_DIR / "params.json").write_text(_json.dumps(params), encoding="utf-8")
+    (RUN_DIR / "params.txt").write_text("".join(f"{k}={v}" + chr(10) for k, v in params.items()), encoding="ascii")
     r = subprocess.run(["schtasks", "/run", "/tn", TASK], capture_output=True, text=True, timeout=30,
                        creationflags=_NO_WINDOW)
     if r.returncode != 0:

@@ -23,6 +23,7 @@ def test_errors_are_explained():
 
 def test_runner_uses_cookie_not_password():
     assert "--cookie-on-stdin" in e._TASK_RUNNER and "passwd" not in e._TASK_RUNNER
+    assert "Start-Process" not in e._TASK_RUNNER and "ws.Run(" in e._TASK_RUNNER   # JScript: PowerShell as SYSTEM took 30-80 s
     assert "stop.flag" in e._TASK_RUNNER and "vpnc-wrapper.js" in e._TASK_RUNNER
     assert "NT AUTHORITY\SYSTEM" in e._SETUP          # session 0: no window can reach the desktop
 
