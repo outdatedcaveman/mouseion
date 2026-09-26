@@ -3,7 +3,9 @@
 Measures outputs, not flags: completeness, PDFs, enrichment writes, the PDF
 engine and its per-source results, the institutional VPN, library health and
 which background jobs are alive. Each run stores a snapshot next to refs.db
-(status_snapshot.json) and reports the change since the last one.
+(status_snapshot.json) and reports the change since the last one. The text also
+goes to status_report.txt (latest) and status_history.log there, so a reader
+that may not run programs (the 4-hourly phone update) only has to read a file.
 
 Usage: python scripts/status_report.py [--json]
 """
@@ -136,6 +138,11 @@ def main() -> None:
         prev = {}
     text = report(now, prev)
     SNAP.write_text(json.dumps(now, indent=1), encoding="utf-8")
+    (DATA / "status_report.txt").write_text(text + "\n", encoding="utf-8")
+    with open(DATA / "status_history.log", "a", encoding="utf-8") as h:
+        h.write(text + "\n\n")
+    if "--copy-to" in sys.argv:        # a second copy where the reader is allowed to look
+        Path(sys.argv[sys.argv.index("--copy-to") + 1]).write_text(text + "\n", encoding="utf-8")
     print(json.dumps({"report": text, "now": now}) if "--json" in sys.argv else text)
 
 
