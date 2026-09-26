@@ -39,7 +39,7 @@ def main() -> None:
     todo = []
     for dp, _dn, fn in os.walk(ROOT):
         for f in fn:
-            if not f.lower().endswith(".pdf"):
+            if not f.lower().endswith((".pdf", ".djvu")):
                 continue
             p = os.path.join(dp, f)
             try:

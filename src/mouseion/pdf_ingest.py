@@ -108,8 +108,55 @@ class IngestResult:
 
 
 # ---------------------------------------------------------------- 1. extract
+def _calibre_convert() -> Optional[str]:
+    import shutil
+    for c in (shutil.which("ebook-convert"), r"C:\Program Files\Calibre2\ebook-convert.exe",
+              r"C:\Program Files (x86)\Calibre2\ebook-convert.exe"):
+        if c and Path(c).exists():
+            return c
+    return None
+
+
+def extract_djvu(path: str) -> PdfFacts:
+    """DjVu: the text layer via Calibre's converter (no DjVu library needed), windowless."""
+    import subprocess
+    import tempfile
+    f = PdfFacts(path=str(path))
+    conv = _calibre_convert()
+    if not conv:
+        f.error = "DjVu needs Calibre (ebook-convert) installed"
+        return f
+    out = Path(tempfile.mkdtemp()) / "djvu.txt"
+    try:
+        subprocess.run([conv, str(path), str(out)], capture_output=True, timeout=300,
+                       creationflags=0x08000000)            # CREATE_NO_WINDOW
+        full = out.read_text(encoding="utf-8", errors="ignore") if out.exists() else ""
+    except (subprocess.TimeoutExpired, OSError) as e:
+        f.error = type(e).__name__
+        full = ""
+    finally:
+        try:
+            out.unlink(missing_ok=True)
+            out.parent.rmdir()
+        except OSError:
+            pass
+    f.text = full[:8000]
+    f.pages = max(1, len(full) // 2500)          # rough page estimate: DjVu here is mostly books
+    lines = [ln.strip() for ln in f.text.splitlines() if len(ln.strip()) > 3]
+    f.font_title = " ".join(lines[:2])[:200] if lines else ""
+    m = DOI_RE.search(f.text)
+    if m:
+        f.doi = m.group(1).rstrip(".,;:").lower()
+    m = ISBN_RE.search(full[:60000])
+    if m:
+        f.isbn = re.sub(r"[^\dX]", "", m.group(1).upper())
+    return f
+
+
 def extract(path: str | Path, data: bytes | None = None) -> PdfFacts:
     import pymupdf
+    if data is None and str(path).lower().endswith(".djvu"):
+        return extract_djvu(str(path))
     f = PdfFacts(path=str(path))
     try:
         doc = pymupdf.open(stream=data, filetype="pdf") if data is not None else pymupdf.open(str(path))
@@ -327,6 +374,9 @@ def _title_search(client: httpx.Client, f: PdfFacts, mailto: str, oa_key: str) -
         pass
     best, best_s = None, 0.0
     nt = _norm(title)
+    if f.pages >= 150:      # a book-sized file: articles and chapters are not it
+        cands = [(x, c) for x, c in cands if (c.ref_type or "") in (RefType.BOOK,) or
+                 getattr(c.ref_type, "value", c.ref_type) in ("book", "monograph", "edited-book")]
     for _, c in cands:
         ct = _norm(c.title or "")
         if not ct:
@@ -391,6 +441,9 @@ def _book_search(client: httpx.Client, f: PdfFacts, mailto: str) -> Optional[Ref
         r = client.get("https://api.crossref.org/works", params=prm)
         if r.status_code == 200:
             for it in r.json()["message"]["items"]:
+                if (it.get("type") or "") not in ("book", "monograph", "edited-book", "reference-book",
+                                                  "book-set", "book-series"):
+                    continue    # a book-sized file is not the same-titled article (Ramsey 1926 vs 1931)
                 c = CrossRefProvider()._parse_work(it)
                 if difflib.SequenceMatcher(None, _norm(title), _norm(c.title or "")).ratio() < 0.85:
                     continue
@@ -527,11 +580,17 @@ def _title_ok(f: PdfFacts, rec: Reference) -> bool:
 def from_pdf_only(f: PdfFacts) -> Reference:
     """What the file itself says, for works no index knows (the title-fixer retries later)."""
     ref = Reference(title=f.title[:500] or Path(f.path).stem)
+    fn_title, fn_author = _split_title_author(Path(f.path).stem)
+    if fn_author and len(_norm(fn_title).split()) >= 2:
+        # "Title (Author)" / "Title, Author" file names beat a first-line guess
+        ref.title = fn_title
+        parts = fn_author.split()
+        ref.authors = [Author(family=parts[-1], given=" ".join(parts[:-1]))]
     if is_whole_volume(f):
         parent = Path(f.path).parent.name
         ref.title = f"{Path(f.path).stem} ({parent})" if parent.lower() not in ("pdf",) else Path(f.path).stem
         ref.ref_type = RefType.OTHER if hasattr(RefType, "OTHER") else ref.ref_type
-    if f.meta_author and not re.fullmatch(r"(admin\w*|user|owner|author|unknown|[a-z]+\d+)", f.meta_author, re.I):
+    if not ref.authors and f.meta_author and not re.fullmatch(r"(admin\w*|user|owner|author|unknown|[a-z]+\d+)", f.meta_author, re.I):
         for name in re.split(r"\s*(?:;|&| and |,(?=\s*[A-Z][a-z]+\s+[A-Z]))\s*", f.meta_author)[:10]:
             parts = name.split()
             if parts:
