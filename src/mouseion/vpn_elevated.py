@@ -31,33 +31,15 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-RUN_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "mouseion" / "vpn"
+STAGE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "mouseion" / "vpn"
+# params/cookie/logs shared with the SYSTEM task: this user + SYSTEM + admins only
+RUN_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn-run"
 IFNAME = "openconnect-mouseion"          # matched by vpn_manager.vpn_adapter_up()
 _NO_WINDOW = 0x08000000
 
 last_error = ""
 declined = False                          # UAC refused: no automatic retries until a click
 auth_failed = False                       # login rejected: no automatic retries (account lockout)
-
-_RUNNER = r'''param([string]$Oc, [string]$Proto, [string]$Cert, [string]$Url, [string]$Ifname, [string]$Dir)
-$ErrorActionPreference = "Continue"
-$cookie = Join-Path $Dir "cookie.txt"
-$stop   = Join-Path $Dir "stop.flag"
-$pidf   = Join-Path $Dir "tunnel.pid"
-Remove-Item $stop -ErrorAction SilentlyContinue
-$a = @("--protocol=$Proto", "--cookie-on-stdin", "--servercert=$Cert", "--interface=$Ifname", "--no-dtls", "--non-inter", "--timestamp", $Url)
-$p = Start-Process -FilePath $Oc -ArgumentList $a -RedirectStandardInput $cookie `
-     -RedirectStandardOutput (Join-Path $Dir "tunnel.log") -RedirectStandardError (Join-Path $Dir "tunnel.err") `
-     -NoNewWindow -PassThru
-Set-Content -Path $pidf -Value $p.Id
-while (-not $p.HasExited) {
-    if (Test-Path $stop) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; break }
-    Start-Sleep -Milliseconds 1000
-}
-Start-Sleep -Milliseconds 500
-Remove-Item $cookie, $pidf, $stop -ErrorAction SilentlyContinue
-'''
-
 
 # ---------------------------------------------------------------------------
 # No prompt per connect (2026-09-25: a UAC prompt on every reconnect "every
@@ -70,12 +52,12 @@ Remove-Item $cookie, $pidf, $stop -ErrorAction SilentlyContinue
 # as administrator.
 # ---------------------------------------------------------------------------
 TASK = "MouseionVPN"
-RUNNER_VERSION = "3"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
+RUNNER_VERSION = "4"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
 PROTECTED = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn"
 
 _TASK_RUNNER = r"""$ErrorActionPreference = 'Continue'
 $prot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$dir  = Join-Path $env:LOCALAPPDATA 'mouseion\vpn'
+$dir  = Join-Path (Split-Path -Parent $prot) 'vpn-run'
 $p = Get-Content (Join-Path $dir 'params.json') -Raw | ConvertFrom-Json
 $allowed = (Get-Content (Join-Path $prot 'allowed_host.txt') -Raw).Trim().ToLower()
 if ($p.proto -notin @('fortinet','anyconnect','gp','nc','pulse','f5','array')) { exit 2 }
@@ -88,13 +70,13 @@ $oc = Join-Path $prot 'openconnect\openconnect.exe'
 $stop = Join-Path $dir 'stop.flag'; $pidf = Join-Path $dir 'tunnel.pid'
 Remove-Item $stop -ErrorAction SilentlyContinue
 $a = @("--protocol=$($p.proto)", '--cookie-on-stdin', "--servercert=$($p.cert)", "--interface=$if",
-       '--no-dtls', '--non-inter', '--timestamp', $p.url)
+       "--script=$(Join-Path $prot 'vpnc-wrapper.js')", '--no-dtls', '--non-inter', '--timestamp', $p.url)
 # Windows PowerShell's Start-Process joins -ArgumentList WITHOUT quoting: an
 # adapter named "Ethernet 7" became two arguments (2026-09-25). Quote each one.
 $argline = ($a | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
 $proc = Start-Process -FilePath $oc -ArgumentList $argline -RedirectStandardInput (Join-Path $dir 'cookie.txt') `
         -RedirectStandardOutput (Join-Path $dir 'tunnel.log') -RedirectStandardError (Join-Path $dir 'tunnel.err') `
-        -NoNewWindow -PassThru
+        -WindowStyle Hidden -PassThru
 Set-Content -Path $pidf -Value $proc.Id
 while (-not $proc.HasExited) {
     if (Test-Path $stop) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; break }
@@ -102,6 +84,21 @@ while (-not $proc.HasExited) {
 }
 Start-Sleep -Milliseconds 500
 Remove-Item (Join-Path $dir 'cookie.txt'), $pidf, $stop -ErrorAction SilentlyContinue
+"""
+
+# openconnect waits at most 10 s for its script and runs it with the VPN settings in
+# the environment; vpnc-script-win.js needs longer on a busy machine (a dozen netsh
+# calls) and then the tunnel is declared dead. The wrapper starts it hidden in the
+# background -- children inherit the environment -- and returns at once.
+_WRAPPER = r"""var ws = WScript.CreateObject("WScript.Shell");
+var reason = ws.Environment("Process")("reason");
+var dir = WScript.ScriptFullName.replace(/[^\\]+$/, "");
+var real = dir + "openconnect\\vpnc-script-win.js";
+var log = dir.replace(/\\vpn\\$/, "\\vpn-run\\") + "script.log";
+var cmd = "%ComSpec% /c cscript.exe //nologo /e:JScript \"" + real + "\" >> \"" + log + "\" 2>&1";
+var background = (reason == "connect" || reason == "reconnect");
+ws.Run(cmd, 0, !background);
+WScript.Quit(0);
 """
 
 _SETUP = r"""param([string]$Src, [string]$Prot, [string]$HostName, [string]$User, [string]$Version)
@@ -116,16 +113,26 @@ try {
   New-Item -ItemType Directory -Force -Path $Prot | Out-Null
   Copy-Item -Path (Join-Path $Src 'openconnect') -Destination $Prot -Recurse -Force
   Copy-Item -Path (Join-Path $Src 'runner.ps1') -Destination (Join-Path $Prot 'runner.ps1') -Force
+  Copy-Item -Path (Join-Path $Src 'vpnc-wrapper.js') -Destination (Join-Path $Prot 'vpnc-wrapper.js') -Force
   Set-Content -Path (Join-Path $Prot 'allowed_host.txt') -Value $HostName -Encoding ASCII
   Set-Content -Path (Join-Path $Prot 'runner_version.txt') -Value $Version -Encoding ASCII
   # folder: admins + SYSTEM write, users read; files inherit it (OI/CI flags only mean
   # something on a folder -- applied to files they left them unreadable, 2026-09-25)
   & icacls $Prot /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null
   & icacls (Join-Path $Prot '*') /reset /T /Q | Out-Null
+  $run = Join-Path (Split-Path -Parent $Prot) 'vpn-run'
+  New-Item -ItemType Directory -Force -Path $run | Out-Null
+  $sid = (New-Object System.Security.Principal.NTAccount($User)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+  & icacls $run /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' ('*' + $sid + ':(OI)(CI)M') /Q | Out-Null
   $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $Prot 'runner.ps1') + '"')
-  $pri = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+  # SYSTEM: runs in session 0, so no window from openconnect, cscript or netsh can
+  # ever reach the desktop (the per-user task flashed console windows, 2026-09-25)
+  $pri = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
   $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 30) -MultipleInstances IgnoreNew
   Register-ScheduledTask -TaskName 'MouseionVPN' -Action $act -Principal $pri -Settings $set -Force | Out-Null
+  # let this (unelevated) user start and query the task -- nothing else
+  $svc = New-Object -ComObject 'Schedule.Service'; $svc.Connect()
+  $svc.GetFolder('\').GetTask('MouseionVPN').SetSecurityDescriptor("D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;$sid)", 0)
   Set-Content -Path (Join-Path $Src 'setup.ok') -Value 'ok'
 } catch { Set-Content -Path $log -Value ($_ | Out-String) }
 """
@@ -183,12 +190,13 @@ def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
     _setup_attempted = True
     import ctypes
     import shutil
-    stage = RUN_DIR / "setup"
+    stage = STAGE_DIR / "setup"
     if stage.exists():
         shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True, exist_ok=True)
     shutil.copytree(exe.parent, stage / "openconnect")
     (stage / "runner.ps1").write_text(_TASK_RUNNER, encoding="utf-8")
+    (stage / "vpnc-wrapper.js").write_text(_WRAPPER, encoding="utf-8")
     (stage / "setup.ps1").write_text(_SETUP, encoding="utf-8")
     user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
     params = (f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{stage / "setup.ps1"}" '
@@ -198,7 +206,8 @@ def install_task(exe: Path, gateway_host: str) -> tuple[bool, str]:
         return False, ("Windows admin permission was declined -- the one-time VPN setup was not installed."
                        if rc == 5 else f"Could not start the one-time VPN setup (code {rc}).")
     for _ in range(120):
-        if (stage / "setup.ok").exists() and task_installed() and _allowed_host() == gateway_host:
+        if (stage / "setup.ok").exists() and task_installed() and _allowed_host() == gateway_host \
+                and RUN_DIR.exists():
             shutil.rmtree(stage, ignore_errors=True)
             return True, "installed"
         if (stage / "setup.log").exists():
@@ -270,7 +279,7 @@ def _explain(out: str) -> str:
 def connect(cfg, exe: Path) -> Dict[str, Any]:
     """Blocking (~5-30 s). Returns a status dict; never raises for expected failures."""
     global last_error, declined
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
     if tunnel_pid():
         return {"status": "connecting", "pid": tunnel_pid()}
     proto = cfg.vpn_protocol or "anyconnect"
@@ -295,51 +304,30 @@ def connect(cfg, exe: Path) -> Dict[str, Any]:
         last_error = _explain(out)
         return {"status": "error", "error": last_error}
 
-    # 2. elevated tunnel (one UAC prompt), fed the session cookie only
-    (RUN_DIR / "cookie.txt").write_text(vals["COOKIE"] + "\n", encoding="ascii")
-    for stale in ("tunnel.log", "tunnel.err", "stop.flag"):
+    # 2. elevated tunnel via the SYSTEM task (one-time setup), fed the session cookie only
+    url = vals.get("CONNECT_URL") or cfg.vpn_gateway
+    host = re.sub(r"^https?://", "", url).split("/")[0].split(":")[0].lower()
+    if not task_installed() or _allowed_host() != host:
+        ok, why = install_task(exe, host)             # the one prompt, once per runner version
+        if not ok:
+            declined = "declined" in why
+            last_error = why
+            return {"status": "error", "error": last_error}
+    declined = False
+    for stale in ("tunnel.log", "tunnel.err", "stop.flag", "script.log"):
         try:
             (RUN_DIR / stale).unlink()
         except FileNotFoundError:
             pass
-    url = vals.get("CONNECT_URL") or cfg.vpn_gateway
-    host = re.sub(r"^https?://", "", url).split("/")[0].split(":")[0].lower()
-    if not task_installed() or _allowed_host() != host:
-        ok, why = install_task(exe, host)             # the one prompt, once per gateway
-        if not ok:
-            declined = "declined" in why
-            last_error = why
-            try:
-                (RUN_DIR / "cookie.txt").unlink()
-            except FileNotFoundError:
-                pass
-            return {"status": "error", "error": last_error}
     import json as _json
+    (RUN_DIR / "cookie.txt").write_text(vals["COOKIE"] + "\n", encoding="ascii")
     (RUN_DIR / "params.json").write_text(_json.dumps({"proto": proto, "cert": vals["FINGERPRINT"], "url": url,
                                                       "ifname": pick_adapter()}), encoding="utf-8")
     r = subprocess.run(["schtasks", "/run", "/tn", TASK], capture_output=True, text=True, timeout=30,
                        creationflags=_NO_WINDOW)
-    if r.returncode == 0:
-        return _await_tunnel()
-    script = RUN_DIR / "tunnel_runner.ps1"
-    script.write_text(_RUNNER, encoding="utf-8")
-    params = (f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script}" '
-              f'-Oc "{exe}" -Proto "{proto}" -Cert "{vals["FINGERPRINT"]}" -Url "{url}" '
-              f'-Ifname "{IFNAME}" -Dir "{RUN_DIR}"')
-    import ctypes
-    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", params, None, 0)
-    if rc <= 32:
-        try:
-            (RUN_DIR / "cookie.txt").unlink()
-        except FileNotFoundError:
-            pass
-        if rc == 5:
-            declined = True
-            last_error = "Windows admin permission was declined, so the tunnel was not started. Click Connect VPN to try again."
-        else:
-            last_error = f"Could not start the elevated VPN runner (ShellExecute code {rc})."
+    if r.returncode != 0:
+        last_error = "Could not start the VPN task: " + (r.stderr or r.stdout).strip()[:200]
         return {"status": "error", "error": last_error}
-    declined = False
     return _await_tunnel()
 
 

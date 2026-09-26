@@ -22,8 +22,9 @@ def test_errors_are_explained():
 
 
 def test_runner_uses_cookie_not_password():
-    assert "--cookie-on-stdin" in e._RUNNER and "passwd" not in e._RUNNER
-    assert "stop.flag" in e._RUNNER
+    assert "--cookie-on-stdin" in e._TASK_RUNNER and "passwd" not in e._TASK_RUNNER
+    assert "stop.flag" in e._TASK_RUNNER and "vpnc-wrapper.js" in e._TASK_RUNNER
+    assert "NT AUTHORITY\SYSTEM" in e._SETUP          # session 0: no window can reach the desktop
 
 
 def test_rejected_login_is_named_and_pauses_retries():
