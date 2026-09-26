@@ -66,6 +66,37 @@ _SKIP_WORDS = re.compile(
     r"boleto|nota fiscal|fatura|invoice|receipt|recibo|comprovante|extrato banc[aá]rio|"
     r"curriculum vitae|curr[ií]culo)\b", re.I)
 
+# Brazilian course material (the owner's call): exercise lists, exams, lecture
+# slides/notes, syllabi, assignments, university notices. Needs a Portuguese
+# signal too, so Italian "prova"/"disciplina" and English talk slides stay.
+_PT_SIGNAL = re.compile(r"ção|ções|ões|[ãõ]|\b(dos|das|não|uma|pelo|pela|aos|às|exerc[ií]c?ios|"
+                        r"equa[cç][oõ]es|solu[cç][oõ]es|lista|aulas?)\b", re.I)
+# phrases only Portuguese course paperwork uses: no language check needed
+_COURSE_PT = re.compile(
+    r"lista\s*(de\s*)?exerc|exerc[ií]c?ios?\s+resolvid|gabarito|notas de aula|\bementa\b|plano de ensino|"
+    r"programa da disciplina|lista de disciplinas|relat[óo]rio de atividades|vestibular|"
+    r"aproveitamento de estudos|monitoria|valendo nota|\bn[ºo°]\.?\s*usp\b|"
+    r"\baulas? abertas|slides?\s*(das?\s*|de\s*)?aulas?", re.I)
+# words other languages share: count only beside a Portuguese signal
+_COURSE_AMBIG = re.compile(r"\bprovas?\b|\baulas?\s*\d|\bedital\b|\bdiploma\b|\bturma\b|trabalho final", re.I)
+# a university course code (USP style: FLF5045, SCX-5015, CRP 0420; not a year like CSL 2022)
+# next to course paperwork words
+_COURSE_CODE = re.compile(
+    r"\b[A-Z]{3}\s?-?(?!19|20)\d{4}\b.{0,60}\b(?i:exemplos|pptx|slides?|aulas?|lista|trabalho|provas?|programa|instru[çc][õo]es|"
+    r"question[aá]rio|resultado|indeferid|disciplinas?)\b|\b(?i:exemplos|slides?|aulas?|lista|trabalho|provas?|programa|"
+    r"instru[çc][õo]es|question[aá]rio|disciplinas?)\b.{0,80}\b[A-Z]{3}\s?-?(?!19|20)\d{4}\b")
+_COURSE_KEEP = re.compile(r"disserta[çc][ãa]o|\btese\b|monografia|sala de aula", re.I)
+
+
+def course_material(text: str) -> str:
+    """The course-material marker found in `text` (title, file name, first page), or ''."""
+    if not text or _COURSE_KEEP.search(text):
+        return ""
+    m = _COURSE_PT.search(text) or _COURSE_CODE.search(text)
+    if not m and _PT_SIGNAL.search(text):
+        m = _COURSE_AMBIG.search(text)
+    return m.group(0) if m else ""
+
 
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "")
@@ -189,7 +220,7 @@ def extract(path: str | Path, data: bytes | None = None) -> PdfFacts:
                 lines = [ln.strip() for ln in ocr_text.splitlines() if len(ln.strip()) > 3]
                 head = []
                 for ln in lines[:4]:
-                    if re.match(r"^(by|par|von|por)|abstract|summary|resumo", ln, re.I):
+                    if re.match(r"^(by|par|von|por)\b|abstract|summary|resumo", ln, re.I):
                         break
                     head.append(ln)
                     if len(" ".join(head)) > 60:
@@ -261,6 +292,9 @@ def relevance(f: PdfFacts) -> Tuple[bool, str]:
     m = _SKIP_WORDS.search(probe)
     if m and not (f.doi or f.arxiv):      # a paper ABOUT manuals keeps its DOI
         return False, "looks like: " + m.group(0)
+    cm = course_material(" ".join([Path(f.path).stem, f.meta_title, f.font_title, f.text[:600]]))
+    if cm and not (f.doi or f.arxiv or f.isbn):
+        return False, "course material: " + cm
     if f.error and not f.text:
         return False, "unreadable: " + f.error
     return True, ""
@@ -400,7 +434,7 @@ def clean_filename(stem: str) -> str:
     """A file name as a title: download-site tags, leading document numbers,
     copy counters and underscores/hyphens-for-spaces removed."""
     s = re.sub(r"\((?:z-?lib(?:\.org)?|libgen[^)]*|b-ok[^)]*|pdfdrive[^)]*|\d+)\)", " ", stem, flags=re.I)
-    s = re.sub(r"(z-?lib\.org|libgen(\.\w+)?|www\.\S+)", " ", s, flags=re.I)
+    s = re.sub(r"\b(z-?lib\.org|libgen(\.\w+)?|www\.\S+)\b", " ", s, flags=re.I)
     s = re.sub(r"^\d{6,}[-_ ]+", "", s)                  # "356062879-Livro-..." (Scribd ids)
     if s.count(" ") < 2 and (s.count("-") >= 3 or s.count("_") >= 3):
         s = re.sub(r"[-_]+", " ", s)
@@ -683,3 +717,44 @@ def process_file(path: str):
         return f, True, "", rec, via, ""
     except Exception as e:
         return None, False, "", None, "", f"{type(e).__name__}: {str(e)[:80]}"
+
+
+def archive_course_material(conn, write: bool = True) -> list:
+    """Move library entries that are course material (see course_material) out of refs.
+
+    Judged on title + PDF file name; entries with a DOI/ISBN/arXiv/PMID are published
+    works and stay. Rows go to refs_duplicates (archive_rule 'course-material'), their
+    tags to refs_removed_tags; PDF files are not touched. Returns [(id, marker, title)].
+    """
+    from .maintenance_dedup import _ensure_archive
+    hits = []
+    for rid, title, pl, pp in conn.execute(
+            "SELECT id, title, pdf_local, pdf_path FROM refs WHERE COALESCE(doi,'')='' AND COALESCE(isbn,'')='' "
+            "AND COALESCE(arxiv_id,'')='' AND COALESCE(pmid,'')=''"):
+        m = course_material(f"{title or ''} || {Path(pl or pp or '').stem}")
+        if m:
+            hits.append((rid, m, title or ""))
+    if not write or not hits:
+        return hits
+    cl = ", ".join(_ensure_archive(conn))
+    conn.execute("CREATE TABLE IF NOT EXISTS refs_removed_tags "
+                 "(ref_id TEXT, tag TEXT, removed_at TEXT DEFAULT (datetime('now')))")
+    has_log = conn.execute("SELECT 1 FROM sqlite_master WHERE name='pdf_ingest_log'").fetchone()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for rid, m, _t in hits:
+            conn.execute(f"INSERT INTO refs_duplicates ({cl}, duplicate_of, archived_at, archive_rule) "
+                         f"SELECT {cl}, NULL, datetime('now'), 'course-material' FROM refs WHERE id = ?", (rid,))
+            conn.execute("INSERT INTO refs_removed_tags (ref_id, tag) SELECT rt.ref_id, t.name FROM ref_tags rt "
+                         "JOIN tags t ON t.id = rt.tag_id WHERE rt.ref_id = ?", (rid,))
+            if has_log:      # the ingest remembers the file as skipped, so it is not re-added
+                conn.execute("UPDATE pdf_ingest_log SET action='skipped', ref_id='', detail=? WHERE ref_id = ?",
+                             ("course material: " + m, rid))
+            for sql in ("DELETE FROM ref_tags WHERE ref_id = ?", "DELETE FROM enrich_queue WHERE ref_id = ?",
+                        "DELETE FROM refs_fts WHERE ref_id = ?", "DELETE FROM refs WHERE id = ?"):
+                conn.execute(sql, (rid,))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return hits

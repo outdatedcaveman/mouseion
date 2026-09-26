@@ -118,6 +118,9 @@ def main() -> None:
             if n % 100 == 0:
                 print(f"  ... {n:,}/{len(todo):,} | {dict(stats)} | {n / (time.time() - t0):.2f}/s", flush=True)
     print(f"done: {dict(stats)} in {time.time() - t0:.0f}s", flush=True)
+    if WRITE:   # course material created before the filter existed, or by older runs
+        gone = PI.archive_course_material(conn, True)
+        print(f"course material archived: {len(gone)}", flush=True)
 
 
 if __name__ == "__main__":
