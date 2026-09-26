@@ -841,6 +841,113 @@ def list_tags():
         return jsonify({"error": str(e)}), 500
 
 
+
+# ---------------------------------------------------------------------------
+# PDF ingestion: one pipeline (mouseion.pdf_ingest) for dropped files, folders
+# and PDF web addresses -- identify, match the library, complete, link.
+# (The Add dialog posted dropped PDFs to /api/pdfs/ingest, which did not exist.)
+# ---------------------------------------------------------------------------
+from pathlib import Path
+from .db import RefDatabase
+
+_ingest_index = {"idx": None, "at": 0.0}
+
+
+def _library_index():
+    import time as _t
+    from . import pdf_ingest as PI
+    if _ingest_index["idx"] is None or _t.time() - _ingest_index["at"] > 600:
+        with RefDatabase() as db:
+            with db._db() as conn:
+                _ingest_index["idx"] = PI.LibraryIndex(conn)
+        _ingest_index["at"] = _t.time()
+    return _ingest_index["idx"]
+
+
+def _ingest_one(path: str, tag: str) -> dict:
+    from . import pdf_ingest as PI
+    db = RefDatabase()
+    res = PI.ingest(path, db, _library_index(), tag)
+    title = (res.ref.title if res.ref else "") or Path(path).name
+    return {"ok": res.action != "error", "action": res.action, "ref_id": res.ref_id, "via": res.via,
+            "ref_title": title, "detail": res.detail}
+
+
+@app.route("/api/pdfs/ingest", methods=["POST"])
+def ingest_pdf_upload():
+    """A dropped/uploaded PDF: saved into the PDF folder, then identified and linked."""
+    import re as _re
+    from .pdf_manager import get_pdf_dir
+    f = request.files.get("file")
+    if not f or not (f.filename or "").lower().endswith(".pdf"):
+        return jsonify({"ok": False, "error": "no PDF file"}), 400
+    name = _re.sub(r'[\\/:*?"<>|]+', "_", Path(f.filename).name)[:180]
+    dest = get_pdf_dir() / name
+    n = 1
+    while dest.exists():
+        dest = get_pdf_dir() / f"{Path(name).stem} ({n}).pdf"
+        n += 1
+    dest.write_bytes(f.read())
+    try:
+        out = _ingest_one(str(dest), "import:drop")
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+    if out["action"] == "skipped":
+        out["ok"] = False
+        out["error"] = "not added (" + out["detail"] + ")"
+    elif out["action"] == "exists":
+        out["ref_title"] += " (already in the library, with a PDF)"
+    return jsonify(out)
+
+
+@app.route("/api/pdfs/ingest-path", methods=["POST"])
+def ingest_pdf_path():
+    """A local PDF, a whole folder (recursively), or a PDF web address -- in the background."""
+    import tempfile
+    import os as _os
+    body = request.json or {}
+    target = (body.get("path") or body.get("url") or "").strip().strip('"')
+    if not target:
+        return jsonify({"error": "path or url required"}), 400
+    job_id = uuid.uuid4().hex[:10]
+    _update_job(job_id, status="running", message="Collecting PDFs…", count=0)
+
+    def _worker():
+        try:
+            from .pdf_manager import get_pdf_dir
+            paths = []
+            if target.lower().startswith(("http://", "https://")):
+                import httpx as _hx
+                r = _hx.get(target, follow_redirects=True, timeout=60)
+                if r.status_code != 200 or r.content[:4] != b"%PDF":
+                    _update_job(job_id, status="error", message=f"not a PDF (HTTP {r.status_code})")
+                    return
+                name = (Path(target.split("?")[0]).name or "download") .replace(".pdf", "") + ".pdf"
+                dest = get_pdf_dir() / name
+                dest.write_bytes(r.content)
+                paths = [str(dest)]
+            elif _os.path.isdir(target):
+                for dp, _dn, fn in _os.walk(target):
+                    paths += [_os.path.join(dp, x) for x in fn if x.lower().endswith(".pdf")]
+            elif _os.path.isfile(target):
+                paths = [target]
+            counts = {}
+            for i, p in enumerate(paths, 1):
+                try:
+                    a = _ingest_one(p, "import:folder")["action"]
+                except Exception:
+                    a = "error"
+                counts[a] = counts.get(a, 0) + 1
+                _update_job(job_id, status="running", count=i,
+                            message=f"{i}/{len(paths)} PDFs: " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+            _update_job(job_id, status="done", count=len(paths),
+                        message=f"{len(paths)} PDFs: " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+        except Exception as e:
+            _update_job(job_id, status="error", message=f"{type(e).__name__}: {e}")
+
+    threading.Thread(target=_worker, daemon=True, name="pdf-ingest-path").start()
+    return jsonify({"job_id": job_id})
+
 @app.route("/api/import", methods=["POST"])
 def import_file():
     """
@@ -6186,7 +6293,7 @@ async function handleAddModalPdfUpload(files) {
     const formData = new FormData();
     formData.append('file', file);
     try {
-      const r = await fetch('/api/pdfs/ingest', { method: 'POST', body: formData });
+      const r = await fetch(apiBase() + '/api/pdfs/ingest', { method: 'POST', body: formData, headers: getCfg().key ? { 'X-API-Key': getCfg().key } : {} });
       const res = await r.json();
       if (res.ok) {
         successCount++;
@@ -7916,6 +8023,17 @@ function closeAdd() {
 async function submitAdd() {
   const text = $addTa.value.trim();
   if (!text) return;
+  // a local file/folder path or a PDF web address -> the PDF ingest pipeline
+  if (/^[a-zA-Z]:[\\/]|^\\\\/.test(text) || /^https?:\/\/\S+\.pdf(\?\S*)?$/i.test(text)) {
+    $addBtn.disabled = true;
+    $addSt.className = 'modal-status s-run';
+    $addSt.innerHTML = '<span class="spin"></span>Reading PDFs…';
+    const isUrl = /^https?:/i.test(text);
+    const r = await apiFetch('/api/pdfs/ingest-path', { method: 'POST', body: JSON.stringify(isUrl ? {url: text} : {path: text}) });
+    const { job_id } = await r.json();
+    addTimer = setInterval(() => pollJob(job_id), 1000);
+    return;
+  }
   $addBtn.disabled = true;
   $addSt.className = 'modal-status s-run';
   $addSt.innerHTML = '<span class="spin"></span>Looking up…';
