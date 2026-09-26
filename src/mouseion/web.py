@@ -5359,14 +5359,11 @@ function saveSettings() {
 }
 
 async function fetchAllPdfs() {
-  try {
-    const r = await apiFetch('/api/pdfs/fetch-all', { method: 'POST' });
-    const data = await r.json();
-    if (data.job_id) {
-      showToast('Finding PDFs in the background — progress is shown in the PDFs panel');
-      document.getElementById('btn-pdf-engine').click();   // open the panel with live counts
-    }
-  } catch(e) { alert('Error: ' + e.message); }
+  // One PDF engine, one panel: open the PDFs panel and start (or show) the run there.
+  const settings = document.getElementById('settings-modal');
+  if (settings) settings.classList.remove('open');
+  document.getElementById('btn-pdf-engine').click();
+  await startPdfEngine();
 }
 async function downloadRefPdf(refId) {
   const btn = document.getElementById('dl-pdf-' + refId);
