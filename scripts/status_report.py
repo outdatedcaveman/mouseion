@@ -7,7 +7,7 @@ which background jobs are alive. Each run stores a snapshot next to refs.db
 goes to status_report.txt (latest) and status_history.log there, so a reader
 that may not run programs (the 4-hourly phone update) only has to read a file.
 
-Usage: python scripts/status_report.py [--json]
+Usage: python scripts/status_report.py [--json] [--copy-to FILE] [--ntfy-config egon-config.json]
 """
 from __future__ import annotations
 
@@ -130,6 +130,47 @@ def report(now: dict, prev: dict) -> str:
     return "\n".join(L)
 
 
+def summary_line(now: dict, prev: dict) -> str:
+    """One phone-sized line: problems first, then the gauges and their change. Counts only."""
+    pct = 100 * now["complete"] / max(1, now["refs"])
+    ppct = 100 * now["with_pdf"] / max(1, now["refs"])
+    warn = []
+    if now.get("vpn") != "connected (USP)":
+        warn.append("VPN " + str(now.get("vpn")))
+    down = [k for k in ("Mouseion app", "egon_core") if not (now.get("jobs") or {}).get(k)]
+    if down:
+        warn.append("DOWN: " + ", ".join(down))
+    parts = [f"{pct:.2f}% complete", f"PDFs {ppct:.1f}%"]
+    if prev.get("refs"):
+        span = (datetime.fromisoformat(now["at"]) - datetime.fromisoformat(prev["at"])).total_seconds() / 3600
+        pp = 100 * prev["complete"] / max(1, prev["refs"])
+        ppp = 100 * prev["with_pdf"] / max(1, prev["refs"])
+        found = sum(d.get("found", 0) for d in (now.get("sources_all") or {}).values()) - \
+            sum(d.get("found", 0) for d in (prev.get("sources_all") or {}).values())
+        parts = [f"{pct:.2f}% complete ({pct - pp:+.2f})", f"PDFs {ppct:.1f}% ({ppct - ppp:+.1f})",
+                 f"+{fmt(max(0, found))} PDFs fetched in {span:.0f}h"]
+        tried = sum(d.get("tried", 0) for d in (now.get("sources_all") or {}).values()) - \
+            sum(d.get("tried", 0) for d in (prev.get("sources_all") or {}).values())
+        if tried > 100 and found == 0:
+            warn.append(f"PDF fetcher 0 of {fmt(tried)}")
+    ing = now.get("ingest") or {}
+    if ing:
+        parts.append(f"ingest {sum(ing.values()) / 1000:.1f}k files")
+    return ("⚠ " + "; ".join(warn) + ". " if warn else "") + ", ".join(parts) + "."
+
+
+def push_ntfy(config_path: str, title: str, text: str) -> bool:
+    """Publish to the owner's secret ntfy topic (read from an Egon-style config: push.ntfy_topic)."""
+    try:
+        import httpx
+        topic = json.loads(Path(config_path).read_text(encoding="utf-8"))["push"]["ntfy_topic"]
+        r = httpx.post(f"https://ntfy.sh/{topic}", content=text.encode("utf-8"),
+                       headers={"Title": title, "Tags": "books"}, timeout=10)
+        return r.status_code < 400
+    except Exception:
+        return False
+
+
 def main() -> None:
     now = measure()
     try:
@@ -143,6 +184,8 @@ def main() -> None:
         h.write(text + "\n\n")
     if "--copy-to" in sys.argv:        # a second copy where the reader is allowed to look
         Path(sys.argv[sys.argv.index("--copy-to") + 1]).write_text(text + "\n", encoding="utf-8")
+    if "--ntfy-config" in sys.argv:     # phone push that works anywhere, never suppressed
+        push_ntfy(sys.argv[sys.argv.index("--ntfy-config") + 1], "Mouseion status", summary_line(now, prev))
     print(json.dumps({"report": text, "now": now}) if "--json" in sys.argv else text)
 
 
