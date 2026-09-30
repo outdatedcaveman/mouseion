@@ -56,6 +56,7 @@ def main() -> None:
     print(f"[ingest] {ROOT} | {len(todo):,} new/changed PDFs | {'WRITE' if WRITE else 'DRY-RUN'} | "
           f"workers={WORKERS}", flush=True)
     index = PI.LibraryIndex(conn)
+    vocab = PI.NameVocab(conn) if todo else None      # vets author lines read off page 1
     db = RefDatabase()
     stats: Counter = Counter()
     t0 = time.time()
@@ -101,10 +102,19 @@ def main() -> None:
                 res = PI.IngestResult(action, detail=why)
             else:
                 # matching and writing stay on this thread (one writer, one index)
-                ref = rec or PI.from_pdf_only(f)
-                hit = index.find(ref) or (index.find(PI.from_pdf_only(f)) if rec else None)
+                ref = rec or PI.from_pdf_only(f, vocab)
+                hit = index.find(ref) or (index.find(PI.from_pdf_only(f, vocab)) if rec else None)
+                filled = False
+                if hit and rec is not None:
+                    # the old entry may be the one with a garbled title and no author:
+                    # what this file resolved to fills its empty fields
+                    seed = db.get(hit[0])
+                    up = PI.fill_plan(seed, rec, f.pages) if seed is not None else {}
+                    if up and WRITE:
+                        filled = retry(PI.apply_fill, db, hit[0], up)
+                    stats["completed_existing"] += bool(up)
                 if hit and hit[1]:
-                    res = PI.IngestResult("exists", hit[0], "library already has a PDF", via)
+                    res = PI.IngestResult("exists", hit[0], "library already has a PDF" + (", completed" if filled else ""), via)
                 elif hit:
                     if WRITE:
                         retry(db.update_integration_ids, hit[0], pdf_local=p, pdf_path=Path(p).name)

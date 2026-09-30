@@ -25,6 +25,7 @@ The enrichment routines then complete whatever is still missing.
 from __future__ import annotations
 
 import difflib
+from collections import Counter
 import json
 import logging
 import re
@@ -45,6 +46,8 @@ ARXIV_FILE_RE = re.compile(r"^((?:0[7-9]|1\d|2\d)(?:0[1-9]|1[0-2])\.\d{4,5})(?:v
 ISBN_RE = re.compile(r"ISBN(?:-1[03])?[:\s]*((?:97[89][-\s]?)?\d{1,5}[-\s]?\d{1,7}[-\s]?\d{1,7}[-\s]?[\dX])\b", re.I)
 FILE_DOI_RE = re.compile(r"(10\.\d{4,9})[_/]([^\s]+)$")      # "10.1007_s00220-019-03608-z"
 PII_RE = re.compile(r"(?:^|[-_])(S?)(\d{4})(\d{3}[\dX])(\d{2})(\d{5})(\d)(?:[-_]|$)", re.I)   # Elsevier 1-s2.0-<PII>-main
+# AMS journals print their PII on page 1 ("S 0002-9939(00)05766-X"); the DOI is 10.1090/<PII>
+AMS_PII_RE = re.compile(r"\bS\s?(\d{4}-\d{3}[\dX])\s?\((\d{2})\)\s?(\d{5})-?([\dX])\b")
 YEAR_RE = re.compile(r"(?<!\d)(1[6-9]\d\d|20[0-4]\d)(?!\d)")
 
 _HEADER = re.compile(r"^(arxiv|doi|http|www\.|vol\.?|pp\.|page|issn|isbn|copyright|©|journal of|proceedings|"
@@ -246,6 +249,11 @@ def extract(path: str | Path, data: bytes | None = None) -> PdfFacts:
         if m:        # Elsevier PII -> DOI: S0168007200000580 -> 10.1016/S0168-0072(00)00058-0
             s_, a, b, yy, item, chk = m.groups()
             f.doi = f"10.1016/{s_.upper()}{a}-{b}({yy}){item}-{chk}".lower()
+    if not f.doi:
+        m = AMS_PII_RE.search(f.text[:3000])
+        if m:
+            issn, yy, num, chk = m.groups()
+            f.doi = f"10.1090/s{issn}-{yy}-{num}-{chk}".lower()
     m = ISBN_RE.search(f.text)
     if m:
         f.isbn = re.sub(r"[^\dX]", "", m.group(1).upper())
@@ -611,7 +619,137 @@ def _title_ok(f: PdfFacts, rec: Reference) -> bool:
     return not words or sum(w in page for w in words) >= max(2, int(0.6 * len(words)))
 
 
-def from_pdf_only(f: PdfFacts) -> Reference:
+_NAME_PARTICLES = {"van", "von", "de", "da", "del", "della", "der", "di", "du", "le", "la", "dos", "das",
+                   "ten", "ter", "bin", "al"}
+_NOT_NAME = re.compile(
+    r"(abstract|introduction|contents|universit|department|dept\b|institut|college|school|laborator|centre|"
+    r"center|faculty|facult|@|https?:|www\.|journal|proceedings|volume|vol\.|pages?\b|press|communicated|"
+    r"received|accepted|published|copyright|©|keywords|\bdoi\b|issn|isbn|\d|chapter|edited|editor|"
+    r"theorem|lemma|section|figure|table|preface|foreword|series|library|society|company|inc\b|ltd\b)", re.I)
+_INITIALS = re.compile(r"^[A-Z]\.(?:-?[A-Z]\.)*$")
+
+
+def _name_token(t: str) -> bool:
+    """An initial ('A.', 'J.-P.') or a capitalised word of letters (any script), hyphens, apostrophes."""
+    if _INITIALS.match(t):
+        return True
+    core = t.replace("-", "").replace("'", "").replace("’", "")
+    return len(core) >= 2 and core.isalpha() and t[0].isupper()
+
+
+def _name_case(tok: str) -> str:
+    if len(tok) > 2 and tok.isupper():
+        if tok.startswith("MC") and len(tok) > 3:
+            return "Mc" + tok[2:].capitalize()
+        return "-".join(x.capitalize() for x in tok.split("-"))
+    if re.fullmatch(r"Mc[A-Z]+", tok):
+        return "Mc" + tok[2:].capitalize()
+    return tok
+
+
+def _parse_names(line: str) -> List[Author]:
+    """'JIANHONG SHEN AND GILBERT STRANG' / 'Tak Wing Chan' / 'A. B. Smith, C. Jones and D. Roe'."""
+    line = re.sub(r"[∗*†‡§¶⋆]|\(\s*\)|\s+\d+(?=\s|,|$)", " ", line)
+    line = re.sub(r"^\s*(by|par|von|por|de)\s+", "", line, flags=re.I).strip(" ,;")
+    if not line or _NOT_NAME.search(line) or len(line) > 160:
+        return []
+    out = []
+    for part in re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+|\s+AND\s+|\s*&\s*|\s*;\s*|\s+e\s+|\s+y\s+|\s+und\s+", line):
+        toks = part.split()
+        if not toks:
+            continue
+        if not 2 <= len(toks) <= 5:
+            return []
+        if not all(_name_token(t) or t.lower() in _NAME_PARTICLES for t in toks):
+            return []
+        if toks[-1].lower() in _NAME_PARTICLES or _INITIALS.match(toks[-1]):
+            return []
+        # the family name is the last token (with any particles before it)
+        i = len(toks) - 1
+        while i - 1 >= 1 and toks[i - 1].lower() in _NAME_PARTICLES:
+            i -= 1
+        out.append(Author(family=" ".join(_name_case(t) for t in toks[i:]),
+                          given=" ".join(_name_case(t) for t in toks[:i])))
+    return out if 1 <= len(out) <= 10 else []
+
+
+def authors_from_page(f: PdfFacts) -> List[Author]:
+    """Authors printed next to the title on page 1 -- read, never guessed: every name
+    returned is a line of the page. Lines that repeat the title's words (a title's
+    second line: 'PARTICLE PHYSICS') are not names."""
+    lines = [ln.strip() for ln in (f.text or "").splitlines() if ln.strip()][:60]
+    if not lines:
+        return []
+    title_words = {w for w in _norm(f.title).split() if len(w) > 2}
+    hits = [i for i, ln in enumerate(lines)
+            if title_words and len(set(_norm(ln).split()) & title_words) >= max(1, len(_norm(ln).split()) // 2)]
+    if hits:
+        lo, hi = max(0, hits[0] - 3), min(len(lines), hits[-1] + 6)
+    else:
+        lo, hi = 0, min(len(lines), 10)
+    after = range(hits[-1] + 1, hi) if hits else range(lo, hi)
+    before = range(hits[0] - 1, lo - 1, -1) if hits else range(0)
+    for scan in (after, before):              # below the title first, then above it
+        for i in scan:
+            ln = lines[i]
+            if re.match(r"^(abstract|introduction|summary|resumo|r[ée]sum[ée]|zusammenfassung)\b", ln, re.I):
+                break
+            toks = set(_norm(ln).split())
+            if toks and title_words and len(toks & title_words) * 2 >= len(toks):
+                continue
+            names = _parse_names(ln)
+            if names:
+                return names
+    return []
+
+
+class NameVocab:
+    """Is a name-shaped line really a name? The library's own abstracts answer: an
+    ordinary word is written in lower case mid-sentence ('artificial intelligence',
+    'differential forms'), a surname is not ('Hume', 'Gödel'). A candidate whose
+    surname is mostly written in lower case in the abstracts is a phrase, not a
+    person. Precision first: a few real surnames that are also common words
+    ('Field', 'Young') are refused too -- they wait for a record instead."""
+
+    _WORD = re.compile(r"[^\W\d_][^\W\d_'’\-]*")
+
+    def __init__(self, conn, min_count: int = 5) -> None:
+        lower: Counter = Counter()
+        upper: Counter = Counter()
+        for (text,) in conn.execute("SELECT abstract FROM refs WHERE COALESCE(abstract,'') != ''"):
+            for sent in re.split(r"(?<=[.!?:;])\s+", text[:4000]):
+                for w in self._WORD.findall(sent)[1:]:          # the first word of a sentence says nothing
+                    k = _norm(w)
+                    if w[0].islower():
+                        lower[k] += 1
+                    elif not w.isupper():
+                        upper[k] += 1
+        self.common = {w for w, n in lower.items() if n >= min_count and n >= upper.get(w, 0)}
+
+    def ok(self, authors: List[Author]) -> bool:
+        for au in authors:
+            fam = [t for t in _norm(au.family).split() if len(t) > 1 and t not in _NAME_PARTICLES]
+            if not fam or any(t in self.common for t in fam):
+                return False
+        return True
+
+
+# reference-manager file names: "Gao_2022_Why_quantum...", "da_Costa_2006_Logic...", "Müller_1997_..."
+_FILENAME_AUTHOR = re.compile(r"^((?:(?:van|von|de|da|del|der|di|du|le|la|dos)_)?[A-ZÀ-Þ][A-Za-zÀ-ÿ'’\-]{1,40})_"
+                              r"(1[5-9]\d\d|20\d\d)_[A-Za-z]")
+
+
+def filename_author(stem: str) -> Optional[Author]:
+    m = _FILENAME_AUTHOR.match(stem)
+    if not m or m.group(1).lower() in ("unknown", "anon", "anonymous", "various"):
+        return None
+    return Author(family=m.group(1).replace("_", " "))
+
+
+LONG_PAGES = 60     # page 1 of a longer file is a cover, series page or an issue's first article
+
+
+def from_pdf_only(f: PdfFacts, vocab: "Optional[NameVocab]" = None) -> Reference:
     """What the file itself says, for works no index knows (the title-fixer retries later)."""
     ref = Reference(title=f.title[:500] or Path(f.path).stem)
     fn_title, fn_author = _split_title_author(Path(f.path).stem)
@@ -629,11 +767,59 @@ def from_pdf_only(f: PdfFacts) -> Reference:
             parts = name.split()
             if parts:
                 ref.authors.append(Author(family=parts[-1], given=" ".join(parts[:-1])))
+    if not ref.authors and f.pages < LONG_PAGES and not f.ocr:
+        names = authors_from_page(f)
+        if names and (vocab is None or vocab.ok(names)):
+            ref.authors = names
+    if not ref.authors:
+        fa = filename_author(Path(f.path).stem)
+        if fa:
+            ref.authors = [fa]
     ref.year = f.year_hint or _year_from_text(f.text)
     ref.doi, ref.arxiv_id, ref.isbn = f.doi or None, f.arxiv or None, f.isbn or None
     if f.pages >= 120:
         ref.ref_type = RefType.BOOK
     return ref
+
+
+def fill_plan(seed: Reference, rec: Reference, pages: int = 0) -> Dict[str, object]:
+    """update_ref_fields(**plan) for an existing entry whose own PDF resolved to `rec`.
+    Only empty fields are filled; the title is replaced when it differs (it came from
+    a file name or a garbled first line -- `rec` was verified against the page).
+    A book-length file never takes a chapter's record."""
+    if pages >= LONG_PAGES and "chapter" in str(rec.ref_type).lower():
+        return {}
+    from .db import _authors_json
+    up: Dict[str, object] = {}
+    if rec.title and (not seed.title or
+                      difflib.SequenceMatcher(None, _norm(seed.title), _norm(rec.title)).ratio() < 0.9):
+        up["title"] = rec.title[:500]
+    if rec.authors and not seed.authors:
+        up["authors_json"] = _authors_json(rec.authors)
+    for fld in ("year", "journal", "volume", "issue", "pages", "doi", "publisher", "isbn", "arxiv_id", "issn"):
+        val = getattr(rec, fld, None)
+        if val and not getattr(seed, fld, None):
+            up[fld] = val
+    return up
+
+
+def apply_fill(db, rid: str, up: Dict[str, object]) -> bool:
+    """Write a fill_plan; a DOI that already belongs to another entry is left out."""
+    import sqlite3
+    if not up:
+        return False
+    try:
+        db.update_ref_fields(rid, **up)
+    except sqlite3.IntegrityError:
+        up = {k: v for k, v in up.items() if k != "doi"}
+        if not up:
+            return False
+        db.update_ref_fields(rid, **up)
+    after = db.get(rid)
+    if after is not None:
+        with db._db() as conn:
+            conn.execute("UPDATE refs SET completeness=? WHERE id=?", (after.completeness, rid))
+    return True
 
 
 # ------------------------------------------------------------------ 4. match

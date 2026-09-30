@@ -72,3 +72,59 @@ def test_archive_course_material_is_recoverable(tmp_path):
     assert lista not in ids and {paper, published} <= ids
     assert c.execute("SELECT archive_rule FROM refs_duplicates WHERE id=?", (lista,)).fetchone() == ("course-material",)
     assert c.execute("SELECT tag FROM refs_removed_tags WHERE ref_id=?", (lista,)).fetchall() == [("archive:archives",)]
+
+
+def test_authors_from_page_reads_the_author_line():
+    F = PI.PdfFacts
+    cases = [
+        ("POTENTIAL USES OF REPRESENTATIONS OF SL(4, R) IN\nPARTICLE PHYSICS\nROBERT ARNOTT WILSON\nAbstract. I",
+         "POTENTIAL USES OF REPRESENTATIONS OF SL(4, R) IN PARTICLE PHYSICS", [("Robert Arnott", "Wilson")]),
+        ("ASYMPTOTIC\nANALYSIS\nOF DAUBECHIES\nPOLYNOMIALS\nJIANHONG SHEN AND GILBERT STRANG\n(Communicated by X)",
+         "ASYMPTOTIC ANALYSIS OF DAUBECHIES POLYNOMIALS", [("Jianhong", "Shen"), ("Gilbert", "Strang")]),
+        ("JAMES D. McCAWLEY\nNATURAL DEDUCTION AND ORDINARY\nLANGUAGE DISCOURSE STRUCTURE\nText",
+         "NATURAL DEDUCTION AND ORDINARY LANGUAGE DISCOURSE STRUCTURE", [("James D.", "McCawley")]),
+        ("GERT H. MULLER\nREFLECTION IN SET THEORY\nTHE BERNAYS-LEVY AXIOM SYSTEM\nIntroduction 1",
+         "REFLECTION IN SET THEORY THE BERNAYS-LEVY AXIOM SYSTEM", [("Gert H.", "Muller")]),
+        ("What is Logical in First-Order Logic?\nBoris Čulina\nDepartment of Mathematics",
+         "What is Logical in First-Order Logic?", [("Boris", "Čulina")]),
+        ("Agenda de Privatizacoes\nAvancos e Desafios\nBrasilia 2019", "Agenda de Privatizacoes", []),
+    ]
+    for text, title, want in cases:
+        got = [(a.given, a.family) for a in PI.authors_from_page(F(path="x.pdf", text=text, font_title=title))]
+        assert got == want, (title, got)
+
+
+def test_ams_pii_and_filename_author():
+    m = PI.AMS_PII_RE.search("Volume 129, Pages 1825-1831 S 0002-9939(00)05766-X Article")
+    assert m and m.groups() == ("0002-9939", "00", "05766", "X")
+    assert PI.filename_author("Gao_2022_Why_quantum").family == "Gao"
+    assert PI.filename_author("da_Costa_2006_Logic").family == "da Costa"
+    assert PI.filename_author("D_2008_Elliptic") is None
+    assert PI.filename_author("Unknown_2001_Something") is None
+
+
+def test_name_vocab_rejects_phrases(tmp_path):
+    import sqlite3
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE refs (authors TEXT, title TEXT, abstract TEXT)")
+    abstract = ("We study artificial intelligence and its forms. Following Hume, the argument of Hume "
+                "and of Gödel shows that intelligence takes many forms; intelligence, forms, and "
+                "epistemology recur in epistemology and in forms of intelligence.")
+    c.executemany("INSERT INTO refs VALUES (?,?,?)", [("[]", "t", abstract)] * 3)
+    v = PI.NameVocab(c, min_count=3)
+    from mouseion.models import Author
+    assert not v.ok([Author(family="Intelligence", given="Artificial")])
+    assert not v.ok([Author(family="Forms", given="Differential")])
+    assert v.ok([Author(family="Hume", given="David")])
+
+
+def test_fill_plan_fills_only_empty_fields():
+    from mouseion.models import Author, Reference, RefType
+    seed = Reference(title="M11p T x11 lp A I", year=2001)
+    rec = Reference(title="Bounded point evaluations for cyclic operators", year=1999, doi="10.1090/x",
+                    journal="Proc. AMS", authors=[Author(family="Bourhim", given="A.")])
+    up = PI.fill_plan(seed, rec, pages=10)
+    assert up["title"].startswith("Bounded") and up["doi"] == "10.1090/x" and "authors_json" in up
+    assert "year" not in up                    # a stored year is kept
+    chapter = Reference(title="Objective Lenses", ref_type=RefType.BOOK_CHAPTER, authors=[Author(family="Keller")])
+    assert PI.fill_plan(Reference(title="Handbook of Confocal Microscopy"), chapter, pages=900) == {}
