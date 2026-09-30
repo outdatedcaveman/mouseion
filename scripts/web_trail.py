@@ -101,7 +101,8 @@ def main() -> None:
     print(f"[web-trail] {len(ids):,} entries | {'WRITE' if WRITE else 'DRY-RUN'}", flush=True)
     known = PI.NameVocab(conn).common            # ordinary words, for re-joining split ligatures
     db = RefDatabase()
-    searcher = W.Searcher()
+    searcher = W.SearchPool.from_config(CFG, Path(CFG.db_path).expanduser().parent / "web_search_budget.json")
+    print(f"  search allowances left: {searcher.status()}", flush=True)
     client = httpx.Client(timeout=30, headers={"User-Agent": "mouseion/0.3 (library repair)"}, follow_redirects=True)
     cols = [d[0] for d in conn.execute("SELECT * FROM refs LIMIT 0").description]
     stats: Counter = Counter()
@@ -118,6 +119,9 @@ def main() -> None:
         try:
             trail = W.find_trail(entry, searcher, min_conf=0.7 if entry["surnames"] else 0.9)
             strikes = 0
+        except W.Exhausted as e:
+            print(f"  stopping: {e}; resumable, the next run continues here", flush=True)
+            break
         except W.Throttled as e:
             strikes += 1
             print(f"  search engine throttled ({e}); pausing 10 min [{strikes}/3]", flush=True)
@@ -162,7 +166,7 @@ def main() -> None:
                   flush=True)
         if n % 50 == 0:
             print(f"  ... {n:,}/{len(ids):,} | {dict(stats)} | {n / (time.time() - t0):.2f}/s", flush=True)
-    print(f"done: {dict(stats)} in {time.time() - t0:.0f}s", flush=True)
+    print(f"done: {dict(stats)} in {time.time() - t0:.0f}s | allowances left: {searcher.status()}", flush=True)
 
 
 if __name__ == "__main__":

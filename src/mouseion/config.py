@@ -71,6 +71,10 @@ class Config:
     elsevier_api_key: str = ""      # Elsevier TDM (dev.elsevier.com): full text to subscribers
     wiley_tdm_token: str = ""       # Wiley TDM client token: full text to subscribers
     google_books_api_key: str = ""  # Google Books API (console.cloud.google.com): lifts the keyless daily cap
+    serper_api_key: str = ""        # serper.dev: Google results, 2,500 free searches
+    tavily_api_key: str = ""        # tavily.com: web search, 1,000 free searches a month
+    brave_api_key: str = ""         # Brave Search API: independent index, ~1,000 free a month
+    gemini_search_api_key: str = "" # Gemini API key for Google-grounded search (billing on; 5,000 free searches a month)
 
     # --- LLM ---
     llm_api_key: str = ""
@@ -196,6 +200,10 @@ _TOML_MAP = {
         "elsevier_api_key": "elsevier_api_key",
         "wiley_tdm_token": "wiley_tdm_token",
         "google_books_api_key": "google_books_api_key",
+        "serper_api_key": "serper_api_key",
+        "tavily_api_key": "tavily_api_key",
+        "brave_api_key": "brave_api_key",
+        "gemini_search_api_key": "gemini_search_api_key",
     },
     "llm": {
         "api_key": "llm_api_key",
@@ -278,6 +286,10 @@ _ENV_MAP: Dict[str, str] = {
     "MOUSEION_ELSEVIER_API_KEY":           "elsevier_api_key",
     "MOUSEION_WILEY_TDM_TOKEN":            "wiley_tdm_token",
     "MOUSEION_GOOGLE_BOOKS_API_KEY":       "google_books_api_key",
+    "MOUSEION_SERPER_API_KEY":              "serper_api_key",
+    "MOUSEION_TAVILY_API_KEY":              "tavily_api_key",
+    "MOUSEION_BRAVE_API_KEY":               "brave_api_key",
+    "MOUSEION_GEMINI_SEARCH_API_KEY":       "gemini_search_api_key",
     "MOUSEION_LLM_API_KEY":                "llm_api_key",
     "MOUSEION_LLM_PROVIDER":               "llm_provider",
     "MOUSEION_NOTION_API_KEY":             "notion_api_key",
@@ -358,6 +370,10 @@ def _render_toml(cfg: Config) -> str:
         f'elsevier_api_key           = {_q(cfg.elsevier_api_key)}',
         f'wiley_tdm_token            = {_q(cfg.wiley_tdm_token)}',
         f'google_books_api_key       = {_q(cfg.google_books_api_key)}',
+        f'serper_api_key             = {_q(cfg.serper_api_key)}',
+        f'tavily_api_key             = {_q(cfg.tavily_api_key)}',
+        f'brave_api_key              = {_q(cfg.brave_api_key)}',
+        f'gemini_search_api_key      = {_q(cfg.gemini_search_api_key)}',
         "",
         "[llm]",
         f'api_key  = {_q(cfg.llm_api_key)}',

@@ -3067,6 +3067,10 @@ def get_settings_config():
             "elsevier_api_key": c.elsevier_api_key,
             "wiley_tdm_token": c.wiley_tdm_token,
             "google_books_api_key": c.google_books_api_key,
+            "serper_api_key": c.serper_api_key,
+            "tavily_api_key": c.tavily_api_key,
+            "brave_api_key": c.brave_api_key,
+            "gemini_search_api_key": c.gemini_search_api_key,
             "vpn_enabled": c.vpn_enabled,
             "vpn_type": c.vpn_type,
             "vpn_protocol": c.vpn_protocol,
@@ -3094,6 +3098,10 @@ def patch_settings_config():
         if "elsevier_api_key" in body: c.elsevier_api_key = body["elsevier_api_key"]
         if "wiley_tdm_token" in body: c.wiley_tdm_token = body["wiley_tdm_token"]
         if "google_books_api_key" in body: c.google_books_api_key = body["google_books_api_key"]
+        if "serper_api_key" in body: c.serper_api_key = body["serper_api_key"]
+        if "tavily_api_key" in body: c.tavily_api_key = body["tavily_api_key"]
+        if "brave_api_key" in body: c.brave_api_key = body["brave_api_key"]
+        if "gemini_search_api_key" in body: c.gemini_search_api_key = body["gemini_search_api_key"]
         if "vpn_enabled" in body: c.vpn_enabled = bool(body["vpn_enabled"])
         if "vpn_type" in body: c.vpn_type = body["vpn_type"]
         if "vpn_protocol" in body: c.vpn_protocol = body["vpn_protocol"]
@@ -4659,6 +4667,18 @@ kbd {
     <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Google Books API key <a href="https://console.cloud.google.com/apis/library/books.googleapis.com" target="_blank" rel="noopener" style="margin-left:6px">get a free key &#8599;</a></label>
     <input type="password" class="modal-ta" id="cfg-gbooks-key" placeholder="Book records and ISBNs; without a key Google cuts us off after a few hundred lookups a day"
            style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Serper API key (web search: Google results) <a href="https://serper.dev/api-key" target="_blank" rel="noopener" style="margin-left:6px">get a key &#8599;</a></label>
+    <input type="password" class="modal-ta" id="cfg-serper-api-key" placeholder="serper.dev: Google results, 2,500 free searches"
+           style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Tavily API key (web search) <a href="https://app.tavily.com/home" target="_blank" rel="noopener" style="margin-left:6px">get a key &#8599;</a></label>
+    <input type="password" class="modal-ta" id="cfg-tavily-api-key" placeholder="tavily.com: web search, 1,000 free searches a month"
+           style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Brave Search API key (web search) <a href="https://api-dashboard.search.brave.com/app/keys" target="_blank" rel="noopener" style="margin-left:6px">get a key &#8599;</a></label>
+    <input type="password" class="modal-ta" id="cfg-brave-api-key" placeholder="Brave Search API: independent index, ~1,000 free a month"
+           style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Gemini key for Google-grounded search <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" style="margin-left:6px">get a key &#8599;</a></label>
+    <input type="password" class="modal-ta" id="cfg-gemini-search-api-key" placeholder="Gemini API key for Google-grounded search (billing on; 5,000 free searches a month)"
+           style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
     <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">CrossRef / OpenAlex Email</label>
     <input type="email" class="modal-ta" id="cfg-cr-email" placeholder="Required for Polite Pool (faster limits)"
            style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:12px">
@@ -5326,6 +5346,10 @@ async function openSettings(msg) {
       document.getElementById('cfg-els-key').value = cd.elsevier_api_key || '';
       document.getElementById('cfg-wiley-token').value = cd.wiley_tdm_token || '';
       document.getElementById('cfg-gbooks-key').value = cd.google_books_api_key || '';
+      document.getElementById('cfg-serper-api-key').value = cd.serper_api_key || '';
+      document.getElementById('cfg-tavily-api-key').value = cd.tavily_api_key || '';
+      document.getElementById('cfg-brave-api-key').value = cd.brave_api_key || '';
+      document.getElementById('cfg-gemini-search-api-key').value = cd.gemini_search_api_key || '';
       document.getElementById('cfg-cr-email').value = cd.crossref_email || cd.openalex_email || '';
       
       // Load VPN configuration
@@ -5483,6 +5507,10 @@ function saveSettings() {
       elsevier_api_key: document.getElementById('cfg-els-key').value.trim(),
       wiley_tdm_token: document.getElementById('cfg-wiley-token').value.trim(),
       google_books_api_key: document.getElementById('cfg-gbooks-key').value.trim(),
+      serper_api_key: document.getElementById('cfg-serper-api-key').value.trim(),
+      tavily_api_key: document.getElementById('cfg-tavily-api-key').value.trim(),
+      brave_api_key: document.getElementById('cfg-brave-api-key').value.trim(),
+      gemini_search_api_key: document.getElementById('cfg-gemini-search-api-key').value.trim(),
       crossref_email: document.getElementById('cfg-cr-email').value.trim(),
       openalex_email: document.getElementById('cfg-cr-email').value.trim(),
       vpn_type: document.getElementById('cfg-vpn-type').value,

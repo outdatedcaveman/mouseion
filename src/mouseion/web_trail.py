@@ -179,6 +179,167 @@ class Searcher:
         return out
 
 
+# Search APIs the owner signed up for. Each has an allowance; the pool spends them
+# evenly and never past the free amount (usage kept in web_search_budget.json).
+class Exhausted(Exception):
+    pass
+
+
+class _Backend:
+    name = ""
+    limit = 0            # searches per period
+    period = "month"     # "month" | "lifetime"
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.client = httpx.Client(timeout=40, follow_redirects=True)
+
+    def _check(self, r: httpx.Response) -> None:
+        if r.status_code in (401, 402, 403) or (r.status_code == 429 and "quota" in r.text.lower()):
+            raise Exhausted(f"{self.name}: HTTP {r.status_code}")
+        if r.status_code == 429 or r.status_code >= 500:
+            raise Throttled(f"{self.name}: HTTP {r.status_code}")
+        r.raise_for_status()
+
+
+class Serper(_Backend):
+    name, limit, period = "serper", 2450, "lifetime"          # 2,500 free, once
+
+    def search(self, q: str) -> Tuple[List[Hit], int]:
+        r = self.client.post("https://google.serper.dev/search", headers={"X-API-KEY": self.key},
+                             json={"q": q, "num": 10})
+        self._check(r)
+        return [Hit(x.get("title", ""), x.get("link", ""), x.get("snippet", "")) for x in r.json().get("organic", [])], 1
+
+
+class Tavily(_Backend):
+    name, limit = "tavily", 980                                # 1,000 free credits a month
+
+    def search(self, q: str) -> Tuple[List[Hit], int]:
+        r = self.client.post("https://api.tavily.com/search", headers={"Authorization": f"Bearer {self.key}"},
+                             json={"query": q, "max_results": 10, "search_depth": "basic"})
+        self._check(r)
+        return [Hit(x.get("title", ""), x.get("url", ""), (x.get("content") or "")[:500])
+                for x in r.json().get("results", [])], 1
+
+
+class Brave(_Backend):
+    name, limit = "brave", 950                                 # $5 monthly credit = 1,000 searches
+
+    def search(self, q: str) -> Tuple[List[Hit], int]:
+        r = self.client.get("https://api.search.brave.com/res/v1/web/search", params={"q": q, "count": 10},
+                            headers={"X-Subscription-Token": self.key, "Accept": "application/json"})
+        self._check(r)
+        return [Hit(x.get("title", ""), x.get("url", ""), x.get("description", ""))
+                for x in (r.json().get("web") or {}).get("results", [])], 1
+
+
+class GeminiGoogle(_Backend):
+    """Gemini with Grounding with Google Search: Google's own results. The model's prose is
+    ignored -- only the pages Google returned (grounding chunks) are used, and each is
+    checked like any other hit. Billed per search the model runs: counted from
+    webSearchQueries, capped at the 5,000 free a month."""
+    name, limit = "gemini-google", 4900
+    MODEL = "gemini-3.5-flash-lite"
+
+    def search(self, q: str) -> Tuple[List[Hit], int]:
+        body = {"contents": [{"parts": [{"text": f"Search the web for this exact scholarly work and list the pages "
+                                                   f"about it: {q}"}]}],
+                "tools": [{"google_search": {}}]}
+        r = self.client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{self.MODEL}:generateContent",
+                             params={"key": self.key}, json=body)
+        self._check(r)
+        cand = (r.json().get("candidates") or [{}])[0]
+        gm = cand.get("groundingMetadata") or {}
+        used = max(1, len(gm.get("webSearchQueries") or []))
+        hits = []
+        for ch in (gm.get("groundingChunks") or [])[:10]:
+            w = ch.get("web") or {}
+            url = w.get("uri", "")
+            try:                          # grounding links are Google redirects: follow to the real page
+                h = self.client.get(url, follow_redirects=False, timeout=15)
+                url = h.headers.get("location", url)
+            except Exception:
+                pass
+            hits.append(Hit(w.get("title", ""), url, ""))
+        return hits, used
+
+
+class DuckDuckGo(_Backend):
+    name, limit = "duckduckgo", 10 ** 9
+
+    def __init__(self, key: str = "") -> None:
+        super().__init__(key)
+        self.s = Searcher(min_gap=8.0)
+
+    def search(self, q: str) -> Tuple[List[Hit], int]:
+        return self.s.search(q), 1
+
+
+class SearchPool:
+    """Spend every configured allowance evenly; a throttled engine rests an hour; when
+    every allowance is used up, Exhausted stops the run (resumable next period)."""
+
+    def __init__(self, backends: List[_Backend], budget_file) -> None:
+        from pathlib import Path as _P
+        self.backends = backends
+        self.file = _P(budget_file)
+        self.resting: Dict[str, float] = {}
+        try:
+            import json as _j
+            self.used = _j.loads(self.file.read_text(encoding="utf-8"))
+        except Exception:
+            self.used = {}
+
+    @classmethod
+    def from_config(cls, cfg, budget_file, use_ddg: bool = True) -> "SearchPool":
+        bs: List[_Backend] = []
+        for attr, klass in (("serper_api_key", Serper), ("gemini_search_api_key", GeminiGoogle),
+                            ("brave_api_key", Brave), ("tavily_api_key", Tavily)):
+            key = (getattr(cfg, attr, "") or "").strip()
+            if key:
+                bs.append(klass(key))
+        if use_ddg:
+            bs.append(DuckDuckGo())
+        return cls(bs, budget_file)
+
+    def _slot(self, b: _Backend) -> str:
+        return "lifetime" if b.period == "lifetime" else time.strftime("%Y-%m")
+
+    def remaining(self, b: _Backend) -> int:
+        return b.limit - self.used.get(b.name, {}).get(self._slot(b), 0)
+
+    def _spend(self, b: _Backend, n: int) -> None:
+        import json as _j
+        slot = self._slot(b)
+        self.used.setdefault(b.name, {})[slot] = self.used.get(b.name, {}).get(slot, 0) + n
+        try:
+            self.file.write_text(_j.dumps(self.used, indent=1), encoding="utf-8")
+        except Exception:
+            pass
+
+    def status(self) -> Dict[str, int]:
+        return {b.name: self.remaining(b) for b in self.backends if b.name != "duckduckgo"}
+
+    def search(self, q: str) -> List[Hit]:
+        now = time.time()
+        live = [b for b in self.backends if self.remaining(b) > 0 and self.resting.get(b.name, 0) < now]
+        if not live:
+            raise Exhausted("every search allowance is used up (or resting)")
+        paid = [b for b in live if b.name != "duckduckgo"]
+        b = max(paid, key=self.remaining) if paid else live[0]
+        try:
+            hits, n = b.search(q)
+        except Exhausted:
+            self.used.setdefault(b.name, {})[self._slot(b)] = b.limit
+            return self.search(q)
+        except Throttled:
+            self.resting[b.name] = now + 3600
+            return self.search(q)
+        self._spend(b, n)
+        return hits
+
+
 # ------------------------------------------------------------------ 3. is it the entry?
 def coverage(title: str, text: str) -> float:
     words = [w for w in norm(title).split() if len(w) > 3] or [w for w in norm(title).split() if len(w) > 1]
