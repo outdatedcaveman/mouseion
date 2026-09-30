@@ -73,8 +73,9 @@ def measure() -> dict:
         out = subprocess.run(["wmic", "process", "where", "name='pythonw.exe' or name='python.exe' or name='Mouseion.exe'",
                               "get", "commandline"], capture_output=True, text=True, timeout=30,
                              creationflags=0x08000000).stdout
-        jobs = {"Mouseion app": "Mouseion.exe" in out}
-        for name in ("resolve_lossy", "recover_isbn", "recover_ids_from_pdfs", "pdf_sweep", "ingest_folder", "egon_core"):
+        jobs = {"Mouseion app": "Mouseion.exe" in out or "-m mouseion" in out}      # exe, or the shortcut (pythonw -m mouseion)
+        for name in ("resolve_lossy", "recover_isbn", "recover_ids_from_pdfs", "pdf_sweep", "ingest_folder",
+                     "complete_from_pdfs", "judge_lossy", "web_trail", "google_books_pass", "egon_core"):
             jobs[name] = name in out
         m["jobs"] = jobs
     except Exception:
