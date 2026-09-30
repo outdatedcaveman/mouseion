@@ -95,3 +95,15 @@ def test_common_word_surname_needs_near_exact_title_and_brackets_are_read():
     blog = W.Hit("Einstein and Tagore: A Conversation About Truth That Still Matters", "https://x.medium.com/e", "home page")
     assert W.matches(e, blog) == 0.0
     assert W.understand("[Lecture Notes in Computer Science 1838] LNCS 1838")["volume"] == "1838"
+
+
+def test_near_identical_titles_and_short_generic_titles():
+    assert W.title_score("Epistemologia teoriei corzilor in gravitatia cuantica",
+                         "Euristica teoriei corzilor in gravitatia cuantica") < 0.85
+    e = {"title": "Analytic Philosophy", "surnames": ["Sosa"], "common_words": {"analytic", "philosophy"}}
+    assert W.matches(e, W.Hit("Analytic Philosophy", "http://philomatica.org/a.pdf", "Ernest Sosa")) == 0.0
+    ok = W.Hit("Ernest Sosa, Analytic Philosophy - PhilPapers", "https://philpapers.org/rec/SOSAP", "")
+    assert W.matches(e, ok) >= 0.85
+
+    rare = {"title": "Psi in science", "surnames": ["Alcock"], "common_words": {"science"}}
+    assert W.matches(rare, W.Hit("Psi in science.", "https://example.org/p", "James Alcock")) >= 0.85

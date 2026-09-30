@@ -115,6 +115,7 @@ NOISE = re.compile(r"(pinterest\.|facebook\.com|twitter\.com|x\.com/|instagram\.
 RANK = [  # higher is better
     (re.compile(r"doi\.org/"), 10), (re.compile(r"(jstor\.org|philpapers\.org|projecteuclid|ams\.org|springer|"
      r"cambridge\.org|oup\.com|academic\.oup|wiley\.com|tandfonline|sciencedirect|muse\.jhu|degruyter|"
+     r"plato\.stanford\.edu|iep\.utm\.edu|"
      r"journals\.|pdcnet\.org|persee\.fr|cairn\.info|erudit\.org|scielo)"), 9),
     (re.compile(r"(arxiv\.org|hal\.science|hal\.archives|ssrn\.com|zenodo|osf\.io|philarchive|core\.ac\.uk|"
                 r"semanticscholar|openalex|europepmc|ncbi\.nlm)"), 8),
@@ -449,6 +450,12 @@ def title_score(entry_title: str, hit_title: str) -> float:
         if not nc or GENERIC_PAGE.match(c):
             continue
         sim = difflib.SequenceMatcher(None, ne, nc).ratio()
+        # similar letters are not enough: nearly every significant word of the entry's title
+        # must be there ("Epistemologia teoriei corzilor..." is not "Euristica teoriei corzilor...")
+        words = [w for w in ne.split() if len(w) > 3] or ne.split()
+        have = set(nc.split())
+        if sim < 0.97 and sum(w in have for w in words) < max(len(words) - 0, 1) * 0.9:
+            sim = min(sim, 0.8)
         if len(ne.split()) >= 3 and len(ne) < len(nc) and ne in nc:       # stored title cut off
             sim = max(sim, 0.9 if len(ne) >= 0.5 * len(nc) else 0.8)
         if len(ne.split()) >= 3 and nc.startswith(ne):                    # stored title cut off at the end
@@ -480,7 +487,16 @@ def matches(entry: Dict, hit: Hit) -> float:
         if not entry.get("title"):
             return 0.0
     sc = title_score(entry.get("title") or "", hit.title)
-    return sc if sc >= (0.95 if weak else 0.85) else 0.0
+    if sc < (0.95 if weak else 0.85):
+        return 0.0
+    # a short title of everyday words ("Analytic Philosophy") names many works: only on a
+    # scholarly site, and with an author's surname in the page title itself
+    sig = [w for w in norm(entry.get("title") or "").split() if len(w) > 2]
+    if len(sig) <= 2 and all(w in entry.get("common_words", ()) for w in sig):
+        in_title = any(re.search(rf"\b{re.escape(x)}\b", norm(hit.title)) for x in surnames) if surnames else False
+        if rank(hit.url) < 7 or not in_title:
+            return 0.0
+    return sc
 
 
 # ------------------------------------------------------------------ 4. identifiers
