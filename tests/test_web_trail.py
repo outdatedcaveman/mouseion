@@ -88,3 +88,10 @@ def test_title_score_rejects_other_works():
 
 def test_title_score_accepts_a_cut_off_stored_title():
     assert W.title_score("Inhomogeneity of the p", "Inhomogeneity of the p-s-Degrees of Recursive Functions") >= 0.85
+
+
+def test_common_word_surname_needs_near_exact_title_and_brackets_are_read():
+    e = {"title": "Einstein and Tagore", "surnames": ["Home", "Robinson"], "common_words": {"home"}}
+    blog = W.Hit("Einstein and Tagore: A Conversation About Truth That Still Matters", "https://x.medium.com/e", "home page")
+    assert W.matches(e, blog) == 0.0
+    assert W.understand("[Lecture Notes in Computer Science 1838] LNCS 1838")["volume"] == "1838"

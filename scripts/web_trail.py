@@ -38,6 +38,7 @@ WRITE = len(args) > 1 and args[1] == "write"
 SHOW = int(sys.argv[sys.argv.index("--show") + 1]) if "--show" in sys.argv else (60 if not WRITE else 0)
 ALL = "--all" in sys.argv
 STAMP = date.today().strftime("%Y%m%d")
+COMMON: set = set()
 CFG = get_config()
 MAILTO = CFG.crossref_email or CFG.openalex_email or ""
 
@@ -115,7 +116,7 @@ def reverify(conn, db) -> None:
                 [a.family for a in seed.authors]
         except Exception:
             fams = [a.family for a in seed.authors]
-        entry = {**W.understand(orig_title), "surnames": [f for f in fams if f]}
+        entry = {**W.understand(orig_title), "surnames": [f for f in fams if f], "common_words": COMMON}
         hit = W.Hit(wt.get("title", ""), wt.get("url", ""), wt.get("snippet", ""))
         if W.matches(entry, hit) >= 0.7:
             kept += 1
@@ -145,6 +146,8 @@ def main() -> None:
         {pdf_clause} AND id NOT IN (SELECT ref_id FROM web_trail_scan)
         ORDER BY (authors IS NULL OR authors IN ('','[]')), RANDOM() LIMIT ?""", (LIMIT,))]
     if "--reverify" in sys.argv:
+        global COMMON
+        COMMON = PI.NameVocab(conn).common
         reverify(conn, RefDatabase())
         return
     print(f"[web-trail] {len(ids):,} entries | {'WRITE' if WRITE else 'DRY-RUN'}", flush=True)
@@ -164,7 +167,7 @@ def main() -> None:
             continue
         u = W.understand(seed.title or "", known)
         entry = {**u, "surnames": [a.family for a in seed.authors if a.family],
-                 "year": seed.year, "journal": seed.journal or ""}
+                 "year": seed.year, "journal": seed.journal or "", "common_words": known}
         try:
             trail = W.find_trail(entry, searcher, min_conf=0.7 if entry["surnames"] else 0.9)
             strikes = 0

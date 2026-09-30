@@ -84,6 +84,7 @@ def understand(title: str, known: Optional[set] = None) -> Dict[str, str]:
     t = LATEX.sub(" ", t)
     t = re.sub(r"<[^>]+>", " ", t)
     t = fix_ligatures(" ".join(t.split()), known)
+    t = re.sub(r"^\[([^\]]{4,80})\]\s*", r"\1 ", t).strip()        # "[Lecture Notes in ... 1838] LNCS 1838"
     out = {"title": t}
     m = SERIES_VOL.match(t)
     if m:
@@ -244,11 +245,10 @@ class GeminiGoogle(_Backend):
     USD_CAP = 0.90          # a month, from the prepaid credit (the owner's $1 cap); searches: 4,900 of 5,000 free
 
     def search(self, q: str) -> Tuple[List[Hit], int]:
-        body = {"contents": [{"parts": [{"text": f"Search the web for this exact scholarly work and list the pages "
-                                                   f"about it: {q}"}]}],
+        body = {"contents": [{"parts": [{"text": f"Find web pages about this scholarly work: {q}. "
+                                                   f"Search the web and name the sites."}]}],
                 "tools": [{"google_search": {}}],
-                # only the pages Google returns are used: no reasoning, a few words of answer
-                "generationConfig": {"maxOutputTokens": 64, "thinkingConfig": {"thinkingBudget": 0}}}
+                "generationConfig": {"thinkingConfig": {"thinkingLevel": "minimal"}, "maxOutputTokens": 256}}
         r = self.client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{self.MODEL}:generateContent",
                              params={"key": self.key}, json=body)
         self._check(r)
@@ -259,18 +259,45 @@ class GeminiGoogle(_Backend):
                           (um.get("candidatesTokenCount", 0) + um.get("thoughtsTokenCount", 0)) * 2.50) / 1e6
         cand = (data.get("candidates") or [{}])[0]
         gm = cand.get("groundingMetadata") or {}
-        used = max(1, len(gm.get("webSearchQueries") or []))
+        used = len(gm.get("webSearchQueries") or [])
         hits = []
-        for ch in (gm.get("groundingChunks") or [])[:10]:
-            w = ch.get("web") or {}
-            url = w.get("uri", "")
+        for ch in (gm.get("groundingChunks") or [])[:8]:
+            url = (ch.get("web") or {}).get("uri", "")
             try:                          # grounding links are Google redirects: follow to the real page
                 h = self.client.get(url, follow_redirects=False, timeout=15)
                 url = h.headers.get("location", url)
             except Exception:
-                pass
-            hits.append(Hit(w.get("title", ""), url, ""))
+                continue
+            title, desc = page_title(self.client, url)
+            if title:
+                hits.append(Hit(title, url, desc))
         return hits, used
+
+
+def page_title(client: httpx.Client, url: str) -> Tuple[str, str]:
+    """(title, description) of a page: citation_title / og:title / <title>."""
+    if not url.startswith("http") or SHADOW.search(url):
+        return "", ""
+    try:
+        r = client.get(url, headers=_UA, timeout=20, follow_redirects=True)
+        html = r.text[:200000] if "html" in r.headers.get("content-type", "") else ""
+    except Exception:
+        return "", ""
+    if not html:
+        return "", ""
+
+    def meta(name):
+        m = re.search(r'<meta[^>]+(?:name|property)=["\']' + re.escape(name) + r'["\'][^>]+content=["\']([^"\']+)', html, re.I) or \
+            re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:name|property)=["\']' + re.escape(name) + r'["\']', html, re.I)
+        return m.group(1).strip() if m else ""
+    import html as _h
+    t = meta("citation_title") or meta("dc.title") or meta("og:title")
+    if not t:
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        t = m.group(1).strip() if m else ""
+    authors = " ".join(re.findall(r'<meta[^>]+name=["\']citation_author["\'][^>]+content=["\']([^"\']+)', html, re.I)[:6])
+    desc = meta("description") or meta("og:description")
+    return _h.unescape(" ".join(t.split()))[:300], _h.unescape(f"{authors} {desc}".strip())[:500]
 
 
 class DuckDuckGo(_Backend):
@@ -340,21 +367,29 @@ class SearchPool:
     def status(self) -> Dict[str, int]:
         return {b.name: self.remaining(b) for b in self.backends if b.name != "duckduckgo"}
 
-    def search(self, q: str) -> List[Hit]:
+    LAST_RESORT = ("gemini-google",)       # costs a little prepaid credit: only when the others found nothing
+
+    def has(self, names) -> bool:
         now = time.time()
-        live = [b for b in self.backends if self.remaining(b) > 0 and self.resting.get(b.name, 0) < now]
+        return any(b.name in names and self.remaining(b) > 0 and self.resting.get(b.name, 0) < now
+                   for b in self.backends)
+
+    def search(self, q: str, only=None) -> List[Hit]:
+        now = time.time()
+        live = [b for b in self.backends if self.remaining(b) > 0 and self.resting.get(b.name, 0) < now
+                and (b.name in only if only else b.name not in self.LAST_RESORT)]
         if not live:
             raise Exhausted("every search allowance is used up (or resting)")
-        paid = [b for b in live if b.name != "duckduckgo"]
-        b = max(paid, key=self.remaining) if paid else live[0]
+        keyed = [b for b in live if b.name != "duckduckgo"]
+        b = max(keyed, key=lambda x: self.remaining(x) / max(1, x.limit)) if keyed else live[0]
         try:
             hits, n = b.search(q)
         except Exhausted:
             self.used.setdefault(b.name, {})[self._slot(b)] = b.limit
-            return self.search(q)
-        except Throttled:
+            return self.search(q, only)
+        except Exception:                  # throttled, network, or an unexpected answer: rest it an hour
             self.resting[b.name] = now + 3600
-            return self.search(q)
+            return self.search(q, only)
         self._spend(b, n)
         cost = getattr(b, "last_cost", 0.0) or 0.0
         if cost:
@@ -428,9 +463,13 @@ def matches(entry: Dict, hit: Hit) -> float:
         return 0.0
     text = f"{hit.title} {hit.snippet} {unquote(hit.url)}"
     surnames = [norm(s).split()[-1] for s in entry.get("surnames", []) if norm(s)]
-    author_ok = not surnames or any(re.search(rf"\b{re.escape(s)}\b", norm(text)) for s in surnames)
-    if not author_ok:
+    found = [s for s in surnames if re.search(rf"\b{re.escape(s)}\b", norm(f"{hit.title} {hit.snippet}"))]
+    if surnames and not found:
+        found = [s for s in surnames if re.search(rf"\b{re.escape(s)}\b", norm(unquote(hit.url)))]
+    if surnames and not found:
         return 0.0
+    # a surname that is also an ordinary word ('Home', 'Young') proves little: then the title must be near-exact
+    weak = bool(found) and all(s in entry.get("common_words", ()) for s in found)
     if entry.get("series") and entry.get("volume"):
         ser_ok = coverage(entry["series"], text) >= 0.75
         vol_ok = re.search(rf"(?<!\d){entry['volume']}(?!\d)", text) is not None
@@ -439,7 +478,7 @@ def matches(entry: Dict, hit: Hit) -> float:
         if not entry.get("title"):
             return 0.0
     sc = title_score(entry.get("title") or "", hit.title)
-    return sc if sc >= 0.85 else 0.0
+    return sc if sc >= (0.95 if weak else 0.85) else 0.0
 
 
 # ------------------------------------------------------------------ 4. identifiers
@@ -509,6 +548,17 @@ def find_trail(entry: Dict, searcher: Searcher, min_conf: float = 0.7) -> Trail:
                 best = (conf, rank(h.url), h, q)
         if best is not None and (best[1] >= 7 or ids):
             break                     # a scholarly page or an identifier: no second query needed
+    if best is None and hasattr(searcher, "has") and searcher.has(SearchPool.LAST_RESORT):
+        q = queries(entry)[-1]
+        try:
+            for h in searcher.search(q, only=SearchPool.LAST_RESORT)[:8]:
+                conf = matches(entry, h)
+                if conf >= min_conf and (best is None or (conf, rank(h.url)) > (best[0], best[1])):
+                    best = (conf, rank(h.url), h, q + " [gemini]")
+                    for k, v in identifiers(h).items():
+                        ids.setdefault(k, v)
+        except Exhausted:
+            pass
     if best is None:
         return Trail("none")
     conf, rk, h, q = best
