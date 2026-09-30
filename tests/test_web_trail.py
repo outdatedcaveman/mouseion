@@ -59,11 +59,32 @@ def test_pool_skips_exhausted_and_throttled(tmp_path):
     assert pool.remaining(dead) == 0 and "slow" in pool.resting
 
 
-def test_pool_never_uses_metered_services_by_default(tmp_path):
+def test_pool_metered_services_only_within_free_limits(tmp_path):
     class Cfg:
         serper_api_key = "s"
         tavily_api_key = "t"
         brave_api_key = "b"
         gemini_search_api_key = "g"
-    names = [b.name for b in W.SearchPool.from_config(Cfg(), tmp_path / "b.json").backends]
-    assert names == ["serper", "tavily", "duckduckgo"]       # no brave, no gemini: they can bill
+    pool = W.SearchPool.from_config(Cfg(), tmp_path / "b.json")
+    lim = {b.name: b.limit for b in pool.backends}
+    assert lim["brave"] <= 950 and lim["gemini-google"] < 5000 and lim["serper"] < 2500 and lim["tavily"] < 1000
+    g = [b for b in pool.backends if b.name == "gemini-google"][0]
+    pool.used["gemini-google-usd"] = {pool._slot(g): 0.95}
+    assert pool.remaining(g) == 0                       # dollar cap reached: no more Gemini this month
+    names = [b.name for b in W.SearchPool.from_config(Cfg(), tmp_path / "c.json", allow_metered=False).backends]
+    assert names == ["serper", "tavily", "duckduckgo"]
+
+
+def test_title_score_rejects_other_works():
+    assert W.title_score("Laws in the Special Sciences: A Comparative Study",
+                         "Sober and Elgin on laws of biology: A critique [Book Review]") < 0.85
+    assert W.title_score("Reply to Jacquette's adventures in the chinese room",
+                         "John R. Searle, Reply to Jacquette's adventures in the chinese room - PhilPapers") >= 0.85
+    assert W.title_score("and the Chemical Revolution", "Chemistry, Physics, and the Chemical Revolution | Isis") >= 0.8
+    assert W.title_score("Z. Zawirski's Conception of the Logic of Quantum Mechanics",
+                         "Roczniki Filozoficzne - Browse") < 0.85
+    assert W.title_score("Emeralds are no chameleons", "emeralds are no chameleons - why \"grue\" is not ...") >= 0.85
+
+
+def test_title_score_accepts_a_cut_off_stored_title():
+    assert W.title_score("Inhomogeneity of the p", "Inhomogeneity of the p-s-Degrees of Recursive Functions") >= 0.85

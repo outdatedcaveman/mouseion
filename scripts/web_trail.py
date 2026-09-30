@@ -9,7 +9,7 @@ evidence (page title, snippet, query) in extras.web_trail. Backups in
 web_trail_bak_<date>, resumable ledger web_trail_scan. A throttled search engine
 pauses the run (10 min, then stops after 3 in a row) -- never worked around.
 
-Usage: python scripts/web_trail.py <limit> <dry|write> [--show N] [--all]
+Usage: python scripts/web_trail.py <limit> <dry|write> [--show N] [--all] | --reverify
   --all  also entries that already have a PDF (they lack an author, not a trail)
 """
 from __future__ import annotations
@@ -87,6 +87,52 @@ def resolve_ids(ids: dict, entry: dict, trail: W.Trail, client: httpx.Client):
     return None, ""
 
 
+def reverify(conn, db) -> None:
+    """Re-check every trail already written against the current matching rules; a trail that
+    fails is undone from its backup row (all columns) and its entry searched again later."""
+    rows = conn.execute("SELECT ref_id, result FROM web_trail_scan WHERE result = 'url' OR result LIKE 'record%'").fetchall()
+    baks = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE name LIKE 'web_trail_bak_%'")]
+    kept = undone = 0
+    for rid, result in rows:
+        seed = db.get(rid)
+        if seed is None:
+            continue
+        ex = conn.execute("SELECT extras FROM refs WHERE id=?", (rid,)).fetchone()[0]
+        try:
+            ex = json.loads(ex or "{}")
+        except Exception:
+            ex = {}
+        wt = ex.get("web_trail") or {}
+        bak = None
+        for b in baks:
+            row = conn.execute(f"SELECT row_json FROM {b} WHERE ref_id=?", (rid,)).fetchone()
+            if row:
+                bak = json.loads(row[0])
+                break
+        orig_title = (bak or {}).get("title") or seed.title or ""
+        try:
+            fams = [a.get("family", "") for a in json.loads((bak or {}).get("authors") or "[]")] or \
+                [a.family for a in seed.authors]
+        except Exception:
+            fams = [a.family for a in seed.authors]
+        entry = {**W.understand(orig_title), "surnames": [f for f in fams if f]}
+        hit = W.Hit(wt.get("title", ""), wt.get("url", ""), wt.get("snippet", ""))
+        if W.matches(entry, hit) >= 0.7:
+            kept += 1
+            continue
+        undone += 1
+        print(f"  undo: {orig_title[:55]:55s} -> {wt.get('title','')[:55]}", flush=True)
+        if bak:
+            cols = [c for c in bak if c != "id"]
+            conn.execute(f"UPDATE refs SET {', '.join(c + '=?' for c in cols)} WHERE id=?",
+                         [bak[c] for c in cols] + [rid])
+        else:
+            ex.pop("web_trail", None)
+            conn.execute("UPDATE refs SET extras=? WHERE id=?", (json.dumps(ex, ensure_ascii=False), rid))
+        conn.execute("DELETE FROM web_trail_scan WHERE ref_id=?", (rid,))
+    print(f"reverify: {kept} kept, {undone} undone", flush=True)
+
+
 def main() -> None:
     conn = sqlite3.connect(str(Path(CFG.db_path).expanduser()), timeout=120, isolation_level=None)
     conn.execute("CREATE TABLE IF NOT EXISTS web_trail_scan (ref_id TEXT PRIMARY KEY, result TEXT, url TEXT, "
@@ -98,6 +144,9 @@ def main() -> None:
     ids = [r[0] for r in conn.execute(f"""SELECT id FROM refs WHERE NOT ({RefDatabase.COMPLETE_SQL}) AND {no_web_id}
         {pdf_clause} AND id NOT IN (SELECT ref_id FROM web_trail_scan)
         ORDER BY (authors IS NULL OR authors IN ('','[]')), RANDOM() LIMIT ?""", (LIMIT,))]
+    if "--reverify" in sys.argv:
+        reverify(conn, RefDatabase())
+        return
     print(f"[web-trail] {len(ids):,} entries | {'WRITE' if WRITE else 'DRY-RUN'}", flush=True)
     known = PI.NameVocab(conn).common            # ordinary words, for re-joining split ligatures
     db = RefDatabase()

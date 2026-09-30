@@ -224,7 +224,7 @@ class Tavily(_Backend):
 
 
 class Brave(_Backend):
-    name, limit = "brave", 950                                 # $5 monthly credit = 1,000 searches
+    name, limit = "brave", 900                                 # $5 monthly credit = 1,000 searches: stay under
 
     def search(self, q: str) -> Tuple[List[Hit], int]:
         r = self.client.get("https://api.search.brave.com/res/v1/web/search", params={"q": q, "count": 10},
@@ -241,15 +241,23 @@ class GeminiGoogle(_Backend):
     webSearchQueries, capped at the 5,000 free a month."""
     name, limit = "gemini-google", 4900
     MODEL = "gemini-3.5-flash-lite"
+    USD_CAP = 0.90          # a month, from the prepaid credit (the owner's $1 cap); searches: 4,900 of 5,000 free
 
     def search(self, q: str) -> Tuple[List[Hit], int]:
         body = {"contents": [{"parts": [{"text": f"Search the web for this exact scholarly work and list the pages "
                                                    f"about it: {q}"}]}],
-                "tools": [{"google_search": {}}]}
+                "tools": [{"google_search": {}}],
+                # only the pages Google returns are used: no reasoning, a few words of answer
+                "generationConfig": {"maxOutputTokens": 64, "thinkingConfig": {"thinkingBudget": 0}}}
         r = self.client.post(f"https://generativelanguage.googleapis.com/v1beta/models/{self.MODEL}:generateContent",
                              params={"key": self.key}, json=body)
         self._check(r)
-        cand = (r.json().get("candidates") or [{}])[0]
+        data = r.json()
+        um = data.get("usageMetadata") or {}
+        # model fees (the search itself is free up to 5,000 a month): $0.30/M in, $2.50/M out
+        self.last_cost = (um.get("promptTokenCount", 0) * 0.30 +
+                          (um.get("candidatesTokenCount", 0) + um.get("thoughtsTokenCount", 0)) * 2.50) / 1e6
+        cand = (data.get("candidates") or [{}])[0]
         gm = cand.get("groundingMetadata") or {}
         used = max(1, len(gm.get("webSearchQueries") or []))
         hits = []
@@ -291,16 +299,16 @@ class SearchPool:
         except Exception:
             self.used = {}
 
-    # OWNER'S RULE (2026-09-30): "not a single extra cent". Only services that CANNOT bill
-    # are used: Serper and Tavily free plans (no card on file -- past the allowance they
-    # refuse), DuckDuckGo. Brave's key is on a metered plan (no monthly cap: every search
-    # is billed past the $5 credit) and Gemini bills model tokens from the prepaid credit
-    # even when the search itself is free -- both stay OFF unless the owner says otherwise.
+    # OWNER'S RULE (2026-09-30): "not a single extra cent" -- "just stay within the free usage".
+    # Serper and Tavily: free plans, no card (past the allowance they refuse). Brave: metered
+    # plan with a $5 monthly credit -> 900 searches a month, under the credit. Gemini: search
+    # free to 5,000 a month -> 4,900; its small model fee comes from the PREPAID credit
+    # (auto-reload off: the card is never charged), metered from usageMetadata, $0.90 a month.
     FREE_ONLY = (("serper_api_key", Serper), ("tavily_api_key", Tavily))
     METERED = (("gemini_search_api_key", GeminiGoogle), ("brave_api_key", Brave))
 
     @classmethod
-    def from_config(cls, cfg, budget_file, use_ddg: bool = True, allow_metered: bool = False) -> "SearchPool":
+    def from_config(cls, cfg, budget_file, use_ddg: bool = True, allow_metered: bool = True) -> "SearchPool":
         bs: List[_Backend] = []
         for attr, klass in cls.FREE_ONLY + (cls.METERED if allow_metered else ()):
             key = (getattr(cfg, attr, "") or "").strip()
@@ -314,7 +322,11 @@ class SearchPool:
         return "lifetime" if b.period == "lifetime" else time.strftime("%Y-%m")
 
     def remaining(self, b: _Backend) -> int:
-        return b.limit - self.used.get(b.name, {}).get(self._slot(b), 0)
+        left = b.limit - self.used.get(b.name, {}).get(self._slot(b), 0)
+        cap = getattr(b, "USD_CAP", None)
+        if cap is not None and self.used.get(b.name + "-usd", {}).get(self._slot(b), 0.0) >= cap:
+            return 0
+        return left
 
     def _spend(self, b: _Backend, n: int) -> None:
         import json as _j
@@ -344,6 +356,16 @@ class SearchPool:
             self.resting[b.name] = now + 3600
             return self.search(q)
         self._spend(b, n)
+        cost = getattr(b, "last_cost", 0.0) or 0.0
+        if cost:
+            import json as _j
+            slot = self._slot(b)
+            d = self.used.setdefault(b.name + "-usd", {})
+            d[slot] = round(d.get(slot, 0.0) + cost, 6)
+            try:
+                self.file.write_text(_j.dumps(self.used, indent=1), encoding="utf-8")
+            except Exception:
+                pass
         return hits
 
 
@@ -355,6 +377,49 @@ def coverage(title: str, text: str) -> float:
     hay = norm(text)
     hay_words = set(hay.split())
     return sum(1 for w in words if w in hay_words) / len(words)
+
+
+GENERIC_PAGE = re.compile(r"^\s*(browse|search( results)?|home|index|category|tag|archives?|issue|volume|table of contents|"
+                          r"all issues|current issue|results for)\b", re.I)
+
+
+def _title_candidates(hit_title: str) -> List[str]:
+    """The work's title inside a result title: 'Logic Is Not Occultism - A. Kootte - PhilPapers',
+    'John R. Searle, Reply to Jacquette's ...', 'SCIENCE AS DISCOVERY | JSTOR'."""
+    t = re.sub(r"<[^>]+>", " ", hit_title or "")
+    t = re.sub(r"^\s*\((?:pdf|doc|html?)\)\s*", "", t, flags=re.I)
+    segs = [x.strip() for x in re.split(r"\s+[|–—]\s+|\s+-\s+|\s+::\s+", t) if x.strip()]
+    out = list(segs)
+    for x in segs:                      # "Firstname Lastname, Title" (PhilPapers) / "Title by Author"
+        m = re.match(r"^(?:[A-Z][\w.'’\-]*\s){1,4}[A-Z][\w'’\-]+,\s+(.{8,})$", x)
+        if m:
+            out.append(m.group(1))
+        m = re.match(r"^(.{8,}?)\s+by\s+[A-Z]", x)
+        if m:
+            out.append(m.group(1))
+    return out or [t]
+
+
+def title_score(entry_title: str, hit_title: str) -> float:
+    """How surely the result's title IS the entry's title (0..1)."""
+    ne = norm(entry_title)
+    if len(ne.split()) < 2:
+        return 0.0
+    best = 0.0
+    for c in _title_candidates(hit_title):
+        trunc = c.rstrip().endswith(("...", "…"))
+        nc = norm(c)
+        if not nc or GENERIC_PAGE.match(c):
+            continue
+        sim = difflib.SequenceMatcher(None, ne, nc).ratio()
+        if len(ne.split()) >= 3 and len(ne) < len(nc) and ne in nc:       # stored title cut off
+            sim = max(sim, 0.9 if len(ne) >= 0.5 * len(nc) else 0.8)
+        if len(ne.split()) >= 3 and nc.startswith(ne):                    # stored title cut off at the end
+            sim = max(sim, 0.9)
+        if trunc and len(nc.split()) >= 4 and ne.startswith(nc):           # the engine cut the result title
+            sim = max(sim, 0.9)
+        best = max(best, sim)
+    return best
 
 
 def matches(entry: Dict, hit: Hit) -> float:
@@ -369,18 +434,12 @@ def matches(entry: Dict, hit: Hit) -> float:
     if entry.get("series") and entry.get("volume"):
         ser_ok = coverage(entry["series"], text) >= 0.75
         vol_ok = re.search(rf"(?<!\d){entry['volume']}(?!\d)", text) is not None
-        if ser_ok and vol_ok:
+        if ser_ok and vol_ok and not GENERIC_PAGE.match(hit.title or ""):
             return 0.8 + (0.2 * coverage(entry["title"], text) if entry.get("title") else 0.0)
         if not entry.get("title"):
             return 0.0
-    t = entry.get("title") or ""
-    if len(norm(t).split()) < 2:
-        return 0.0
-    cov_title = coverage(t, f"{hit.title} {unquote(hit.url)}")
-    cov_all = coverage(t, text)
-    if cov_title >= 0.7 or (cov_all >= 0.85 and len(norm(t).split()) >= 3):
-        return max(cov_title, cov_all * 0.95)
-    return 0.0
+    sc = title_score(entry.get("title") or "", hit.title)
+    return sc if sc >= 0.85 else 0.0
 
 
 # ------------------------------------------------------------------ 4. identifiers
