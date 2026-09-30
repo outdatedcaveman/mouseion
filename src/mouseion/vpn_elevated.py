@@ -52,7 +52,11 @@ auth_failed = False                       # login rejected: no automatic retries
 # as administrator.
 # ---------------------------------------------------------------------------
 TASK = "MouseionVPN"
-RUNNER_VERSION = "7"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
+RUNNER_VERSION = "8"      # bump when _TASK_RUNNER changes: triggers the (one) re-setup
+# v8 (2026-09-30): scheduled tasks run at BELOW-NORMAL priority by default and every child
+# inherits it, so on a busy machine (Drive streaming PDFs, CPU ~90%) the adapter scripts ran
+# 9-14 s late, openconnect declared the peer dead and USP rejected the session. Now: task
+# above normal, openconnect HIGH, the configuration scripts HIGH.
 PROTECTED = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Mouseion" / "vpn"
 
 _TASK_RUNNER = r"""// Mouseion VPN runner v5 (JScript): run by the SYSTEM task, starts in a fraction of a
@@ -121,6 +125,8 @@ function ocPid() {
 var pid = 0;
 for (i = 0; i < 40 && !pid; i++) { WScript.Sleep(250); pid = ocPid(); }
 if (pid) {
+    try { GetObject("winmgmts:\\\\.\\root\\cimv2:Win32_Process.Handle='" + pid + "'").SetPriority(128); log("openconnect priority: high"); }
+    catch (e) { log("could not raise openconnect priority: " + e.message); }
     var f = fso.CreateTextFile(run + "\\tunnel.pid", true);
     f.Write(String(pid));
     f.Close();
@@ -172,7 +178,7 @@ try {
 } catch (e) {}
 log("start, mode=" + mode);
 var real = dir + "\\openconnect\\vpnc-script-win.js";
-var cmd = ws.ExpandEnvironmentStrings("%ComSpec%") + " /c cscript.exe //nologo /e:JScript \"" + real +
+var cmd = ws.ExpandEnvironmentStrings("%ComSpec%") + " /c start \"\" /b /high /wait cscript.exe //nologo /e:JScript \"" + real +
           "\" >> \"" + run + "\\script.log\" 2>&1";
 var background = (reason == "connect" || reason == "reconnect");
 if (!background || mode == "sync") {
@@ -231,10 +237,12 @@ class MouseionScriptLauncher
         string real = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cscript.exe");
         string args = "//nologo " + ArgsAfterExe(Environment.CommandLine);
         var sw = Stopwatch.StartNew();
+        try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High; } catch { }
         try
         {
             var psi = new ProcessStartInfo(real, args) { UseShellExecute = false, CreateNoWindow = true };
             Process p = Process.Start(psi);
+            try { p.PriorityClass = ProcessPriorityClass.High; } catch { }
             bool background = reason == "connect" || reason == "reconnect";
             string exit = "";
             if (!background && p.WaitForExit(9000)) exit = " exit " + p.ExitCode;
@@ -278,7 +286,7 @@ try {
   # SYSTEM: runs in session 0, so no window from openconnect, cscript or netsh can
   # ever reach the desktop (the per-user task flashed console windows, 2026-09-25)
   $pri = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-  $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 30) -MultipleInstances IgnoreNew
+  $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 30) -MultipleInstances IgnoreNew -Priority 2
   Register-ScheduledTask -TaskName 'MouseionVPN' -Action $act -Principal $pri -Settings $set -Force | Out-Null
   # let this (unelevated) user start and query the task -- nothing else
   $svc = New-Object -ComObject 'Schedule.Service'; $svc.Connect()
