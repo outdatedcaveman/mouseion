@@ -34,3 +34,12 @@ def test_save_keeps_a_backup(tmp_path, monkeypatch):
     (tmp_path / "config.toml").write_text('[providers]\nopenalex_email = "old"\n', encoding="utf-8")
     C._save(C.Config())
     assert "old" in (tmp_path / "config.toml.bak").read_text(encoding="utf-8")
+
+
+def test_google_books_key_is_sent_when_set(monkeypatch):
+    from mouseion.providers import google_books as G
+    cfg = C.Config()
+    monkeypatch.setattr(C, "get_config", lambda: cfg)
+    assert "key" not in G._with_key({"q": "isbn:1"})
+    cfg.google_books_api_key = "k123"
+    assert G._with_key({"q": "isbn:1"}) == {"q": "isbn:1", "key": "k123"}

@@ -3066,6 +3066,7 @@ def get_settings_config():
             "openalex_api_key": c.openalex_api_key,
             "elsevier_api_key": c.elsevier_api_key,
             "wiley_tdm_token": c.wiley_tdm_token,
+            "google_books_api_key": c.google_books_api_key,
             "vpn_enabled": c.vpn_enabled,
             "vpn_type": c.vpn_type,
             "vpn_protocol": c.vpn_protocol,
@@ -3092,6 +3093,7 @@ def patch_settings_config():
         if "openalex_api_key" in body: c.openalex_api_key = body["openalex_api_key"]
         if "elsevier_api_key" in body: c.elsevier_api_key = body["elsevier_api_key"]
         if "wiley_tdm_token" in body: c.wiley_tdm_token = body["wiley_tdm_token"]
+        if "google_books_api_key" in body: c.google_books_api_key = body["google_books_api_key"]
         if "vpn_enabled" in body: c.vpn_enabled = bool(body["vpn_enabled"])
         if "vpn_type" in body: c.vpn_type = body["vpn_type"]
         if "vpn_protocol" in body: c.vpn_protocol = body["vpn_protocol"]
@@ -4654,6 +4656,9 @@ kbd {
     <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Wiley TDM token <a href="https://onlinelibrary.wiley.com/library-info/resources/text-and-datamining" target="_blank" rel="noopener" style="margin-left:6px">get one &#8599;</a></label>
     <input type="password" class="modal-ta" id="cfg-wiley-token" placeholder="Full-text PDFs from Wiley over your institution's subscription"
            style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
+    <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">Google Books API key <a href="https://console.cloud.google.com/apis/library/books.googleapis.com" target="_blank" rel="noopener" style="margin-left:6px">get a free key &#8599;</a></label>
+    <input type="password" class="modal-ta" id="cfg-gbooks-key" placeholder="Book records and ISBNs; without a key Google cuts us off after a few hundred lookups a day"
+           style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:8px">
     <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px">CrossRef / OpenAlex Email</label>
     <input type="email" class="modal-ta" id="cfg-cr-email" placeholder="Required for Polite Pool (faster limits)"
            style="min-height:0;padding:8px 12px;resize:none;font-family:var(--mono);margin-bottom:12px">
@@ -5320,6 +5325,7 @@ async function openSettings(msg) {
       document.getElementById('cfg-oa-key').value = cd.openalex_api_key || '';
       document.getElementById('cfg-els-key').value = cd.elsevier_api_key || '';
       document.getElementById('cfg-wiley-token').value = cd.wiley_tdm_token || '';
+      document.getElementById('cfg-gbooks-key').value = cd.google_books_api_key || '';
       document.getElementById('cfg-cr-email').value = cd.crossref_email || cd.openalex_email || '';
       
       // Load VPN configuration
@@ -5476,6 +5482,7 @@ function saveSettings() {
       openalex_api_key: document.getElementById('cfg-oa-key').value.trim(),
       elsevier_api_key: document.getElementById('cfg-els-key').value.trim(),
       wiley_tdm_token: document.getElementById('cfg-wiley-token').value.trim(),
+      google_books_api_key: document.getElementById('cfg-gbooks-key').value.trim(),
       crossref_email: document.getElementById('cfg-cr-email').value.trim(),
       openalex_email: document.getElementById('cfg-cr-email').value.trim(),
       vpn_type: document.getElementById('cfg-vpn-type').value,

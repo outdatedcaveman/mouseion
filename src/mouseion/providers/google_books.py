@@ -22,6 +22,16 @@ from .base import BaseProvider
 _BASE = "https://www.googleapis.com/books/v1/volumes"
 
 
+def _with_key(params: dict) -> dict:
+    """Keyless calls share a small per-IP daily cap (HTTP 429 by midday); a free key lifts it."""
+    try:
+        from ..config import get_config
+        key = get_config().google_books_api_key
+    except Exception:
+        key = ""
+    return {**params, "key": key} if key else params
+
+
 class GoogleBooksProvider(BaseProvider):
     name = "google_books"
     priority = 8          # Supplementary for book metadata
@@ -115,7 +125,7 @@ class GoogleBooksProvider(BaseProvider):
     async def lookup_by_isbn(
         self, isbn: str, client: httpx.AsyncClient
     ) -> Optional[Reference]:
-        params = {"q": f"isbn:{isbn}"}
+        params = _with_key({"q": f"isbn:{isbn}"})
         resp = await self._get(client, _BASE, params=params)
         if resp is None:
             return None
@@ -146,7 +156,7 @@ class GoogleBooksProvider(BaseProvider):
         if authors:
             query += f'+inauthor:"{authors[0]}"'
 
-        params = {"q": query, "maxResults": "5", "printType": "books"}
+        params = _with_key({"q": query, "maxResults": "5", "printType": "books"})
 
         async def _do(c: httpx.AsyncClient) -> List[Reference]:
             resp = await self._get(c, _BASE, params=params)

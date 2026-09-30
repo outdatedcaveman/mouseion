@@ -70,6 +70,7 @@ class Config:
     openalex_api_key: str = ""
     elsevier_api_key: str = ""      # Elsevier TDM (dev.elsevier.com): full text to subscribers
     wiley_tdm_token: str = ""       # Wiley TDM client token: full text to subscribers
+    google_books_api_key: str = ""  # Google Books API (console.cloud.google.com): lifts the keyless daily cap
 
     # --- LLM ---
     llm_api_key: str = ""
@@ -194,6 +195,7 @@ _TOML_MAP = {
         "openalex_api_key": "openalex_api_key",
         "elsevier_api_key": "elsevier_api_key",
         "wiley_tdm_token": "wiley_tdm_token",
+        "google_books_api_key": "google_books_api_key",
     },
     "llm": {
         "api_key": "llm_api_key",
@@ -275,6 +277,7 @@ _ENV_MAP: Dict[str, str] = {
     "MOUSEION_OPENALEX_API_KEY":           "openalex_api_key",
     "MOUSEION_ELSEVIER_API_KEY":           "elsevier_api_key",
     "MOUSEION_WILEY_TDM_TOKEN":            "wiley_tdm_token",
+    "MOUSEION_GOOGLE_BOOKS_API_KEY":       "google_books_api_key",
     "MOUSEION_LLM_API_KEY":                "llm_api_key",
     "MOUSEION_LLM_PROVIDER":               "llm_provider",
     "MOUSEION_NOTION_API_KEY":             "notion_api_key",
@@ -354,6 +357,7 @@ def _render_toml(cfg: Config) -> str:
         f'openalex_api_key           = {_q(cfg.openalex_api_key)}',
         f'elsevier_api_key           = {_q(cfg.elsevier_api_key)}',
         f'wiley_tdm_token            = {_q(cfg.wiley_tdm_token)}',
+        f'google_books_api_key       = {_q(cfg.google_books_api_key)}',
         "",
         "[llm]",
         f'api_key  = {_q(cfg.llm_api_key)}',
