@@ -57,3 +57,13 @@ def test_pool_skips_exhausted_and_throttled(tmp_path):
     pool = W.SearchPool([dead, slow, ok], tmp_path / "budget.json")
     assert pool.search("q")[0].url == "u"
     assert pool.remaining(dead) == 0 and "slow" in pool.resting
+
+
+def test_pool_never_uses_metered_services_by_default(tmp_path):
+    class Cfg:
+        serper_api_key = "s"
+        tavily_api_key = "t"
+        brave_api_key = "b"
+        gemini_search_api_key = "g"
+    names = [b.name for b in W.SearchPool.from_config(Cfg(), tmp_path / "b.json").backends]
+    assert names == ["serper", "tavily", "duckduckgo"]       # no brave, no gemini: they can bill

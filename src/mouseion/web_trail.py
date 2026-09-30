@@ -291,11 +291,18 @@ class SearchPool:
         except Exception:
             self.used = {}
 
+    # OWNER'S RULE (2026-09-30): "not a single extra cent". Only services that CANNOT bill
+    # are used: Serper and Tavily free plans (no card on file -- past the allowance they
+    # refuse), DuckDuckGo. Brave's key is on a metered plan (no monthly cap: every search
+    # is billed past the $5 credit) and Gemini bills model tokens from the prepaid credit
+    # even when the search itself is free -- both stay OFF unless the owner says otherwise.
+    FREE_ONLY = (("serper_api_key", Serper), ("tavily_api_key", Tavily))
+    METERED = (("gemini_search_api_key", GeminiGoogle), ("brave_api_key", Brave))
+
     @classmethod
-    def from_config(cls, cfg, budget_file, use_ddg: bool = True) -> "SearchPool":
+    def from_config(cls, cfg, budget_file, use_ddg: bool = True, allow_metered: bool = False) -> "SearchPool":
         bs: List[_Backend] = []
-        for attr, klass in (("serper_api_key", Serper), ("gemini_search_api_key", GeminiGoogle),
-                            ("brave_api_key", Brave), ("tavily_api_key", Tavily)):
+        for attr, klass in cls.FREE_ONLY + (cls.METERED if allow_metered else ()):
             key = (getattr(cfg, attr, "") or "").strip()
             if key:
                 bs.append(klass(key))
