@@ -225,7 +225,9 @@ class Tavily(_Backend):
 
 
 class Brave(_Backend):
-    name, limit = "brave", 900                                 # $5 monthly credit = 1,000 searches: stay under
+    # $5 monthly credit = 1,000 searches. Brave's billing month need not start on the 1st: half per
+    # calendar month keeps ANY 30-day window under the credit (owner: not a single extra cent)
+    name, limit = "brave", 450
 
     def search(self, q: str) -> Tuple[List[Hit], int]:
         r = self.client.get("https://api.search.brave.com/res/v1/web/search", params={"q": q, "count": 10},
@@ -240,9 +242,9 @@ class GeminiGoogle(_Backend):
     ignored -- only the pages Google returned (grounding chunks) are used, and each is
     checked like any other hit. Billed per search the model runs: counted from
     webSearchQueries, capped at the 5,000 free a month."""
-    name, limit = "gemini-google", 4900
+    name, limit = "gemini-google", 2400          # 5,000 free a month; half per calendar month (see Brave)
     MODEL = "gemini-3.5-flash-lite"
-    USD_CAP = 0.90          # a month, from the prepaid credit (the owner's $1 cap); searches: 4,900 of 5,000 free
+    USD_CAP = 0.45          # a calendar month of model fees from the prepaid credit (owner's $1 cap, halved)
 
     def search(self, q: str) -> Tuple[List[Hit], int]:
         body = {"contents": [{"parts": [{"text": f"Find web pages about this scholarly work: {q}. "
