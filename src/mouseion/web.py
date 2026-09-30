@@ -5330,6 +5330,8 @@ async function openSettings(msg) {
       document.getElementById('cfg-vpn-username').value = cd.vpn_username || '';
       document.getElementById('cfg-vpn-password').value = cd.vpn_password || '';
       updateVpnStatusBadge();
+      // one poller only: every Settings open used to add another, forever
+      if (window._vpnStatusInterval) clearInterval(window._vpnStatusInterval);
       window._vpnStatusInterval = setInterval(updateVpnStatusBadge, 3000);
     }
   } catch(e) {}
@@ -6845,6 +6847,26 @@ document.querySelectorAll('.eq-tier-btn').forEach(btn => {
 
 // Poll daemon status every 30s for the status dot
 setInterval(refreshDaemonStatus, 30000);
+
+// Memory guard (2026-09-29): after 3.5 days open, this window's renderer held 2.4 GB
+// on an 8 GB machine -- enough to starve everything else. The PDF engine, VPN and
+// jobs live in the server, so a quiet reload loses nothing: do it when the page has
+// grown or aged, and only after 15 min without input and with no dialog open.
+(function memoryGuard() {
+  const born = Date.now();
+  let lastInput = Date.now();
+  ['mousemove', 'keydown', 'wheel', 'pointerdown', 'touchstart'].forEach(ev =>
+    window.addEventListener(ev, () => { lastInput = Date.now(); }, { passive: true, capture: true }));
+  setInterval(() => {
+    const heap = (performance.memory && performance.memory.usedJSHeapSize) || 0;
+    const big = heap > 600 * 1024 * 1024;
+    const old = Date.now() - born > 12 * 3600 * 1000;
+    const idle = Date.now() - lastInput > 15 * 60 * 1000;
+    const busy = document.querySelector('.overlay.open') ||
+                 (document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName));
+    if ((big || old) && idle && !busy) location.reload();
+  }, 5 * 60 * 1000);
+})();
 setTimeout(refreshDaemonStatus, 2000); // initial check after app loads
 
 // ── Advanced filter panel ─────────────────────────────────────────────────────
