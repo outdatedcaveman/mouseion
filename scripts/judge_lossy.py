@@ -13,7 +13,7 @@ are known. Sample: 9/40 of the judge band accepted, 9/9 correct by hand.
 Writes only empty fields (mouseion.pdf_ingest.fill_plan), after a backup row
 (judge_bak_<date>); every entry is logged in lossy_judge (resumable).
 
-Usage: python scripts/judge_lossy.py <limit> <dry|write> [workers] [--band judge|no_record] [--show N]
+Usage: python scripts/judge_lossy.py <limit> <dry|write> [workers] [--band judge|no_record] [--reviews] [--show N]
 """
 from __future__ import annotations
 
@@ -121,11 +121,41 @@ def candidates(title: str, fams: list, journal: str) -> list:
     return out
 
 
+REVIEW = re.compile(r"^(?:review(?: of)?:?\s+)?(?P<book>.{6,}?)\s+by\s+(?P<author>[A-Z][\w.'’\- ]{2,60}?)"
+                    r"(?:\s*[;:(]|\s*$)")
+
+
+def judge_review(seed, title: str) -> tuple:
+    """'Kultur der Urzeit by Hoernes, Moritz' -- a book review, as JSTOR/Isis title them.
+    Crossref often lacks the reviewer, so the stored author can't be checked; instead the
+    found title must name the reviewed book AND its author, in the same year."""
+    m = REVIEW.match(title)
+    if not m or not seed.year:
+        return None, ""
+    book, bauthor = m.group("book"), norm(m.group("author").split(",")[0]).split()
+    if not bauthor:
+        return None, ""
+    for ht, hf, hy, doi, item in candidates(title, [a.family for a in seed.authors if a.family], seed.journal or ""):
+        nh = norm(ht)
+        if hy and int(hy) == int(seed.year) and title_match(book, ht) >= 0.85 and \
+                (bauthor[-1] in nh.split() or bauthor[0] in nh.split()):
+            rec = CrossRefProvider()._parse_work(item) if item is not None else PI._crossref_doi(client(), doi, MAILTO)
+            if rec is not None:
+                rec.doi = rec.doi or doi
+                rec.title = " ".join(re.sub(r"<[^>]+>", "", rec.title or "").split())
+                rec.authors = rec.authors or list(seed.authors)     # the reviewer stays
+                return rec, "review"
+    return None, ""
+
+
 def judge(seed) -> tuple:
     """-> (record or None, reason)"""
     fams = [a.family for a in seed.authors if a.family]
     want = {norm(f).split()[-1] for f in fams if norm(f)}
     title = clean_title(seed.title or "")
+    rec, why = judge_review(seed, title)
+    if rec is not None:
+        return rec, why
     if len(norm(title).split()) < 2 or not want:
         return None, "too_little"
     best = None
@@ -159,9 +189,14 @@ def main() -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS lossy_judge (ref_id TEXT PRIMARY KEY, result TEXT, doi TEXT, "
                  "scanned_at TEXT DEFAULT (datetime('now')))")
     conn.execute(f"CREATE TABLE IF NOT EXISTS judge_bak_{STAMP} (ref_id TEXT PRIMARY KEY, row_json TEXT)")
-    ids = [r[0] for r in conn.execute(f"""SELECT r.id FROM refs r JOIN lossy_scan2 l ON l.ref_id = r.id
-        WHERE l.result = ? AND NOT ({RefDatabase.COMPLETE_SQL}) AND COALESCE(r.doi,'') = ''
-        AND r.id NOT IN (SELECT ref_id FROM lossy_judge) ORDER BY RANDOM() LIMIT ?""", (BAND, LIMIT))]
+    if "--reviews" in sys.argv:      # 'Book by Author' titles the first judge pass turned down
+        ids = [r[0] for r in conn.execute(f"""SELECT r.id FROM refs r JOIN lossy_judge j ON j.ref_id = r.id
+            WHERE j.result != 'accept' AND r.title LIKE '% by %' AND NOT ({RefDatabase.COMPLETE_SQL})
+            AND COALESCE(r.doi,'') = '' LIMIT ?""", (LIMIT,))]
+    else:
+        ids = [r[0] for r in conn.execute(f"""SELECT r.id FROM refs r JOIN lossy_scan2 l ON l.ref_id = r.id
+            WHERE l.result = ? AND NOT ({RefDatabase.COMPLETE_SQL}) AND COALESCE(r.doi,'') = ''
+            AND r.id NOT IN (SELECT ref_id FROM lossy_judge) ORDER BY RANDOM() LIMIT ?""", (BAND, LIMIT))]
     print(f"[judge] band={BAND} | {len(ids):,} entries | {'WRITE' if WRITE else 'DRY-RUN'} | workers={WORKERS}",
           flush=True)
     db = RefDatabase()
