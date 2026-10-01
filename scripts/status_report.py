@@ -53,6 +53,16 @@ def measure() -> dict:
         m["ingest"] = dict(c.execute("SELECT action, COUNT(*) FROM pdf_ingest_log GROUP BY 1").fetchall())
     except sqlite3.Error:
         m["ingest"] = {}
+    # repair passes (2026-09-30 / 10-01): entries completed from their own PDF, junk-titled entries
+    # identified, web trails written
+    for key, sql in (("own_pdf", "SELECT result, COUNT(*) FROM own_pdf_scan GROUP BY 1"),
+                     ("identify", "SELECT result, COUNT(*) FROM identify_scan GROUP BY 1"),
+                     ("web_trail", "SELECT CASE WHEN result LIKE 'record%' THEN 'record' ELSE result END, COUNT(*) "
+                                   "FROM web_trail_scan GROUP BY 1")):
+        try:
+            m[key] = dict(c.execute(sql).fetchall())
+        except sqlite3.Error:
+            m[key] = {}
     c.close()
     try:
         m["sources_all"] = json.loads((DATA / "pdf_source_stats.json").read_text(encoding="utf-8"))
@@ -112,6 +122,14 @@ def report(now: dict, prev: dict) -> str:
         tot, ptot = sum(ing.values()), sum(ping.values())
         L.append(f"PDF archive ingest: {fmt(tot)} files processed (+{fmt(tot - ptot)}) | " + ", ".join(
             f"{k} {fmt(v)} (+{fmt(v - ping.get(k, 0))})" for k, v in sorted(ing.items(), key=lambda kv: -kv[1])))
+    def _d(key, k):
+        return (now.get(key) or {}).get(k, 0) - (prev.get(key) or {}).get(k, 0)
+    op, idf, wt = now.get("own_pdf") or {}, now.get("identify") or {}, now.get("web_trail") or {}
+    if op or idf or wt:
+        L.append(f"Repairs: from own PDF {fmt(op.get('record', 0) + op.get('page-authors', 0) + op.get('filename-authors', 0) + op.get('filename-meta-authors', 0))}"
+                 f" (+{fmt(_d('own_pdf', 'record') + _d('own_pdf', 'page-authors') + _d('own_pdf', 'filename-meta-authors'))})"
+                 f" | junk titles identified {fmt(idf.get('identified', 0))} (+{fmt(_d('identify', 'identified'))})"
+                 f" | web trails {fmt(wt.get('url', 0) + wt.get('record', 0))} (+{fmt(_d('web_trail', 'url') + _d('web_trail', 'record'))})")
     srcs = now.get("sources_all") or {}
     psrc = prev.get("sources_all") or {}
     rows = []
@@ -155,8 +173,14 @@ def summary_line(now: dict, prev: dict) -> str:
         if tried > 100 and found == 0:
             warn.append(f"PDF fetcher 0 of {fmt(tried)}")
     ing = now.get("ingest") or {}
-    if ing:
+    if ing and prev.get("ingest") and sum(ing.values()) != sum((prev.get("ingest") or {}).values()):
         parts.append(f"ingest {sum(ing.values()) / 1000:.1f}k files")
+    if prev.get("refs"):
+        fixed = sum((now.get(k) or {}).get(r, 0) - (prev.get(k) or {}).get(r, 0)
+                    for k, r in (("own_pdf", "record"), ("own_pdf", "page-authors"), ("own_pdf", "filename-meta-authors"),
+                                 ("identify", "identified"), ("web_trail", "url"), ("web_trail", "record")))
+        if fixed > 0:
+            parts.append(f"{fmt(fixed)} entries repaired")
     return ("⚠ " + "; ".join(warn) + ". " if warn else "") + ", ".join(parts) + "."
 
 
