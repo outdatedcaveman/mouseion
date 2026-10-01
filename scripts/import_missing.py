@@ -36,8 +36,8 @@ WRITE = len(sys.argv) > 3 and sys.argv[3] == "write"
 
 
 def norm(t) -> str:
-    t = unicodedata.normalize("NFKD", re.sub(r"<[^>]+>", " ", str(t or "")))
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", "".join(c for c in t if not unicodedata.combining(c)).lower()).split())
+    from mouseion.textnorm import fold      # every script's letters survive
+    return fold(re.sub(r"<[^>]+>", " ", str(t or "")))
 
 
 def main() -> None:

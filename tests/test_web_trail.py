@@ -107,3 +107,12 @@ def test_near_identical_titles_and_short_generic_titles():
 
     rare = {"title": "Psi in science", "surnames": ["Alcock"], "common_words": {"science"}}
     assert W.matches(rare, W.Hit("Psi in science.", "https://example.org/p", "James Alcock")) >= 0.85
+
+
+def test_normaliser_keeps_every_script():
+    from mouseion.textnorm import fold
+    from mouseion import pdf_ingest as PI
+    assert fold("Новая интерпретация релятивистской физики") == "новая интерпретация релятивистскои физики"
+    assert PI._norm("Ἀριστοτέλης: Περὶ ψυχῆς") and W.norm("中文 标题")
+    assert fold("Gödel’s Théorème — I") == "godel s theoreme i"
+    assert W.title_score("Человек и информационная среда", "Человек и информационная среда - КиберЛенинка") >= 0.85

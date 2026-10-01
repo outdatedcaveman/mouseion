@@ -66,8 +66,8 @@ def _compatible(seed: Reference, candidate: Reference) -> float:
         sa = _author_families(seed)
         ca = _author_families(candidate)
         if sa and ca and (sa & ca):
-            s_words = set(re.findall(r"[a-z0-9]{4,}", st))
-            c_words = set(re.findall(r"[a-z0-9]{4,}", ct))
+            s_words = set(re.findall(r"[^\W_]{4,}", st))      # every script, not only a-z
+            c_words = set(re.findall(r"[^\W_]{4,}", ct))
             if s_words and len(s_words & c_words) / max(1, len(s_words | c_words)) >= 0.72:
                 return 0.78
     return 0.0

@@ -64,9 +64,8 @@ LIGATURE = re.compile(r"\b(\w*(?:f|ff))\s+((?:i|l|fi|fl)[a-z]+)\b")
 
 
 def norm(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s or "")
-    s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", s).split())
+    from .textnorm import fold      # every script's letters survive
+    return fold(s)
 
 
 def fix_ligatures(s: str, known: Optional[set] = None) -> str:

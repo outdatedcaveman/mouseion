@@ -102,9 +102,8 @@ def course_material(text: str) -> str:
 
 
 def _norm(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s or "")
-    s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", s).split())
+    from .textnorm import fold      # every script's letters survive (a-z only made Cyrillic titles empty)
+    return fold(s)
 
 
 @dataclass

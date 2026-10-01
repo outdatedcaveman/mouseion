@@ -443,7 +443,7 @@ def _work(rid: str, skip_crossref: bool = False):
     info["src"] = best[2]
     # two-keyword titles ("Quantum information") are too generic to auto-accept
     # ...unless the whole title is identical ("O przedmiocie matematycznym": stopword-light languages)
-    fw = lambda t: re.sub(r"[^a-z0-9]+", " ", _fold(t or "")).split()          # noqa: E731
+    fw = lambda t: re.sub(r"[\W_]+", " ", _fold(t or "")).split()            # noqa: E731  every script
     same = fw(seed.title) == fw(best[1].title) and len(fw(seed.title)) >= 3
     ok = best[0] >= ACCEPT_P and (len(info["keywords"]) >= 3 or same) and bool(_ident(best[1]))
     return rid, ("accept" if ok else "judge"), _ident(best[1]), best[1], info

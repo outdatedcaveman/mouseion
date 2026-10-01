@@ -88,10 +88,10 @@ _TAG = re.compile(r"<[^>]+>")
 
 
 def _norm_title(t: Any) -> str:
-    import unicodedata
-    t = unicodedata.normalize("NFKD", _TAG.sub(" ", str(t or "")))
-    t = "".join(ch for ch in t if not unicodedata.combining(ch)).lower()
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", t).split())
+    # every script's letters survive: with [a-z0-9] two DIFFERENT Cyrillic titles both became ""
+    # and the title veto saw them as equal
+    from .textnorm import fold
+    return fold(_TAG.sub(" ", str(t or "")))
 
 
 def _type_family(t: Any) -> str:
