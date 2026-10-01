@@ -6,7 +6,10 @@ Nothing is changed here. A candidate is an incomplete entry whose title is
   * a page artefact ('Download Limit Exceeded', 'Just a moment', 'Access denied')
   * only a publisher's name ('McGraw Hill', 'Oxford University Press')
   * only digits and file tokens ('9912074 pdf')
-  * unreadable (OCR noise: few ordinary words or names -- 'I T IImIIT', 'M11p T x11 lp A I')
+  * unreadable: letter salad judged on CHARACTERS ('I T IImIIT', 'M11p T x11 lp A I') --
+    never on English vocabulary: Polish, Turkish, Latin titles and names are real
+A rich string is NOT junk: a series + volume ('LNCS 3796'), a JSTOR number, an Elsevier
+PII, a journal-issue file name ('JMP1984V25N12') -- those get a "suggestion" instead.
 A series + volume ('LNCS 3796') is NOT junk: it names a book (see mouseion.web_trail).
 
 Writes a JSON list (default: junk_candidates.json next to refs.db) with the reason, whether
@@ -45,6 +48,52 @@ PUBLISHERS = {"mcgraw hill", "mcgraw-hill", "springer", "springer verlag", "else
               "blackwell", "palgrave macmillan", "macmillan", "penguin", "dover", "university of chicago press"}
 
 
+VOWELS = set("aeiouyAEIOUYàáâãäåèéêëìíîïòóôõöùúûüýÿæœøıАЕИОУЫЭЮЯаеиоуыэюяΑΕΗΙΟΥΩαεηιουω")
+
+
+def gibberish_token(t: str) -> bool:
+    """Letter salad, not language: judged on characters, never on English vocabulary
+    (Polish, Turkish, Norwegian, Latin titles and names are real words)."""
+    core = re.sub(r"[^\w]", "", t)
+    if len(core) < 2:
+        return False
+    if re.search(r"\d", core) and re.search(r"[A-Za-z]", core) and not re.fullmatch(r"\d{1,4}(st|nd|rd|th|s)?|[A-Z]?\d+[a-z]?", core):
+        return True                                   # 'Ehaobagzmackkhsiy4Nillipgi66', 'M11p', 'x11'
+    if re.fullmatch(r"[0-9A-Fa-f]{6,}", core) and re.search(r"[A-Fa-f]", core):
+        return True                                   # hex ids
+    letters = [c for c in core if c.isalpha()]
+    if len(letters) >= 4 and not any(c in VOWELS for c in letters):
+        return True                                   # 'IImIIT', 'Ctn'
+    if re.search(r"[bcdfghjklmnpqrstvwxz]{6,}", core.lower()):
+        return True                                   # six consonants in a row
+    if re.search(r"[a-z][A-Z]{2,}[a-z]", core):
+        return True                                   # 'lpAIx' case salad
+    return False
+
+
+JOURNAL_FILE = re.compile(r"^(?P<j>[A-Z]{2,6})(?P<y>1[89]\d\d|20\d\d)V(?P<v>\d{1,3})N(?P<n>\d{1,3})\b")
+JOURNAL_CODES = {"JMP": "Journal of Mathematical Physics"}
+PII_TITLE = re.compile(r"^PII\s*:?\s*S?\s*(\d{4})\s*-?\s*(\d{3}[\dX])\s*\(?(\d{2})\)?\s*(\d{5})", re.I)
+
+
+def suggestion(title: str, pdf: str) -> str:
+    """A rich string that names something findable -- not junk."""
+    t = (title or "").strip()
+    stem = re.sub(r"\.(pdf|djvu)$", "", (pdf or "").split("\\")[-1], flags=re.I)
+    for x in (t, stem):
+        m = JOURNAL_FILE.match(x or "")
+        if m:
+            j = JOURNAL_CODES.get(m.group("j"), m.group("j"))
+            return f"whole journal issue: {j} vol. {int(m.group('v'))} no. {int(m.group('n'))} ({m.group('y')})"
+    m = PII_TITLE.match(t)
+    if m:
+        return f"Elsevier article id S{m.group(1)}-{m.group(2)}({m.group(3)}){m.group(4)} -> DOI lookup"
+    for x in (t, stem):
+        if re.fullmatch(r"\d{6,9}", x or ""):
+            return f"JSTOR stable id {x} -> 10.2307/{x}"
+    return ""
+
+
 def reason(title: str, common: set, fam: Counter) -> str:
     t = (title or "").strip()
     n = W.norm(t)
@@ -63,12 +112,12 @@ def reason(title: str, common: set, fam: Counter) -> str:
     toks = n.split()
     if all(re.fullmatch(r"\d+|pdf|v\d+|doc|dvi|ps", x) for x in toks):
         return "digits only"
-    words = [x for x in toks if len(x) > 1 and not x.isdigit()]
-    if len(toks) >= 2:
-        known = sum(1 for x in words if x in common or fam.get(x, 0) >= 3)
-        letters = sum(1 for ch in t if ch.isalpha())
-        if (not words or known / max(1, len(words)) < 0.34) and letters < 60:
-            return "unreadable (OCR noise)"
+    raw = [x for x in re.split(r"\s+", t) if x]
+    if len(raw) >= 2 and all(len(re.sub(r"\W", "", x)) <= 1 for x in raw):
+        return "unreadable (single letters)"          # 'J H S', 'I T'
+    bad = sum(gibberish_token(x) for x in raw)
+    if raw and bad / len(raw) >= 0.4:
+        return "unreadable (letter salad)"
     return ""
 
 
@@ -98,7 +147,7 @@ def main() -> None:
             srcs = ""
         tr = trails.get(rid)
         rows.append({"id": rid, "title": (title or "")[:200], "authors": au, "year": year, "type": rtype,
-                     "reason": why, "pdf": (pl or "").split("\\")[-1][:120] if pl else ("drive" if pd else ""),
+                     "reason": why, "suggestion": suggestion(title, pl or ""), "pdf": (pl or "").split("\\")[-1][:120] if pl else ("drive" if pd else ""),
                      "imported_from": srcs, "web": (tr[0] if tr else "not searched yet"), "web_url": (tr[1] if tr else "")})
     out.write_text(json.dumps(rows, ensure_ascii=False, indent=0), encoding="utf-8")
     print(f"{len(rows):,} candidates -> {out}")
