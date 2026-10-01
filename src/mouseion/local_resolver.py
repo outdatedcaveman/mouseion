@@ -29,7 +29,7 @@ def _author_families(ref: Reference) -> set[str]:
 
 
 def _fts_query(title: str) -> str:
-    words = [w for w in re.findall(r"[A-Za-z0-9]{3,}", title.lower()) if len(w) >= 3]
+    words = [w for w in re.findall(r"[^\W_]{3,}", title.lower()) if len(w) >= 3]      # every script
     return " ".join(words[:8])
 
 
