@@ -128,3 +128,17 @@ def test_fill_plan_fills_only_empty_fields():
     assert "year" not in up                    # a stored year is kept
     chapter = Reference(title="Objective Lenses", ref_type=RefType.BOOK_CHAPTER, authors=[Author(family="Keller")])
     assert PI.fill_plan(Reference(title="Handbook of Confocal Microscopy"), chapter, pages=900) == {}
+
+
+def test_junk_review_fix_note_parsing():
+    import importlib.util, json, sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    sys.argv = ["apply_junk_decisions.py", "x", "dry"]
+    spec = importlib.util.spec_from_file_location("ajd", root / "scripts" / "apply_junk_decisions.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    up = m.parse_note("The Lazy Lambda Calculus / Samson Abramsky / 1990")
+    assert up["title"] == "The Lazy Lambda Calculus" and up["year"] == 1990
+    assert json.loads(up["authors_json"])[0]["family"] == "Abramsky"
+    assert m.parse_note("Just a title") == {"title": "Just a title"}

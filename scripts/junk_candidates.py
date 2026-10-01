@@ -133,7 +133,8 @@ def main() -> None:
     rows = []
     for rid, title, authors, year, rtype, pl, pd, src in conn.execute(
             f"""SELECT id, title, authors, year, ref_type, pdf_local, pdf_drive_id, sources FROM refs
-                WHERE NOT ({RefDatabase.COMPLETE_SQL})"""):
+                WHERE NOT ({RefDatabase.COMPLETE_SQL})
+                AND COALESCE(json_extract(extras, '$.junk_review.decision'), '') != 'keep'"""):
         why = reason(title, vocab.common, vocab.fam) if hasattr(vocab, "fam") else reason(title, vocab.common, Counter())
         if not why:
             continue

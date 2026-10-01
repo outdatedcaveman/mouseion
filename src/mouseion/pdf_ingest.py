@@ -905,37 +905,27 @@ def process_file(path: str):
         return None, False, "", None, "", f"{type(e).__name__}: {str(e)[:80]}"
 
 
-def archive_course_material(conn, write: bool = True) -> list:
-    """Move library entries that are course material (see course_material) out of refs.
-
-    Judged on title + PDF file name; entries with a DOI/ISBN/arXiv/PMID are published
-    works and stay. Rows go to refs_duplicates (archive_rule 'course-material'), their
-    tags to refs_removed_tags; PDF files are not touched. Returns [(id, marker, title)].
-    """
+def archive_refs(conn, items, rule: str) -> int:
+    """Move entries out of refs, recoverably: rows to refs_duplicates (archive_rule `rule`),
+    tags to refs_removed_tags; an ingest-log row is marked skipped so the file is not
+    re-added. `items` = [(id, reason)]. PDF files are never touched. One transaction."""
     from .maintenance_dedup import _ensure_archive
-    hits = []
-    for rid, title, pl, pp in conn.execute(
-            "SELECT id, title, pdf_local, pdf_path FROM refs WHERE COALESCE(doi,'')='' AND COALESCE(isbn,'')='' "
-            "AND COALESCE(arxiv_id,'')='' AND COALESCE(pmid,'')=''"):
-        m = course_material(f"{title or ''} || {Path(pl or pp or '').stem}")
-        if m:
-            hits.append((rid, m, title or ""))
-    if not write or not hits:
-        return hits
+    if not items:
+        return 0
     cl = ", ".join(_ensure_archive(conn))
     conn.execute("CREATE TABLE IF NOT EXISTS refs_removed_tags "
                  "(ref_id TEXT, tag TEXT, removed_at TEXT DEFAULT (datetime('now')))")
     has_log = conn.execute("SELECT 1 FROM sqlite_master WHERE name='pdf_ingest_log'").fetchone()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for rid, m, _t in hits:
+        for rid, why in items:
             conn.execute(f"INSERT INTO refs_duplicates ({cl}, duplicate_of, archived_at, archive_rule) "
-                         f"SELECT {cl}, NULL, datetime('now'), 'course-material' FROM refs WHERE id = ?", (rid,))
+                         f"SELECT {cl}, NULL, datetime('now'), ? FROM refs WHERE id = ?", (rule, rid))
             conn.execute("INSERT INTO refs_removed_tags (ref_id, tag) SELECT rt.ref_id, t.name FROM ref_tags rt "
                          "JOIN tags t ON t.id = rt.tag_id WHERE rt.ref_id = ?", (rid,))
             if has_log:      # the ingest remembers the file as skipped, so it is not re-added
                 conn.execute("UPDATE pdf_ingest_log SET action='skipped', ref_id='', detail=? WHERE ref_id = ?",
-                             ("course material: " + m, rid))
+                             (f"{rule}: {why}"[:200], rid))
             # FTS by rowid (O(1)); by the UNINDEXED ref_id it scans the whole index and holds the lock
             for sql in ("DELETE FROM ref_tags WHERE ref_id = ?", "DELETE FROM enrich_queue WHERE ref_id = ?",
                         "DELETE FROM refs_fts WHERE rowid = (SELECT rowid FROM refs WHERE id = ?)",
@@ -945,4 +935,23 @@ def archive_course_material(conn, write: bool = True) -> list:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    return len(items)
+
+
+def archive_course_material(conn, write: bool = True) -> list:
+    """Move library entries that are course material (see course_material) out of refs.
+
+    Judged on title + PDF file name; entries with a DOI/ISBN/arXiv/PMID are published
+    works and stay. Rows go to refs_duplicates (archive_rule 'course-material'), their
+    tags to refs_removed_tags; PDF files are not touched. Returns [(id, marker, title)].
+    """
+    hits = []
+    for rid, title, pl, pp in conn.execute(
+            "SELECT id, title, pdf_local, pdf_path FROM refs WHERE COALESCE(doi,'')='' AND COALESCE(isbn,'')='' "
+            "AND COALESCE(arxiv_id,'')='' AND COALESCE(pmid,'')=''"):
+        m = course_material(f"{title or ''} || {Path(pl or pp or '').stem}")
+        if m:
+            hits.append((rid, m, title or ""))
+    if write and hits:
+        archive_refs(conn, [(rid, "course material: " + m) for rid, m, _t in hits], "course-material")
     return hits
