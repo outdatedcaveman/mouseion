@@ -746,6 +746,174 @@ def filename_author(stem: str) -> Optional[Author]:
     return Author(family=m.group(1).replace("_", " "))
 
 
+# --------------------------------------------------------- reference-manager file names
+# 'RYLE, Gilbert - Mr. Collingwood and the Ontological Argument'
+# 'Metcalfe, Olivetti _ Gabbay - Proof Theory for Fuzzy Logics'
+# 'Holcombe - Algebraic Automata Theory (1982)'      'Raduta A.A. (ed.) Symmetries and Semiclassical ...'
+# 'The Primate Origins of Human Nature by Carol V. Ward'   '019920554X.Oxford.University.Press.USA.Believing.by.Faith'
+_FN_ISBN = re.compile(r"^(97[89]\d{10}|\d{9}[\dXx])(?=[._ -])")
+_FN_YEAR = re.compile(r"[\(\[]((?:1[5-9]|20)\d\d)[\)\]]")
+_PUBLISHERS_FN = re.compile(r"\b(Oxford|Cambridge|University|Press|USA|UK|Springer|Verlag|Wiley|Routledge|Elsevier|"
+                            r"Academic|Publishers?|Books?|Edition|Ed|ebook)\b", re.I)
+
+
+def _names_from(side: str) -> List[Author]:
+    """'RYLE, Gilbert' / 'Metcalfe, Olivetti _ Gabbay' / 'Raduta A.A.' / 'Trease H.E., Fritts M.F.' -> authors."""
+    side = re.sub(r"\((eds?|hrsg|coord)\.?\)", " ", side, flags=re.I).strip(" ,;")
+    parts = [x.strip() for x in re.split(r"\s+_\s+|\s*&\s*|\s+and\s+|;", side) if x.strip()]
+    if len(parts) > 1:              # a list ('Metcalfe, Olivetti _ Gabbay'): commas separate people too
+        parts = [y.strip() for x in parts for y in x.split(",") if y.strip()]
+    out: List[Author] = []
+    for part in parts:
+        # 'RYLE, Gilbert' -> one person; 'Metcalfe, Olivetti' -> two surnames; 'Trease H.E., Fritts M.F.' -> two
+        bits = [b.strip() for b in part.split(",") if b.strip()]
+        if len(bits) == 2 and re.fullmatch(r"[A-Z][a-z'\-]+(?: [A-Z][a-z'\-]+)?|(?:[A-Z]\.){1,3}", bits[1]) and \
+                not re.search(r"[A-Z]\.", bits[0]) and len(bits[0].split()) == 1:
+            out.append(Author(family=_name_case(bits[0]), given=bits[1]))
+            continue
+        for b in bits:
+            toks = b.split()
+            if not toks or len(toks) > 4:
+                return []
+            inits = [t for t in toks if _INITIALS.match(t)]
+            names = [t for t in toks if not _INITIALS.match(t)]
+            if not names or not all(_name_token(t) or t.lower() in _NAME_PARTICLES for t in names):
+                return []
+            if inits and len(names) == 1:                    # 'Raduta A.A.'
+                out.append(Author(family=_name_case(names[0]), given=" ".join(inits)))
+            elif len(names) == 1:
+                out.append(Author(family=_name_case(names[0])))
+            else:
+                out.append(Author(family=_name_case(names[-1]), given=" ".join(toks[:-1])))
+    return out if 1 <= len(out) <= 8 else []
+
+
+def filename_meta(stem: str) -> Dict[str, object]:
+    """Title, authors, year, ISBN that a reference-manager / library file name carries."""
+    raw = re.sub(r"\s*\(\d+\)$", "", stem)
+    out: Dict[str, object] = {}
+    m = _FN_ISBN.match(raw)
+    if m:
+        out["isbn"] = m.group(1).upper()
+        raw = raw[m.end():]
+        raw = re.sub(r"[._]", " ", raw)
+        raw = re.sub(r"^\s*(?:" + _PUBLISHERS_FN.pattern + r"|\s)+", "", raw, flags=re.I)
+    raw = raw.replace(" _ ", " & ")                     # 'Metcalfe, Olivetti _ Gabbay': a list separator
+    t = clean_filename(raw) if "clean_filename" in globals() else raw
+    t = re.sub(r"[_]+", " ", t).strip()
+    y = _FN_YEAR.search(t)
+    if y:
+        out["year"] = int(y.group(1))
+        t = (t[:y.start()] + t[y.end():]).strip(" -,")
+    ed = bool(re.search(r"\((eds?|hrsg)\.?\)", t, re.I))
+    authors: List[Author] = []
+    title = t
+    if " - " in t:
+        left, right = t.split(" - ", 1)
+        a = _names_from(left)
+        if a and len(right.split()) >= 2:
+            authors, title = a, right
+    elif re.search(r"\((eds?|hrsg)\.?\)", t, re.I):
+        m2 = re.match(r"^(.{3,80}?\((?:eds?|hrsg)\.?\))\s+(.{6,})$", t, re.I)
+        if m2:
+            a = _names_from(m2.group(1))
+            if a:
+                authors, title = a, m2.group(2)
+    elif re.match(r"^[A-Z][a-z'\-]+ (?:[A-Z]\.?){1,3}[\s,.]", t):        # 'Bellman R. Stability ...', 'Barro R.J., Sala-i-Martin X. ...'
+        t2 = re.sub(r"\s*\((?:copy|\d+)\)\.?", "", t)
+        m4 = re.match(r"^((?:[A-Z][a-z'\-]+(?:-[a-z]+-[A-Z][a-z]+)? (?:[A-Z]\.?){1,3}\.?,?\s*){1,6})\s*(.{6,})$", t2)
+        a = _names_from(m4.group(1)) if m4 else []
+        if a:
+            authors, title = a, m4.group(2)
+    else:
+        m3 = re.match(r"^(.{8,}?)\s+by\s+([A-Z][\w.'\- ]{2,60})$", t)
+        if m3:
+            a = _names_from(m3.group(2))
+            if a:
+                authors, title = a, m3.group(1)
+    if not authors and "isbn" not in out:
+        t_title, t_author = _split_title_author(t)            # 'Algebra, Serge Lang' / 'Title (Author)'
+        if t_author:
+            a = _names_from(t_author)
+            if a:
+                authors, title = a, t_title
+    title = re.sub(r"^\d{1,4}\s*-\s*", "", re.sub(r"\s+", " ", title)).strip(" -,.")    # '102 - Lie Groups'
+    if len(title.split()) >= 2:
+        out["title"] = title[:300]
+    if authors:
+        out["authors"] = authors
+        out["editors"] = ed
+    return out
+
+
+def names_on_page(authors: List[Author], text: str) -> bool:
+    """Every surname appears on the first pages (scans' OCR may not have them: caller decides)."""
+    page = _norm((text or "")[:8000])
+    return bool(authors) and all(_norm(a.family).split()[-1] in page.split() for a in authors if _norm(a.family))
+
+
+def search_verified_by_page(f: PdfFacts, titles: List[str], cfg=None) -> Tuple[Optional[Reference], str]:
+    """Title search (Crossref, OpenAlex; OpenLibrary for books) whose answer is CONFIRMED by the PDF:
+    the candidate's title matches one of `titles` and one of its authors' surnames is printed on the
+    first pages (or in the file name). For good titles the indexes know but whose author line the
+    page layout hid ('ECONOMIC GROWTH' + 'Barro' on the title page)."""
+    if cfg is None:
+        from .config import get_config
+        cfg = get_config()
+    mailto = cfg.crossref_email or cfg.openalex_email or ""
+    page = set(_norm((f.text or "")[:8000]).split()) | set(_norm(Path(f.path).stem).split())
+    seen = set()
+    with httpx.Client(timeout=30, headers=_UA, follow_redirects=True) as client:
+        for title in titles:
+            t = " ".join((title or "").split())
+            if len(_norm(t).split()) < 2 or _norm(t) in seen:
+                continue
+            seen.add(_norm(t))
+            cands: List[Reference] = []
+            try:
+                r = client.get("https://api.crossref.org/works",
+                               params={"query.bibliographic": t, "rows": 5, **({"mailto": mailto} if mailto else {})})
+                if r.status_code == 200:
+                    from .providers.crossref import CrossRefProvider
+                    for it in r.json()["message"]["items"]:
+                        rec = CrossRefProvider()._parse_work(it)
+                        if rec is not None:
+                            cands.append(rec)
+            except Exception:
+                pass
+            if f.pages >= 80:
+                try:
+                    r = client.get("https://openlibrary.org/search.json", params={"title": t[:200], "limit": 5})
+                    if r.status_code == 200:
+                        for d in r.json().get("docs", []):
+                            rec = Reference(title=d.get("title", ""), ref_type=RefType.BOOK,
+                                            year=d.get("first_publish_year"),
+                                            authors=[Author(family=n.split()[-1], given=" ".join(n.split()[:-1]))
+                                                     for n in d.get("author_name", [])[:6] if n.split()])
+                            isbns = d.get("isbn") or []
+                            rec.isbn = next((i for i in isbns if len(i) == 13), isbns[0] if isbns else None)
+                            rec.publisher = (d.get("publisher") or [None])[0]
+                            cands.append(rec)
+                except Exception:
+                    pass
+            for rec in cands:
+                if not rec.title:
+                    continue
+                full = f"{rec.title} {getattr(rec, 'subtitle', '') or ''}".strip()
+                sim = max(difflib.SequenceMatcher(None, _norm(t), _norm(x)).ratio() for x in (rec.title, full))
+                nt, nr = _norm(t), _norm(rec.title)
+                if len(nt.split()) >= 2 and (nr.startswith(nt) or nt.startswith(nr)) and len(nr.split()) >= 2:
+                    sim = max(sim, 0.9)
+                if sim < 0.85:
+                    continue
+                if f.pages >= 150 and "chapter" in str(rec.ref_type).lower():
+                    continue
+                fams = [_norm(a.family).split()[-1] for a in rec.authors if _norm(a.family)]
+                if fams and any(x in page for x in fams if len(x) > 2):
+                    return rec, "title-search+author-on-page"
+    return None, ""
+
+
 LONG_PAGES = 60     # page 1 of a longer file is a cover, series page or an issue's first article
 
 
