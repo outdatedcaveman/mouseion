@@ -37,6 +37,9 @@ LIMIT = int(args[0]) if args else 50
 WRITE = len(args) > 1 and args[1] == "write"
 SHOW = int(sys.argv[sys.argv.index("--show") + 1]) if "--show" in sys.argv else (60 if not WRITE else 0)
 ALL = "--all" in sys.argv
+# --ids FILE: exactly these entries (a JSON list of ids, or of objects with "id"), PDF or not,
+# searched or not -- e.g. the junk-review candidates, each searched before anyone calls it junk
+IDS_FILE = sys.argv[sys.argv.index("--ids") + 1] if "--ids" in sys.argv else ""
 STAMP = date.today().strftime("%Y%m%d")
 COMMON: set = set()
 CFG = get_config()
@@ -142,7 +145,15 @@ def main() -> None:
     no_web_id = ("COALESCE(url,'')='' AND COALESCE(oa_url,'')='' AND COALESCE(doi,'')='' AND COALESCE(isbn,'')='' "
                  "AND COALESCE(arxiv_id,'')='' AND COALESCE(pmid,'')=''")
     pdf_clause = "" if ALL else " AND COALESCE(pdf_local,'')='' AND COALESCE(pdf_drive_id,'')=''"
-    ids = [r[0] for r in conn.execute(f"""SELECT id FROM refs WHERE NOT ({RefDatabase.COMPLETE_SQL}) AND {no_web_id}
+    if IDS_FILE:
+        wanted = json.loads(Path(IDS_FILE).read_text(encoding="utf-8"))
+        wanted = [w["id"] if isinstance(w, dict) else w for w in wanted]
+        seen = {r[0] for r in conn.execute("SELECT ref_id FROM web_trail_scan")}
+        ids = [i for i in wanted if i not in seen][:LIMIT]
+    else:
+        ids = None
+    if ids is None:
+        ids = [r[0] for r in conn.execute(f"""SELECT id FROM refs WHERE NOT ({RefDatabase.COMPLETE_SQL}) AND {no_web_id}
         {pdf_clause} AND id NOT IN (SELECT ref_id FROM web_trail_scan)
         ORDER BY (authors IS NULL OR authors IN ('','[]')), RANDOM() LIMIT ?""", (LIMIT,))]
     if "--reverify" in sys.argv:
@@ -166,6 +177,20 @@ def main() -> None:
         if seed is None:
             continue
         u = W.understand(seed.title or "", known)
+        pdf = conn.execute("SELECT pdf_local FROM refs WHERE id=?", (rid,)).fetchone()[0]
+        if IDS_FILE and pdf and Path(pdf).exists() and len(W.norm(u.get("title", "")).split()) < 3:
+            # the stored title is junk: search what the PDF's own first page says
+            try:
+                f = PI.extract(pdf)
+                pt = f.title or ""
+                if len(W.norm(pt).split()) >= 3:
+                    u = W.understand(pt, known)
+                    if not seed.authors and f.pages < PI.LONG_PAGES and not f.ocr:
+                        page_auth = PI.authors_from_page(f)
+                        if page_auth:
+                            seed.authors = page_auth
+            except Exception:
+                pass
         entry = {**u, "surnames": [a.family for a in seed.authors if a.family],
                  "year": seed.year, "journal": seed.journal or "", "common_words": known}
         try:
