@@ -16,6 +16,9 @@ Priority order (highest reliability first):
   9. OpenLibrary     — books via ISBN (archive.org)
  10. Google Books    — books via ISBN (broader coverage)
  11. Unpaywall       — open access PDF URLs via DOI
+
+Opt-in, outside the default set: BASE (base_search) — repository copies from
+11k+ OAI-PMH repositories for the PDF chain; needs registered access, 1 QPS.
 """
 
 from .crossref         import CrossRefProvider
@@ -29,6 +32,7 @@ from .doi_org          import DOIOrgProvider
 from .unpaywall        import UnpaywallProvider
 from .arxiv_api        import ArXivAPIProvider
 from .google_books     import GoogleBooksProvider
+from .base_search      import BaseSearchProvider
 
 def _make_providers():
     """Create fresh provider instances.
@@ -70,6 +74,7 @@ __all__ = [
     "OpenLibraryProvider",
     "GoogleBooksProvider",
     "UnpaywallProvider",
+    "BaseSearchProvider",
     "DEFAULT_PROVIDERS",
     "_make_providers",
 ]

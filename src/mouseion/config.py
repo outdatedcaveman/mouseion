@@ -75,6 +75,7 @@ class Config:
     tavily_api_key: str = ""        # tavily.com: web search, 1,000 free searches a month
     brave_api_key: str = ""         # Brave Search API: independent index, ~1,000 free a month
     gemini_search_api_key: str = "" # Gemini API key for Google-grounded search (billing on; 5,000 free searches a month)
+    base_search_api_key: str = ""   # BASE (base-search.net) apikey; alternative to a registered IP
 
     # --- LLM ---
     llm_api_key: str = ""
@@ -84,6 +85,7 @@ class Config:
     pdf_storage_path: str = str(_DEFAULT_PDFS)
     auto_fetch_pdfs: bool = False
     institutional_proxy_url: str = ""  # e.g. https://proxy.university.edu/login?url=
+    base_search_enabled: bool = False  # BASE repository copies in the PDF chain (needs BASE access)
 
     # --- Notion ---
     notion_api_key: str = ""
@@ -204,12 +206,14 @@ _TOML_MAP = {
         "tavily_api_key": "tavily_api_key",
         "brave_api_key": "brave_api_key",
         "gemini_search_api_key": "gemini_search_api_key",
+        "base_search_api_key": "base_search_api_key",
     },
     "llm": {
         "api_key": "llm_api_key",
         "provider": "llm_provider",
     },
-    "pdf":          {"storage_path": "pdf_storage_path", "auto_fetch": "auto_fetch_pdfs", "institutional_proxy_url": "institutional_proxy_url"},
+    "pdf":          {"storage_path": "pdf_storage_path", "auto_fetch": "auto_fetch_pdfs", "institutional_proxy_url": "institutional_proxy_url",
+                     "base_search_enabled": "base_search_enabled"},
     "notion":       {"api_key": "notion_api_key", "database_id": "notion_database_id"},
     "zotero":       {
         "api_key": "zotero_api_key",
@@ -290,6 +294,8 @@ _ENV_MAP: Dict[str, str] = {
     "MOUSEION_TAVILY_API_KEY":              "tavily_api_key",
     "MOUSEION_BRAVE_API_KEY":               "brave_api_key",
     "MOUSEION_GEMINI_SEARCH_API_KEY":       "gemini_search_api_key",
+    "MOUSEION_BASE_SEARCH_API_KEY":         "base_search_api_key",
+    "MOUSEION_BASE_SEARCH_ENABLED":         "base_search_enabled",
     "MOUSEION_LLM_API_KEY":                "llm_api_key",
     "MOUSEION_LLM_PROVIDER":               "llm_provider",
     "MOUSEION_NOTION_API_KEY":             "notion_api_key",
@@ -318,7 +324,20 @@ def _apply_env(cfg: Config) -> None:
     for env_var, attr in _ENV_MAP.items():
         val = os.environ.get(env_var, "")
         if val:
-            setattr(cfg, attr, val)
+            setattr(cfg, attr, _coerce_like(getattr(cfg, attr), val))
+
+
+def _coerce_like(current, val: str):
+    """An env string typed like the field it sets: MOUSEION_VPN_ENABLED=0 must be
+    False, not the (truthy) string "0"."""
+    if isinstance(current, bool):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(current, int):
+        try:
+            return int(val)
+        except ValueError:
+            return current
+    return val
 
 
 def _load_dotenv() -> None:
@@ -374,6 +393,7 @@ def _render_toml(cfg: Config) -> str:
         f'tavily_api_key             = {_q(cfg.tavily_api_key)}',
         f'brave_api_key              = {_q(cfg.brave_api_key)}',
         f'gemini_search_api_key      = {_q(cfg.gemini_search_api_key)}',
+        f'base_search_api_key        = {_q(cfg.base_search_api_key)}  # BASE apikey (or register your IP)',
         "",
         "[llm]",
         f'api_key  = {_q(cfg.llm_api_key)}',
@@ -386,6 +406,7 @@ def _render_toml(cfg: Config) -> str:
         f"storage_path = '{cfg.pdf_storage_path}'",
         f"auto_fetch   = {str(cfg.auto_fetch_pdfs).lower()}",
         f'institutional_proxy_url = {_q(cfg.institutional_proxy_url)}',
+        f"base_search_enabled = {str(cfg.base_search_enabled).lower()}  # BASE repository copies (needs BASE access)",
         "",
         "[notion]",
         f'api_key     = {_q(cfg.notion_api_key)}',

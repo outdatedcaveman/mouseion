@@ -76,6 +76,7 @@ _DEFAULT_LIMITS: Dict[str, Limit] = {
     # --- PDF / OA discovery (these were the silent quota killers) ---
     "unpaywall":        Limit(per_min=60,  per_day=90_000,  min_interval=0.15),
     "core":             Limit(per_min=6,   per_day=900,     min_interval=2.0),
+    "base_search":      Limit(per_min=55,  per_day=40_000,  min_interval=1.05),  # BASE asks for 1 QPS
     "scihub":           Limit(per_min=10,  per_day=5_000,   min_interval=3.0),
     "annas":            Limit(per_min=10,  per_day=5_000,   min_interval=3.0),
     "pdf_host":         Limit(per_min=120, per_day=200_000, min_interval=0.0),

@@ -6,6 +6,7 @@ A self-hosted academic reference manager built for large personal libraries (250
 
 - **Import anything**: BibTeX, RIS, CSL-JSON, Markdown, HTML bookmarks, plain text with DOIs/URLs/arXiv IDs/PMIDs. Drag and drop.
 - **Enrich automatically**: 11 academic API providers (CrossRef, OpenAlex, Semantic Scholar, PubMed, DBLP, arXiv, OpenLibrary, DOI.org, Unpaywall, Google Books) fill in missing metadata. Background daemon with adaptive priority queue processes your whole library while you work.
+- **Repository copies via BASE (opt-in)**: the Bielefeld Academic Search Engine's 11k+ OAI-PMH repositories as one more open-access PDF source; needs BASE API access (see [docs/BASE-PROVIDER.md](docs/BASE-PROVIDER.md)).
 - **Search everything**: Full-text search across titles, abstracts, authors, keywords, journals, DOIs, URLs, ISBNs, PMIDs, arXiv IDs. Instant results on 250k+ libraries via FTS5.
 - **Export anywhere**: BibTeX, RIS, CSL-JSON, CSV, Markdown, Zotero RDF.
 - **Organize**: Tags (manual + auto-assigned from 30-topic taxonomy), collections, reading status (unread/reading/read), Kanban board view.

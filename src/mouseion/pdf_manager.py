@@ -135,8 +135,18 @@ def _pdf_ledger_key() -> str:
         except Exception:
             pass
         _LEDGER_KEY_CACHE[:] = [_t.time(), key]
-    # a run without the shadow sources must not mark refs as tried for runs with them
-    return _LEDGER_KEY_CACHE[1] + ("" if _shadow_sources_on() else "_open") + "_" + FETCHER_VERSION
+    # a run without the shadow sources must not mark refs as tried for runs with them;
+    # likewise a miss from before BASE was switched on must not hide refs from BASE
+    return (_LEDGER_KEY_CACHE[1] + ("" if _shadow_sources_on() else "_open")
+            + ("_base" if _base_search_on() else "") + "_" + FETCHER_VERSION)
+
+
+def _base_search_on() -> bool:
+    try:
+        from .providers import base_search
+        return base_search.enabled()
+    except Exception:
+        return False
 
 
 class TemporaryDownloadError(Exception):
@@ -325,6 +335,8 @@ async def _download_pdf_impl(
       1. ``ref.oa_url`` (already known OA link from enrichment)
       2. arXiv PDF (always free)
       3. Unpaywall lookup (DOI-based OA discovery)
+      3.5 every repository copy OpenAlex / Unpaywall / Europe PMC list
+      3.6 BASE repository copies (only with base_search_enabled)
       4. Semantic Scholar openAccessPdf link
       5. CORE.ac.uk full-text search
       6. DOI via institutional proxy / EZproxy
@@ -378,6 +390,7 @@ async def _download_pdf_impl(
 
     temporary_failure = False
     blocked = False
+    unasked = False          # an enabled source could not be asked: not a miss
 
     try:
         # Strategy 1: Use oa_url already on the reference
@@ -436,6 +449,35 @@ async def _download_pdf_impl(
                 temporary_failure = True
             except _publisher_blocked() as e:
                 logger.info("Repository host paused: %s", e)
+
+        # Strategy 3.6: BASE -- 11k+ OAI-PMH repositories (theses, accepted manuscripts)
+        # that the indexes above miss. Off unless base_search_enabled; when BASE
+        # cannot be asked (not registered, budget wait) the ref stays eligible.
+        if (ref.doi or ref.title) and _base_search_on():
+            _src("BASE (repository copies)")
+            from .providers import base_search as _bs
+            try:
+                copies = await _bs.repository_copies(client, ref)
+                if copies is None:
+                    unasked = True
+                for cp in copies or []:
+                    try:
+                        if await _stream_download(client, cp.url, dest):
+                            ref.pdf_path = filename
+                            ref.oa_url = ref.oa_url or cp.url
+                            if isinstance(getattr(ref, "extras", None), dict):
+                                ref.extras["pdf_provenance"] = {
+                                    "source": "base_search", "url": cp.url, "repository": cp.collection,
+                                    "repository_name": cp.provider, "matched_by": cp.matched_by}
+                            return filename
+                    except _publisher_blocked() as e:
+                        logger.info("Repository host paused: %s", e)
+            except _bs.BaseAccessDenied as e:
+                logger.info("BASE not reachable for this caller: %s", e)
+                unasked = True
+            except TemporaryDownloadError as e:
+                logger.info("Temporary failure using BASE: %s", e)
+                temporary_failure = True
 
         # Strategy 4: Semantic Scholar openAccessPdf
         _src("Semantic Scholar")
@@ -562,7 +604,7 @@ async def _download_pdf_impl(
         # changes if enrichment adds an oa_url/doi, making the ref eligible
         # again.  Without this, refs where gray sources (Sci-Hub/CORE/Anna's)
         # are all dead get re-attempted every sweep forever.
-        if _rid and not blocked:        # a bot check is "not now", not "no PDF"
+        if _rid and not blocked and not unasked:   # a bot check is "not now", not "no PDF"
             _router.record_attempt(_rid, _ledger, _eh, "miss")
         if temporary_failure:
             logger.info("All strategies exhausted (some had temporary failures) for ref: %s", _rid)
