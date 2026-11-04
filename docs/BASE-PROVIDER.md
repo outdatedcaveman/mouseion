@@ -1,6 +1,6 @@
 # BASE (Bielefeld Academic Search Engine) — repository copies for the PDF tail
 
-Status: **built and tested, switched off, waiting for BASE access** (2026-10-31).
+Status: **built and tested, switched off, waiting for BASE access** (refused on 2026-10-18, 10-31 and 11-04; the public IP alternated between two addresses).
 
 ## Why BASE
 
@@ -63,9 +63,19 @@ make is for an **apikey**. An IP grant would break at the next address change.
 
 Access is requested via BASE's contact form, https://www.base-search.net/about/en/contact.php.
 The page is behind Anubis bot protection, so it opens in a normal browser only.
-The owner submits it by hand. Suggested text:
+The owner submits it by hand. The form, as archived from Nov 2024 to Jun 2025,
+has exactly these fields:
 
-> **Subject:** HTTP API access request (non-commercial) — apikey
+| Field | What to enter |
+|---|---|
+| "Please leave the following field blank:" | nothing (a spam trap) |
+| Your Email Address (required) | the address BASE should reply to |
+| Your Question (required) | the text below |
+| "I hereby consent to the processing …" checkbox (required) | tick it |
+
+There is no name or subject field, so the subject line goes at the top of the question. Suggested text:
+
+> HTTP API access request (non-commercial) — apikey
 >
 > I maintain Mouseion, an open-source (AGPL-3.0) personal reference manager
 > (https://github.com/outdatedcaveman/mouseion). I would like to use the BASE
