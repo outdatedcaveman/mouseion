@@ -95,6 +95,10 @@ LIMIT = int(args[1]) if len(args) > 1 else 20
 WRITE = len(args) > 2 and args[2] == "write"
 CAP = int(_opt("--cap", "18"))
 SHOW = int(_opt("--show", "0"))
+MAX_MIN = float(_opt("--max-minutes", "90"))   # Egon's rotation never kills a job: the job stops itself
+CALL_TIMEOUT_S = 300                           # one langextract call (its own 503 retries included)
+import socket  # noqa: E402
+socket.setdefaulttimeout(120)                  # Drive downloads (httplib2) and every other socket
 IDS = [i for i in _opt("--ids", "").split(",") if i]
 P.WRITE = WRITE                                 # _apply writes only when this is True
 STATS = {"mode": MODE, "checked": 0, "updated": 0, "rejected": 0, "no_record": 0, "collision": 0,
@@ -418,9 +422,17 @@ def run_lx(conn, stamp) -> None:
     cached = _cache()
     overloaded = 0
     proc = _runner()
+    import queue
+    import threading
+    lines: queue.Queue = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(x) for x in iter(proc.stdout.readline, b"")], daemon=True).start()
+    t_end = time.time() + MAX_MIN * 60
     try:
         with ThreadPoolExecutor(4) as pool:                      # PDFs stream from Drive in parallel
             for rid, text, state in pool.map(_text, rows):
+                if time.time() > t_end:
+                    print(f"  {MAX_MIN:.0f}-minute limit reached: stopping (the rest stays in the pool)", flush=True)
+                    break
                 STATS["checked"] += 1
                 if state != "ok":
                     STATS["no_pdf" if state == "no_pdf" else "no_text"] += 1
@@ -431,7 +443,11 @@ def run_lx(conn, stamp) -> None:
                 if out is None:
                     proc.stdin.write((json.dumps({"id": rid, "text": text}, ensure_ascii=False) + "\n").encode("utf-8"))
                     proc.stdin.flush()
-                    line = proc.stdout.readline().decode("utf-8", "replace")
+                    try:
+                        line = lines.get(timeout=CALL_TIMEOUT_S).decode("utf-8", "replace")
+                    except queue.Empty:
+                        print(f"  langextract gave no answer in {CALL_TIMEOUT_S}s: stopping", flush=True)
+                        break
                     out = json.loads(line) if line.strip() else {"err": "runner died"}
                     STATS["lx_calls"] += 1
                     if not re.search(r"503|UNAVAILABLE", out.get("err") or ""):   # an overload is not a used call
