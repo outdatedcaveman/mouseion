@@ -441,6 +441,9 @@ def _build_consolidated_rows(conn: sqlite3.Connection) -> list[dict]:
 
         row = _ref_to_row(merged)
         row["id"] = keep_id
+        if row.get("title"):          # Crossref titles carry <i>/MathML markup; never keep it
+            row["title"] = _clean_markup_title(row["title"])
+            row["title"] = _without_site_chrome(row["title"], [r["title"] for r in drop_rows])
         row["created_at"] = min(
             [r["created_at"] for r in [keep_row, *drop_rows] if _nonnull_text(r["created_at"])],
             default=keep_row["created_at"],
@@ -639,6 +642,166 @@ def _apply_pairs(conn: sqlite3.Connection, rule: str = "") -> Dict[str, int]:
     }
 
 
+_HTML_TAG = re.compile(r"</?[A-Za-z][\w:.-]*(?:\s[^<>]*)?/?>")   # a tag, not a bare '<' in maths
+
+
+def _clean_markup_title(t: str) -> str:
+    import html as _html
+    return " ".join(_html.unescape(_HTML_TAG.sub(" ", t)).split()) or t
+
+
+def _without_site_chrome(title: str, others: list) -> str:
+    """A web clip's title carries the site ("Physics | Free Full-Text | <title>"); when a
+    merged twin's clean title (3+ words, no ' | ') sits inside it, the clean one wins."""
+    from .textnorm import fold
+    if " | " not in (title or ""):
+        return title
+    for t in others:
+        if t and " | " not in t and len(fold(t).split()) >= 3 and fold(t) in fold(title):
+            return t
+    return title
+
+
+def _name_set(authors_json: Any) -> set[str]:
+    from .textnorm import fold
+    out: set[str] = set()
+    try:
+        people = json.loads(authors_json or "[]")
+    except Exception:
+        return out
+    for a in people if isinstance(people, list) else []:
+        if isinstance(a, dict):
+            for part in (a.get("family"), a.get("given")):
+                out |= {w for w in fold(str(part or "")).split() if len(w) >= 3}
+    return out
+
+
+def _titles_agree_strictly(a: str, b: str) -> bool:
+    """A shared DOI from a collision is weaker evidence than a shared identifier (a wrong
+    DOI is exactly how two works collide), so titles must nearly match -- or one must be
+    a cut-off start of the other."""
+    try:
+        from rapidfuzz import fuzz
+        sort_ratio, set_ratio = fuzz.token_sort_ratio, fuzz.token_set_ratio
+    except Exception:                                  # pragma: no cover
+        from difflib import SequenceMatcher
+        sort_ratio = set_ratio = lambda x, y: 100 * SequenceMatcher(None, x, y).ratio()  # noqa: E731
+    x, y = _norm_title(a).split(), _norm_title(b).split()
+    if not x or not y:
+        return False
+    # numbers that disagree name different things ("Lecture Notes in Computer Science 2952"
+    # vs "... 5203"); a year range extending a year ("1892" / "1892 1969") is fine
+    dx, dy = {w for w in x if w.isdigit()}, {w for w in y if w.isdigit()}
+    if dx and dy and not (dx <= dy or dy <= dx):
+        return False
+    short, long_ = (x, y) if len(x) <= len(y) else (y, x)
+    if len(short) >= 3 and long_[:len(short)] == short:
+        return True
+    # calibrated on the 2026-11-05 dry run: good pairs below 85 were all containments
+    # (subtitle, review prefix); the two doubtful ones (75/76) were not
+    if len(short) >= 3 and set_ratio(" ".join(x), " ".join(y)) >= 100:
+        return True
+    return sort_ratio(" ".join(x), " ".join(y)) >= 85
+
+
+def _run_doi_collision_batch(conn: sqlite3.Connection, max_merges: int, samples: Optional[list] = None
+                             ) -> Dict[str, int]:
+    """Pairs recorded in doi_collisions (db.replace_ref / grounded_meta): a verified DOI
+    that another row already held. The holder (it has the DOI) is kept; the other row
+    fills its empty fields (PDF, notes, ...) and is archived. Found 2026-11-05 on a hand
+    sample of 50 pairs: 44 the same work, 3 ambiguous (editions, reviews), 1 two works
+    sharing a wrongly assigned DOI. So, beyond the title check: years within 3, no
+    book vs chapter/article, and no author conflict when both rows name authors."""
+    conn.execute("DROP TABLE IF EXISTS temp.pairs")
+    conn.execute("CREATE TEMP TABLE pairs (keep_id TEXT, drop_id TEXT)")
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='doi_collisions'").fetchone():
+        return {"selected": 0, "merged": 0, "skipped_conflicts": 0}
+    rows = conn.execute(
+        """SELECT c.holder_id, c.ref_id, k.title, d.title, k.year, d.year, k.ref_type, d.ref_type,
+                  k.authors, d.authors, c.doi,
+                  k.journal, k.container_title, d.journal, d.container_title
+           FROM doi_collisions c JOIN refs k ON k.id = c.holder_id JOIN refs d ON d.id = c.ref_id
+           WHERE COALESCE(k.status,'') != 'duplicate' AND COALESCE(d.status,'') != 'duplicate'
+             AND COALESCE(d.doi,'') = ''
+           ORDER BY c.seen_at""").fetchall()
+    veto = {"veto_title": 0, "veto_venue_title": 0, "veto_year": 0, "veto_type": 0, "veto_author": 0,
+            "veto_chain": 0}
+    keeps, drops, chosen = set(), set(), []
+    for keep, drop, kt, dt, ky, dy, ktype, dtype, ka, da, doi, kj, kc, dj, dc in rows:
+        if len(chosen) >= max_merges:
+            break
+        why = None
+        venues = {_norm_title(v) for v in (kj, kc, dj, dc) if v}
+        if _norm_title(kt) in venues or _norm_title(dt) in venues:
+            why = "veto_venue_title"                   # "Acta Physica Polonica B" is a journal, not a title
+        elif not _titles_agree_strictly(kt or "", dt or ""):
+            why = "veto_title"
+        elif str(ky or "").isdigit() and str(dy or "").isdigit() and abs(int(ky) - int(dy)) > 3:
+            why = "veto_year"
+        elif "book" in (_type_family(ktype), _type_family(dtype)) and _type_family(ktype) != _type_family(dtype):
+            why = "veto_type"
+        else:
+            kn, dn = _name_set(ka), _name_set(da)
+            if kn and dn and not (kn & dn):
+                why = "veto_author"
+        if why is None and (drop in keeps or keep in drops or drop in drops):
+            why = "veto_chain"                         # one merge per row per run: no chains
+        if why:
+            veto[why] += 1
+            if samples is not None and len(samples) < 400:
+                samples.append({"verdict": why, "doi": doi, "keep": (kt or "")[:90], "drop": (dt or "")[:90],
+                                "years": [ky, dy], "types": [ktype, dtype]})
+            continue
+        keeps.add(keep); drops.add(drop); chosen.append((keep, drop))
+        if samples is not None and len(samples) < 400:
+            samples.append({"verdict": "merge", "doi": doi, "keep": (kt or "")[:90], "drop": (dt or "")[:90],
+                            "years": [ky, dy], "types": [ktype, dtype], "keep_id": keep, "drop_id": drop})
+    conn.executemany("INSERT INTO pairs (keep_id, drop_id) VALUES (?, ?)", chosen)
+    stats = _apply_pairs(conn, rule="doi_collision")
+    stats.update(veto)
+    stats["candidates"] = len(rows)
+    return stats
+
+
+def run_doi_collision_merge(db_path: Optional[Path | str] = None, max_merges: int = 5000,
+                            dry_run: bool = True, report_path: Optional[Path | str] = None) -> Dict[str, Any]:
+    """Merge the duplicate pairs exposed by DOI collisions. dry_run=True does every step in
+    a transaction and rolls it back, so the report shows exactly what a write would do."""
+    from .config import get_config
+    start = time.time()
+    db_path = Path(db_path or get_config().db_path).expanduser()
+    report_path = Path(report_path) if report_path else db_path.parent / (
+        f"doi-collision-merge-{'dry' if dry_run else 'write'}-{datetime.now():%Y%m%d-%H%M}.json")
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    before = _scalar(conn, "SELECT COUNT(*) FROM refs")
+    samples: list = []
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("DROP TRIGGER IF EXISTS refs_ad")
+    conn.execute("DROP TRIGGER IF EXISTS refs_au")
+    try:
+        stats = _run_doi_collision_batch(conn, max_merges, samples)
+        after = _scalar(conn, "SELECT COUNT(*) FROM refs")
+        _recreate_fts_triggers(conn)
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    report = {"dry_run": dry_run, "before_total_refs": before, "after_total_refs": after,
+              "merged": before - after, "stats": stats, "elapsed_seconds": round(time.time() - start, 2),
+              "samples": samples}
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    report["report_path"] = str(report_path)
+    return report
+
+
 def run_dedup_all(
     db_path: Optional[Path | str] = None,
     max_merges: int = 50_000,
@@ -678,6 +841,11 @@ def run_dedup_all(
                 break
             stats = _run_identifier_batch(conn, ident, remaining)
             stats["rule"] = f"same_{ident}"
+            passes.append(stats)
+            remaining -= stats["merged"]
+        if remaining > 0:                          # pairs a verified DOI exposed (doi_collisions)
+            stats = _run_doi_collision_batch(conn, remaining)
+            stats["rule"] = "doi_collision"
             passes.append(stats)
             remaining -= stats["merged"]
 

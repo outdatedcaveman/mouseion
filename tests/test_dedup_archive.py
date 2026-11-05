@@ -54,3 +54,15 @@ def test_dedup_archives_and_vetoes(tmp_path):
     # an already-flagged duplicate leaves the live table for the archive
     assert marked not in live and marked in archived
     assert any(p.get("vetoed_title_mismatch") for p in report["passes"])
+
+
+def test_doi_collision_titles_and_chrome():
+    from mouseion.maintenance_dedup import _titles_agree_strictly, _without_site_chrome, _clean_markup_title
+    assert not _titles_agree_strictly("Lecture Notes in Computer Science 2952", "Lecture Notes in Computer Science 5203")
+    assert not _titles_agree_strictly("Background geometry of DLCQ M theory on a p", "The Background Geometry of DLCQ Supergravity")
+    assert _titles_agree_strictly("Revision Without Revision Sequences", "Revision Without Revision Sequences: Circular Definitions")
+    assert _titles_agree_strictly("Eloge Eduard Farber 1892", "Éloge: Eduard Farber, 1892-1969")
+    assert _without_site_chrome("Physics | Free Full-Text | Fluctuations-Induced Quantum Radiation",
+                                ["Fluctuations-Induced Quantum Radiation"]) == "Fluctuations-Induced Quantum Radiation"
+    assert _clean_markup_title("<i>Post hoc</i> Verification") == "Post hoc Verification"
+    assert _clean_markup_title("When x < y holds") == "When x < y holds"
