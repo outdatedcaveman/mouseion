@@ -63,3 +63,12 @@ def test_colliding_doi_is_recorded_not_silently_dropped(tmp_path):
         rows = conn.execute("SELECT ref_id, doi, holder_id FROM doi_collisions").fetchall()
     assert [tuple(r) for r in rows] == [(b, "10.3390/physics5020040", a)]
     db.close()
+
+
+def test_title_word_authors_cannot_veto(G):
+    seed = Reference(title="A Problem Solving Approa", authors=[Author(family="Maple"), Author(family="Mathematica")])
+    cand = Reference(title="Maple and Mathematica: A Problem Solving Approach for Mathematics",
+                     authors=[Author(family="Shingareva", given="Inna")])
+    assert G.P._authors_are_title_words(seed, cand)
+    real = Reference(title="x", authors=[Author(family="Maple", given="J.")])
+    assert not G.P._authors_are_title_words(real, cand)            # a given name: a real author

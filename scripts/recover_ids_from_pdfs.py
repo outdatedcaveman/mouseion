@@ -253,8 +253,24 @@ def _agrees_with_ref(seed, cand) -> bool:
         return False
     import recover_ids as R
     names = R._name_tokens(seed)
-    if names and not (names & R._name_tokens(cand)):
+    if names and not (names & R._name_tokens(cand)) and not _authors_are_title_words(seed, cand):
         return False
+    return True
+
+
+def _authors_are_title_words(seed, cand) -> bool:
+    """File-name imports turned title words into 'authors' ("Maple and Mathematica - ..."
+    -> authors Maple, Mathematica, no given names). Such authors cannot veto a record:
+    every one has no given name AND every family name is a word of the record's title."""
+    auth = list(seed.authors or [])
+    if not auth:
+        return False
+    words = set(_norm(getattr(cand, "title", "") or "").split())
+    for a in auth:
+        fam = getattr(a, "family", None) if not isinstance(a, dict) else a.get("family")
+        giv = getattr(a, "given", None) if not isinstance(a, dict) else a.get("given")
+        if (giv or "").strip() or not fam or not set(_norm(fam).split()) <= words:
+            return False
     return True
 
 

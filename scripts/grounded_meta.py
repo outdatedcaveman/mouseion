@@ -179,11 +179,16 @@ def _write_doi(conn, stamp, rid, kind, doi, cand, via, exact=False) -> str:
         # record's title, let it give way (resolve_lossy's verified_title, same reason)
         sw = _WORDS.findall((seed.title or "").lower())
         cw = _WORDS.findall(((cand.title if cand else "") or "").lower())
-        if sw and len(cw) > len(sw) and cw[:len(sw)] == sw:
-            exact = True
+        # ...or a fragment from inside it ("A Problem Solving Approa" of "Maple and
+        # Mathematica: A Problem Solving Approach ..."): a contiguous run of its words
+        if sw and len(cw) > len(sw):
+            tail_cut = sw[:-1] if len(sw) > 2 else sw          # the last word may be cut off
+            n = len(tail_cut)
+            if any(cw[i:i + n] == tail_cut for i in range(len(cw) - n + 1)):
+                exact = True
     if seed is not None and cand is not None:
         names = R._name_tokens(seed)
-        if names and not (names & R._name_tokens(cand)):
+        if names and not (names & R._name_tokens(cand)) and not P._authors_are_title_words(seed, cand):
             STATS["author_mismatch"] += 1
             return "author_mismatch"
     res = P._apply(conn, stamp, rid, kind, doi, cand, verified_title=exact, log_scan=False)
