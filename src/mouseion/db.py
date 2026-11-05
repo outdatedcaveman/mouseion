@@ -805,6 +805,20 @@ class RefDatabase:
                     current = conn.execute(
                         "SELECT doi FROM refs WHERE id = ?", (ref_id,),
                     ).fetchone()
+                    # A verified DOI held by another row means the two rows are very likely
+                    # the same work. Dropping it silently hid ~4,900 such pairs (found
+                    # 2026-11-04); record the pair so a duplicate review can merge them.
+                    if not (current and current["doi"]):
+                        try:
+                            conn.execute(
+                                "CREATE TABLE IF NOT EXISTS doi_collisions (ref_id TEXT, doi TEXT, "
+                                "holder_id TEXT, source TEXT, seen_at TEXT DEFAULT (datetime('now')), "
+                                "PRIMARY KEY (ref_id, doi))")
+                            conn.execute(
+                                "INSERT OR IGNORE INTO doi_collisions (ref_id, doi, holder_id, source) "
+                                "VALUES (?, ?, ?, 'replace_ref')", (ref_id, row["doi"], existing["id"]))
+                        except sqlite3.Error:
+                            pass
                     row["doi"] = current["doi"] if current else None
 
             cols = list(row.keys())

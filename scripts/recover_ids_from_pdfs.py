@@ -387,12 +387,14 @@ def _scan_and_resolve(ref_id, drive_id, local):
     return rid, kind, ident, cand
 
 
-def _apply(conn, stamp, rid, kind, ident, cand, verified_title=False):
+def _apply(conn, stamp, rid, kind, ident, cand, verified_title=False, log_scan=True):
     """Main thread only (one SQLite connection): verify, merge, back up, write, log.
     verified_title: the caller has already matched a DAMAGED title against the
     candidate (resolve_lossy); the damaged title must then give way, or Mouseion's
     merge drops the candidate as a title mismatch ("Mechanics in Six" vs
-    "Mechanics in Six-Dimensional Spacetime": 11 of 53 verified would be written)."""
+    "Mechanics in Six-Dimensional Spacetime": 11 of 53 verified would be written).
+    log_scan=False: a caller with its own ledger (grounded_meta) leaves pdf_id_scan alone.
+    Returns the verdict: no_record | title_mismatch | improved | no_gain."""
     seed = DB.get(rid)
     seed = _clean_seed(seed) if seed is not None else None
     original_title = seed.title if seed is not None else None
@@ -434,9 +436,10 @@ def _apply(conn, stamp, rid, kind, ident, cand, verified_title=False):
                                  (rid, json.dumps(dict(zip(cols, row)), default=str)))
                     conn.commit()
                     DB.replace_ref(rid, merged)
-    if WRITE:
+    if WRITE and log_scan:
         conn.execute("INSERT OR REPLACE INTO pdf_id_scan (ref_id, result, found_id) VALUES (?,?,?)",
                      (rid, f"{kind}:{result}", ident))
+    return result
 
 
 def retry_logged():
