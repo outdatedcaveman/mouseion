@@ -50,8 +50,8 @@ FETCHER_VERSION = "v3"   # v3: every repository copy (OpenAlex locations, Europe
 
 
 # ---- per-source tally: which strategy was tried and which one found the PDF ----
-import contextvars as _cv
-import threading as _th
+import contextvars as _cv  # noqa: E402
+import threading as _th  # noqa: E402
 
 _SRC: "_cv.ContextVar[str]" = _cv.ContextVar("pdf_source", default="")
 _TALLY_LOCK = _th.Lock()
@@ -629,7 +629,7 @@ async def _stream_download(
 
     Uses chunked streaming (64 KB) so large PDFs are never fully buffered.
     Cleans up partial files on failure.
-    
+
     If follow_html_links is True and the URL returns HTML, attempts to parse
     and download candidate PDF links from the page.
     """
@@ -649,7 +649,7 @@ async def _stream_download(
                 if resp.status_code != 200:
                     return False
                 content_type = resp.headers.get("content-type", "")
-                
+
                 # Check if it's HTML
                 if "html" in content_type.lower() or "text/xml" in content_type.lower():
                     body_bytes = await resp.aread()
@@ -700,12 +700,12 @@ async def _stream_download(
         from urllib.parse import urljoin
         soup = BeautifulSoup(html_content, "html.parser")
         candidates = []
-        
+
         # 1. citation_pdf_url meta tags
         for meta in soup.find_all("meta", attrs={"name": "citation_pdf_url"}):
             if meta.get("content"):
                 candidates.append(meta["content"])
-                
+
         # 2. regular links
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -713,7 +713,7 @@ async def _stream_download(
             text_lower = a.get_text(strip=True).lower()
             if ".pdf" in href_lower or "pdf" in text_lower or "download" in text_lower:
                 candidates.append(href)
-                
+
         seen = set()
         resolved_candidates = []
         for c in candidates:
@@ -721,7 +721,7 @@ async def _stream_download(
             if full_url not in seen and full_url.startswith("http"):
                 seen.add(full_url)
                 resolved_candidates.append(full_url)
-                
+
         for cand_url in resolved_candidates[:5]:
             try:
                 # Attempt to download the candidate (do not follow nested HTML pages)
@@ -731,7 +731,7 @@ async def _stream_download(
                 raise
             except Exception:
                 pass
-                
+
     return False
 
 
@@ -772,8 +772,8 @@ async def _crossref_fulltext_links(client: httpx.AsyncClient, doi: str, cfg) -> 
     except (httpx.RequestError, ValueError):
         return []
     out: List[Tuple[str, dict]] = []
-    for l in sorted(links, key=lambda x: 0 if "pdf" in (x.get("content-type") or "") else 1):
-        url = l.get("URL") or ""
+    for link in sorted(links, key=lambda x: 0 if "pdf" in (x.get("content-type") or "") else 1):
+        url = link.get("URL") or ""
         host = url.split("/")[2].lower() if url.count("/") >= 2 else ""
         kind = _KEY_API.get(host)
         if kind == "elsevier":
@@ -823,10 +823,10 @@ async def _repository_copies(client: httpx.AsyncClient, ref: Reference, cfg) -> 
             if r.status_code == 200:
                 w = r.json()
                 locs = w.get("locations") or []
-                locs.sort(key=lambda l: (not l.get("is_oa"), l.get("version") != "publishedVersion"))
-                for l in locs:
-                    if l.get("is_oa") or l.get("pdf_url"):
-                        add(pdf=l.get("pdf_url"), page=l.get("landing_page_url") if l.get("is_oa") else None)
+                locs.sort(key=lambda loc: (not loc.get("is_oa"), loc.get("version") != "publishedVersion"))
+                for loc in locs:
+                    if loc.get("is_oa") or loc.get("pdf_url"):
+                        add(pdf=loc.get("pdf_url"), page=loc.get("landing_page_url") if loc.get("is_oa") else None)
                 pmcid = ((w.get("ids") or {}).get("pmcid") or "").rstrip("/").split("/")[-1]
                 if pmcid:
                     pmcids.append(pmcid)
@@ -839,8 +839,8 @@ async def _repository_copies(client: httpx.AsyncClient, ref: Reference, cfg) -> 
             async with network_slot("pdf_lookup", bucket="unpaywall"):
                 r = await client.get(f"https://api.unpaywall.org/v2/{doi}", params={"email": email}, timeout=20.0)
             if r.status_code == 200:
-                for l in r.json().get("oa_locations") or []:
-                    add(pdf=l.get("url_for_pdf"), page=l.get("url_for_landing_page"))
+                for loc in r.json().get("oa_locations") or []:
+                    add(pdf=loc.get("url_for_pdf"), page=loc.get("url_for_landing_page"))
         except (httpx.RequestError, ValueError):
             pass
     # Europe PMC: open full text by DOI
@@ -1173,7 +1173,7 @@ async def _annas_archive_lookup(
 
                 html = resp.text
                 soup = BeautifulSoup(html, "html.parser")
-                
+
                 # Find all md5 result links and their texts
                 results_found = []
                 for a in soup.find_all("a", href=True):
@@ -1229,7 +1229,7 @@ async def _annas_archive_lookup(
                     r'href="(https?://[^"]+)"[^>]*>\s*(?:.*?(?:download|Libgen|fast|slow|partner|IPFS|gateway|option|sci-hub|z-library))',
                     resp2.text, re.I
                 )
-                
+
                 if not download_links:
                     # Fallback to parsing all external download subdomain links
                     download_links = re.findall(
@@ -1497,7 +1497,7 @@ async def _ddg_pdf_search(
     from .api_router import get_router
     from rapidfuzz import fuzz
     import json
-    
+
     router = get_router()
 
     if not ref.title or len(ref.title) < 10:
@@ -1505,7 +1505,7 @@ async def _ddg_pdf_search(
 
     # Try both quoted search and unquoted fallback search
     clean_title = ref.title.strip().replace('"', '')
-    
+
     # 1. Quoted search query
     quoted_query = f'"{clean_title}" filetype:pdf'
     if ref.authors:
@@ -1534,7 +1534,7 @@ async def _ddg_pdf_search(
     for query, is_quoted in [(quoted_query, True), (unquoted_query, False)]:
         if not await router.acquire("duckduckgo", max_wait=60.0):
             raise TemporaryDownloadError("DuckDuckGo lock acquisition timeout")
-            
+
         logger.info("DDG PDF Search: searching for '%s'", query)
         try:
             results = await _search_duckduckgo(query, client, max_results=5)
@@ -1547,13 +1547,13 @@ async def _ddg_pdf_search(
                     return False
                 continue
             _web_state["fails"] = 0
-                
+
             for res in results:
                 url = res.get("url", "")
                 res_title = res.get("title", "")
                 if not url:
                     continue
-                
+
                 # Check similarity if it's an unquoted search or for extra safety
                 if res_title and ref.title:
                     target_title_lower = ref.title.lower()

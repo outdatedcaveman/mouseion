@@ -165,8 +165,8 @@ def _as_list(v) -> List[str]:
 
 
 def _first(v) -> str:
-    l = _as_list(v)
-    return l[0] if l else ""
+    items = _as_list(v)
+    return items[0] if items else ""
 
 
 def parse_response(body: bytes | str) -> List[dict]:

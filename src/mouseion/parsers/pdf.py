@@ -109,7 +109,8 @@ def parse_pdf_file(path: str | Path) -> Reference:
 
 def parse_pdf_bytes(data: bytes, filename: str = "upload.pdf") -> Reference:
     """Extract metadata from PDF bytes (for file uploads)."""
-    import tempfile, os
+    import tempfile
+    import os
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
         f.write(data)
         tmp = f.name

@@ -752,7 +752,9 @@ def _run_doi_collision_batch(conn: sqlite3.Connection, max_merges: int, samples:
                 samples.append({"verdict": why, "doi": doi, "keep": (kt or "")[:90], "drop": (dt or "")[:90],
                                 "years": [ky, dy], "types": [ktype, dtype]})
             continue
-        keeps.add(keep); drops.add(drop); chosen.append((keep, drop))
+        keeps.add(keep)
+        drops.add(drop)
+        chosen.append((keep, drop))
         if samples is not None and len(samples) < 400:
             samples.append({"verdict": "merge", "doi": doi, "keep": (kt or "")[:90], "drop": (dt or "")[:90],
                             "years": [ky, dy], "types": [ktype, dtype], "keep_id": keep, "drop_id": drop})

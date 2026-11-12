@@ -590,7 +590,7 @@ async def batch_openlibrary(
                         retry_after = float(resp.headers.get("Retry-After", 60.0))
                     except (TypeError, ValueError):
                         retry_after = 60.0
-                    cache.set_cooldown("openlibrary", time.time() + 600.0)
+                    cache.set_cooldown("openlibrary", time.time() + max(600.0, retry_after))
                     logger.warning("OpenLibrary batch: HTTP %d, cooling down, skipping chunk", resp.status_code)
                     return
 
