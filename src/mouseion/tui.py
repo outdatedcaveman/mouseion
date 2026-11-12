@@ -699,9 +699,11 @@ class MouseionApp(App):
             f"https://doi.org/{ref.doi}" if ref.doi else None
         )
         if url:
-            import sys, subprocess
+            import sys
+            import subprocess
             if sys.platform == "win32":
-                import os; os.startfile(url)
+                import os
+                os.startfile(url)
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", url])
             else:

@@ -76,6 +76,7 @@ class Config:
     brave_api_key: str = ""         # Brave Search API: independent index, ~1,000 free a month
     gemini_search_api_key: str = "" # Gemini API key for Google-grounded search (billing on; 5,000 free searches a month)
     base_search_api_key: str = ""   # BASE (base-search.net) apikey; alternative to a registered IP
+    alphaxiv_enabled: bool = False  # alphaXiv full-text title search -> arXiv id/abstract (opt-in, no key needed)
 
     # --- LLM ---
     llm_api_key: str = ""
@@ -207,6 +208,7 @@ _TOML_MAP = {
         "brave_api_key": "brave_api_key",
         "gemini_search_api_key": "gemini_search_api_key",
         "base_search_api_key": "base_search_api_key",
+        "alphaxiv_enabled": "alphaxiv_enabled",
     },
     "llm": {
         "api_key": "llm_api_key",
@@ -296,6 +298,7 @@ _ENV_MAP: Dict[str, str] = {
     "MOUSEION_GEMINI_SEARCH_API_KEY":       "gemini_search_api_key",
     "MOUSEION_BASE_SEARCH_API_KEY":         "base_search_api_key",
     "MOUSEION_BASE_SEARCH_ENABLED":         "base_search_enabled",
+    "MOUSEION_ALPHAXIV_ENABLED":            "alphaxiv_enabled",
     "MOUSEION_LLM_API_KEY":                "llm_api_key",
     "MOUSEION_LLM_PROVIDER":               "llm_provider",
     "MOUSEION_NOTION_API_KEY":             "notion_api_key",
@@ -394,6 +397,7 @@ def _render_toml(cfg: Config) -> str:
         f'brave_api_key              = {_q(cfg.brave_api_key)}',
         f'gemini_search_api_key      = {_q(cfg.gemini_search_api_key)}',
         f'base_search_api_key        = {_q(cfg.base_search_api_key)}  # BASE apikey (or register your IP)',
+        f"alphaxiv_enabled           = {str(cfg.alphaxiv_enabled).lower()}  # alphaXiv title search -> arXiv id (opt-in)",
         "",
         "[llm]",
         f'api_key  = {_q(cfg.llm_api_key)}',

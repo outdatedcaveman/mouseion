@@ -110,7 +110,7 @@ def _build_service(interactive: bool = False):
                 "Set GOOGLE_DRIVE_CREDENTIALS_JSON (env var) or "
                 "google_drive_credentials_path in config.toml."
             )
-        
+
         full_path = _find_client_secret(path)
         if full_path is None:
             raise FileNotFoundError(f"Credentials file not found at {Path(path).expanduser()}")
@@ -138,7 +138,7 @@ def _build_service(interactive: bool = False):
                         creds.refresh(Request())
                     except Exception:
                         creds = None
-                
+
                 if not creds or not creds.valid:
                     # The consent flow opens a browser tab: only on an explicit
                     # request (`mouseion drive-auth`), never from a background
@@ -151,7 +151,7 @@ def _build_service(interactive: bool = False):
                         str(full_path), _SCOPES
                     )
                     creds = flow.run_local_server(port=0)
-                
+
                 with open(str(token_path), "w") as token:
                     token.write(creds.to_json())
 

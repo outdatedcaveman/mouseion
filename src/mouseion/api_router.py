@@ -71,6 +71,7 @@ _DEFAULT_LIMITS: Dict[str, Limit] = {
     "dblp":             Limit(per_min=60,  per_day=10_000,  min_interval=0.5),
     "arxiv":            Limit(per_min=30,  per_day=20_000,  min_interval=0.3),
     "arxiv_api":        Limit(per_min=30,  per_day=20_000,  min_interval=0.3),
+    "alphaxiv":         Limit(per_min=40,  per_day=10_000,  min_interval=1.0),  # public, no key; stay polite
     "openlibrary":      Limit(per_min=60,  per_day=30_000,  min_interval=0.2),
     "google_books":     Limit(per_min=60,  per_day=10_000,  min_interval=0.2),
     # --- PDF / OA discovery (these were the silent quota killers) ---

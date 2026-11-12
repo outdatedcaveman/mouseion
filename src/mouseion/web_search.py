@@ -247,7 +247,7 @@ _META_ABSTRACT_NAMES = [
 
 
 
-import time
+import time  # noqa: E402
 _domain_locks = {}
 _domain_cache_lock = asyncio.Lock()
 
@@ -256,16 +256,16 @@ async def _acquire_domain_lock(url: str):
     domain = urlparse(url).netloc
     if not domain:
         return
-    
+
     async with _domain_cache_lock:
         if domain not in _domain_locks:
             _domain_locks[domain] = 0.0
-    
+
     now = time.time()
     last_hit = _domain_locks[domain]
     if now - last_hit < 1.0:
         await asyncio.sleep(1.0 - (now - last_hit))
-    
+
     _domain_locks[domain] = time.time()
 
 async def _scrape_page_metadata(
@@ -279,7 +279,7 @@ async def _scrape_page_metadata(
         await _acquire_domain_lock(url)
         async with network_slot("metadata", bucket=bucket_from_url(url), min_interval=0.1):
             resp = await client.get(url, follow_redirects=True)
-        
+
         # --- Wayback Machine Fallback ---
         if resp.status_code in (404, 403, 410, 500, 502, 503, 504):
             try:
@@ -294,7 +294,7 @@ async def _scrape_page_metadata(
                             resp = await client.get(archived["url"], follow_redirects=True)
             except Exception:
                 pass
-                
+
         if resp.status_code != 200:
             return None
 
@@ -307,10 +307,10 @@ async def _scrape_page_metadata(
                 from pdfminer.high_level import extract_text
                 # Extract text from just the first 2 pages (the title page / header)
                 text = extract_text(io.BytesIO(resp.content), maxpages=2)
-                
+
                 ref = Reference()
                 ref.url = url
-                
+
                 # Hunt for DOI in the raw text
                 import re
                 m = re.search(r'10\.\d{4,}/[^\s"\'<>]+', text)

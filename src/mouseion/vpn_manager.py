@@ -83,7 +83,7 @@ def is_vpn_connected_locally(cfg: Config) -> bool:
     """Return True if the VPN connection is active based on network status."""
     if not cfg.vpn_gateway:
         return True
-        
+
     # 1. If USP gateway, check if we have a USP IP or a VPN-related private IP
     if "usp.br" in cfg.vpn_gateway.lower():
         try:
@@ -103,7 +103,7 @@ def is_vpn_connected_locally(cfg: Config) -> bool:
                         socket.gethostname(), None, socket.AF_INET
                     )
                 ]
-            
+
             for ip in ips:
                 # USP address space: only a tunnel (or being on campus) gives one
                 if ip.startswith("143.107."):
@@ -119,7 +119,7 @@ def is_vpn_connected_locally(cfg: Config) -> bool:
         # (The old UDP probe of USP's DNS is gone: 143.107.253.3 answers from
         # the public internet, so it "proved" a tunnel that was not there.)
         return False
-        
+
     return True
 
 
@@ -141,7 +141,7 @@ def _adapter_descriptions() -> Dict[str, str]:
             text=True, errors="ignore", timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
         import csv
         import io
-        rows = csv.DictReader(io.StringIO("\n".join(l for l in out.splitlines() if l.strip())))
+        rows = csv.DictReader(io.StringIO("\n".join(ln for ln in out.splitlines() if ln.strip())))
         _ADAPTER_DESC = {r["NetConnectionID"]: r.get("Description") or "" for r in rows if r.get("NetConnectionID")}
         _ADAPTER_DESC_AT = time.time()
     except Exception as e:
@@ -172,7 +172,7 @@ def _log_tail(n: int = 12) -> str:
     try:
         cfg = get_config()
         lines = (Path(cfg.db_path).parent / "vpn_stdout.log").read_text(encoding="utf-8", errors="ignore").splitlines()
-        body = [l for l in lines if l.strip() and not l.startswith("--- VPN SESSION")]
+        body = [ln for ln in lines if ln.strip() and not ln.startswith("--- VPN SESSION")]
         return "\n".join(body[-n:])
     except Exception:
         return ""
@@ -230,11 +230,11 @@ def _ensure_vpn_adapters_enabled() -> None:
         ]
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         out = subprocess.check_output(cmd, text=True, creationflags=flags, errors="ignore")
-        
+
         # Parse CSV output
         import csv
         import io
-        
+
         # Filter lines and parse
         lines = [line.strip() for line in out.splitlines() if line.strip()]
         if len(lines) > 1:
@@ -245,7 +245,7 @@ def _ensure_vpn_adapters_enabled() -> None:
                 desc = row.get("Description", "")
                 if not net_id:
                     continue
-                
+
                 # Check if it matches Fortinet, TAP, or Cisco
                 match_terms = ["fortinet", "tap", "cisco"]
                 is_vpn = any(term in name.lower() or term in desc.lower() or term in net_id.lower() for term in match_terms)
@@ -270,7 +270,7 @@ def _log_subprocess_output(proc: subprocess.Popen, log_path: Path) -> None:
                 for line in proc.stdout:
                     f.write(line)
                     f.flush()
-                f.write(f"\n--- VPN SESSION ENDED ---\n")
+                f.write("\n--- VPN SESSION ENDED ---\n")
                 f.flush()
         except Exception as e:
             logger.error("Error in VPN log reader: %s", e)
@@ -339,7 +339,7 @@ def start_vpn(cfg: Config) -> Dict[str, Any]:
                 ]
 
                 logger.info("Starting OpenConnect VPN: %s", " ".join(cmd))
-                
+
                 # Start process redirecting output to log files (prevents pipe deadlock)
                 proc = subprocess.Popen(
                     cmd,

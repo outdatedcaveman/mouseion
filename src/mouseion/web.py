@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 import re
 import sys
 import threading
@@ -20,6 +21,8 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, Response, abort, jsonify, redirect, request, send_file
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +428,8 @@ def list_refs():
                 ]
         return jsonify({"refs": result, "total": total, "offset": offset, "limit": limit})
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
@@ -847,8 +851,8 @@ def list_tags():
 # and PDF web addresses -- identify, match the library, complete, link.
 # (The Add dialog posted dropped PDFs to /api/pdfs/ingest, which did not exist.)
 # ---------------------------------------------------------------------------
-from pathlib import Path
-from .db import RefDatabase
+from pathlib import Path  # noqa: E402
+from .db import RefDatabase  # noqa: E402
 
 _ingest_index = {"idx": None, "at": 0.0}
 
@@ -1028,7 +1032,8 @@ def import_file():
                         all_ids.extend(ids)
                     inserted += len(chunk)
                 except Exception:
-                    import traceback; traceback.print_exc()
+                    import traceback
+                    traceback.print_exc()
                     insert_errors += len(chunk)
 
                 done_so_far = inserted + insert_errors
@@ -1053,7 +1058,8 @@ def import_file():
                     from .enrich_daemon import start as _start_daemon
                     _start_daemon()
                 except Exception:
-                    import traceback; traceback.print_exc()
+                    import traceback
+                    traceback.print_exc()
 
             msg = f"Imported {inserted:,} references"
             if insert_errors:
@@ -1501,7 +1507,7 @@ def get_pdf_status():
         status_copy["sources"] = _source_stats()
     except Exception:
         status_copy["sources"] = {}
-    
+
     import time
     now = time.time()
     with _pdf_library_total_cache_lock:
@@ -1543,7 +1549,7 @@ def pdf_config():
     if request.method == "GET":
         with _pdf_status_lock:
             return jsonify({"focus_max_tier": _pdf_fetch_status.get("focus_max_tier", 4)})
-    
+
     # PATCH
     body = request.json or {}
     if "focus_max_tier" in body:
@@ -1641,7 +1647,7 @@ def fetch_all_pdfs():
                 conditions.append("(doi IS NOT NULL AND doi != '')")
             if max_tier >= 4:
                 conditions.append("(title IS NOT NULL AND title != '')")
-            
+
             sub_condition = " OR ".join(conditions) if conditions else "1=0"
 
             with RefDatabase() as db:
@@ -1745,7 +1751,7 @@ def fetch_all_pdfs():
                     with _pdf_status_lock:
                         if _pdf_fetch_status.get("stop_requested"):
                             break
-                    
+
                     try:
                         idx, ref = queue.get_nowait()
                     except asyncio.QueueEmpty:
@@ -1812,8 +1818,7 @@ def fetch_all_pdfs():
                                 fetched += 1
                                 checked += 1
                                 current_fetched = fetched
-                                current_checked = checked
-                            
+
                             with _pdf_status_lock:
                                 _pdf_fetch_status["found"] = current_fetched
                                 _pdf_fetch_status["logs"].append(f"  --> SUCCESS: Saved to {result}{drive_msg}")
@@ -1828,18 +1833,16 @@ def fetch_all_pdfs():
                                 failed += 1
                                 checked += 1
                                 current_failed = failed
-                                current_checked = checked
 
                             with _pdf_status_lock:
                                 _pdf_fetch_status["failed"] = current_failed
-                                _pdf_fetch_status["logs"].append(f"  --> FAILED: No PDF link could be resolved/downloaded.")
+                                _pdf_fetch_status["logs"].append("  --> FAILED: No PDF link could be resolved/downloaded.")
                     except Exception as ex:
                         # No refs.db write — the router ledger tracks the miss.
                         with progress_lock:
                             failed += 1
                             checked += 1
                             current_failed = failed
-                            current_checked = checked
 
                         with _pdf_status_lock:
                             _pdf_fetch_status["failed"] = current_failed
@@ -3089,25 +3092,44 @@ def patch_settings_config():
         from .config import get_config, save_config
         c = get_config()
         body = request.json or {}
-        if "llm_provider" in body: c.llm_provider = body["llm_provider"]
-        if "llm_api_key" in body: c.llm_api_key = body["llm_api_key"]
-        if "semantic_scholar_api_key" in body: c.semantic_scholar_api_key = body["semantic_scholar_api_key"]
-        if "crossref_email" in body: c.crossref_email = body["crossref_email"]
-        if "openalex_email" in body: c.openalex_email = body["openalex_email"]
-        if "openalex_api_key" in body: c.openalex_api_key = body["openalex_api_key"]
-        if "elsevier_api_key" in body: c.elsevier_api_key = body["elsevier_api_key"]
-        if "wiley_tdm_token" in body: c.wiley_tdm_token = body["wiley_tdm_token"]
-        if "google_books_api_key" in body: c.google_books_api_key = body["google_books_api_key"]
-        if "serper_api_key" in body: c.serper_api_key = body["serper_api_key"]
-        if "tavily_api_key" in body: c.tavily_api_key = body["tavily_api_key"]
-        if "brave_api_key" in body: c.brave_api_key = body["brave_api_key"]
-        if "gemini_search_api_key" in body: c.gemini_search_api_key = body["gemini_search_api_key"]
-        if "vpn_enabled" in body: c.vpn_enabled = bool(body["vpn_enabled"])
-        if "vpn_type" in body: c.vpn_type = body["vpn_type"]
-        if "vpn_protocol" in body: c.vpn_protocol = body["vpn_protocol"]
-        if "vpn_gateway" in body: c.vpn_gateway = body["vpn_gateway"]
-        if "vpn_username" in body: c.vpn_username = body["vpn_username"]
-        if "vpn_password" in body: c.vpn_password = body["vpn_password"]
+        if "llm_provider" in body:
+            c.llm_provider = body["llm_provider"]
+        if "llm_api_key" in body:
+            c.llm_api_key = body["llm_api_key"]
+        if "semantic_scholar_api_key" in body:
+            c.semantic_scholar_api_key = body["semantic_scholar_api_key"]
+        if "crossref_email" in body:
+            c.crossref_email = body["crossref_email"]
+        if "openalex_email" in body:
+            c.openalex_email = body["openalex_email"]
+        if "openalex_api_key" in body:
+            c.openalex_api_key = body["openalex_api_key"]
+        if "elsevier_api_key" in body:
+            c.elsevier_api_key = body["elsevier_api_key"]
+        if "wiley_tdm_token" in body:
+            c.wiley_tdm_token = body["wiley_tdm_token"]
+        if "google_books_api_key" in body:
+            c.google_books_api_key = body["google_books_api_key"]
+        if "serper_api_key" in body:
+            c.serper_api_key = body["serper_api_key"]
+        if "tavily_api_key" in body:
+            c.tavily_api_key = body["tavily_api_key"]
+        if "brave_api_key" in body:
+            c.brave_api_key = body["brave_api_key"]
+        if "gemini_search_api_key" in body:
+            c.gemini_search_api_key = body["gemini_search_api_key"]
+        if "vpn_enabled" in body:
+            c.vpn_enabled = bool(body["vpn_enabled"])
+        if "vpn_type" in body:
+            c.vpn_type = body["vpn_type"]
+        if "vpn_protocol" in body:
+            c.vpn_protocol = body["vpn_protocol"]
+        if "vpn_gateway" in body:
+            c.vpn_gateway = body["vpn_gateway"]
+        if "vpn_username" in body:
+            c.vpn_username = body["vpn_username"]
+        if "vpn_password" in body:
+            c.vpn_password = body["vpn_password"]
         save_config(c)
         return jsonify({"ok": True})
     except Exception as e:
@@ -3132,14 +3154,19 @@ def toggle_vpn_endpoint():
         from .vpn_manager import start_vpn, stop_vpn, get_vpn_status
         body = request.json or {}
         enabled = body.get("enabled", False)
-        
+
         c = get_config()
-        if "gateway" in body: c.vpn_gateway = body["gateway"]
-        if "username" in body: c.vpn_username = body["username"]
-        if "password" in body: c.vpn_password = body["password"]
-        if "type" in body: c.vpn_type = body["type"]
-        if "protocol" in body: c.vpn_protocol = body["protocol"]
-        
+        if "gateway" in body:
+            c.vpn_gateway = body["gateway"]
+        if "username" in body:
+            c.vpn_username = body["username"]
+        if "password" in body:
+            c.vpn_password = body["password"]
+        if "type" in body:
+            c.vpn_type = body["type"]
+        if "protocol" in body:
+            c.vpn_protocol = body["protocol"]
+
         if enabled:
             c.vpn_enabled = True
             save_config(c)
@@ -4603,13 +4630,13 @@ kbd {
     </p>
     <textarea class="modal-ta" id="add-ta"
       placeholder="10.1038/nature12373&#10;arXiv:1706.03762&#10;https://…"></textarea>
-    
+
     <div id="add-dropzone" style="border:2px dashed var(--border);border-radius:8px;padding:16px;text-align:center;margin:10px 0;background:var(--bg);cursor:pointer;transition:all .2s;font-size:12px">
       <div style="font-size:18px;margin-bottom:4px">📥</div>
       <div style="font-weight:600">Drag &amp; Drop PDFs here to parse &amp; add to library</div>
       <input type="file" id="add-file-input" multiple accept=".pdf" style="display:none">
     </div>
-    
+
     <div class="modal-status" id="add-st"></div>
     <div class="modal-foot">
       <button class="btn btn-ghost" id="btn-paste-clipboard" title="Paste from clipboard" style="margin-right:auto">📋 Paste</button>
@@ -4942,7 +4969,7 @@ kbd {
   <div class="modal-box" style="width:600px;max-width:90%;max-height:85vh;overflow-y:auto">
     <h2>📄 Scorched Earth PDF Engine</h2>
     <p class="modal-hint">Ingest and fetch academic PDFs for your reference library</p>
-    
+
     <p style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.4">
       This engine will recursively search OpenAlex, Unpaywall, arXiv, Semantic Scholar, Core.ac.uk, and the open web for open access PDFs, downloading them to your Google Drive and linking them directly to your library.
     </p>
@@ -4974,7 +5001,7 @@ kbd {
         <span style="color:var(--muted);font-size:11px">Total Targets</span>
       </div>
     </div>
-    
+
     <!-- Tier Breakdown Panel -->
     <div id="pdf-source-stats" style="margin-bottom:12px"></div>
     <div id="pdf-tier-breakdown" style="margin-bottom:16px;padding:12px 14px;background:var(--panel);border:1px solid var(--border);border-radius:8px"></div>
@@ -4993,7 +5020,7 @@ kbd {
 
     <div style="font-size:12px;font-weight:600;margin-bottom:8px">Engine Logs</div>
     <div id="pdf-engine-log" style="background:#111;color:#0f0;font-family:var(--mono);font-size:11px;padding:12px;border-radius:6px;height:180px;overflow-y:auto;white-space:pre-wrap">Waiting to start...</div>
-    
+
     <div class="modal-foot">
       <button class="btn btn-ghost" onclick="document.getElementById('pdf-modal').classList.remove('open')">Close</button>
     </div>
@@ -5351,7 +5378,7 @@ async function openSettings(msg) {
       document.getElementById('cfg-brave-api-key').value = cd.brave_api_key || '';
       document.getElementById('cfg-gemini-search-api-key').value = cd.gemini_search_api_key || '';
       document.getElementById('cfg-cr-email').value = cd.crossref_email || cd.openalex_email || '';
-      
+
       // Load VPN configuration
       document.getElementById('cfg-vpn-type').value = cd.vpn_type || 'openconnect';
       document.getElementById('cfg-vpn-protocol').value = cd.vpn_protocol || 'anyconnect';
@@ -5721,19 +5748,19 @@ document.addEventListener('keydown', e => {
       }
       return;
     }
-    
+
     if (_lastSelIdx === -1) {
       _lastSelIdx = curIdx;
       selectedIds.add(selId);
     }
-    
+
     const targetIdx = isDown ? curIdx + 1 : curIdx - 1;
     if (targetIdx >= 0 && targetIdx < refs.length) {
       const targetId = refs[targetIdx].id;
-      
+
       const lo = Math.min(_lastSelIdx, targetIdx);
       const hi = Math.max(_lastSelIdx, targetIdx);
-      
+
       if (_lastTargetIdx !== -1) {
         const prevLo = Math.min(_lastSelIdx, _lastTargetIdx);
         const prevHi = Math.max(_lastSelIdx, _lastTargetIdx);
@@ -5743,11 +5770,11 @@ document.addEventListener('keydown', e => {
           }
         }
       }
-      
+
       for (let i = lo; i <= hi; i++) {
         selectedIds.add(refs[i].id);
       }
-      
+
       _lastTargetIdx = targetIdx;
       selectRef(targetId);
       scrollSelIntoView();
@@ -6129,7 +6156,7 @@ async function refreshPdfProgress() {
   try {
     const r = await apiFetch('/api/pdfs/status');
     const data = await r.json();
-    
+
     // Update logs
     const logBox = document.getElementById('pdf-engine-log');
     if (data.logs && data.logs.length) {
@@ -6138,7 +6165,7 @@ async function refreshPdfProgress() {
     } else {
       logBox.textContent = 'Waiting to start...';
     }
-    
+
     // Render Tier Table
     const tierDiv = document.getElementById('pdf-tier-breakdown');
     if (tierDiv && data.tiers) {
@@ -6149,15 +6176,15 @@ async function refreshPdfProgress() {
         {t:4, label:'T4: Title Search',          color:'#fab387'},
         {t:5, label:'T5: No ID/Title (cannot fetch)', color:'#f38ba8'}
       ];
-      
+
       const tiers = data.tiers;
       const totalTiers = Object.values(tiers).reduce((a,b)=>a+b,0) || 1;
-      
+
       let html = '<table style="width:100%;border-collapse:collapse;font-size:11px">'
         + '<tr style="color:var(--muted)"><th style="text-align:left;padding:2px 4px">Tier</th>'
         + '<th style="text-align:right;padding:2px 4px">Missing PDFs</th>'
         + '<th style="padding:2px 4px;width:40%"></th></tr>';
-        
+
       for (const td of tDefs) {
         const cnt = tiers[td.t] || 0;
         const pct = (cnt / totalTiers * 100).toFixed(1);
@@ -6195,7 +6222,7 @@ async function refreshPdfProgress() {
     if (activeBtn) {
       activeFocus = parseInt(activeBtn.dataset.tier);
     }
-    
+
     // Update stats
     const found = data.found || 0;
     const failed = data.failed || 0;
@@ -6203,21 +6230,21 @@ async function refreshPdfProgress() {
     document.getElementById('pdf-stat-failed').textContent = failed.toLocaleString();
     const libEl = document.getElementById('pdf-stat-library');
     if (libEl && data.library_total != null) libEl.textContent = data.library_total.toLocaleString();
-    
+
     if (data.running) {
       const total = data.total || 0;
       const togo = Math.max(0, total - (found + failed));
       document.getElementById('pdf-stat-togo').textContent = togo.toLocaleString();
       document.getElementById('pdf-stat-total').textContent = total.toLocaleString();
-      
+
       document.getElementById('btn-pdf-start').disabled = true;
       document.getElementById('btn-pdf-stop').disabled = false;
-      
+
       pdfEngineActive = true;
     } else {
       document.getElementById('btn-pdf-start').disabled = false;
       document.getElementById('btn-pdf-stop').disabled = true;
-      
+
       // If not running, calculate targets to go based on focus config
       let potentialTotal = 0;
       if (data.tiers) {
@@ -6227,7 +6254,7 @@ async function refreshPdfProgress() {
       }
       document.getElementById('pdf-stat-togo').textContent = potentialTotal.toLocaleString();
       document.getElementById('pdf-stat-total').textContent = potentialTotal.toLocaleString();
-      
+
       if (pdfEngineActive) {
         pdfEngineActive = false;
         logBox.textContent += '\nEngine finished.';
@@ -6243,15 +6270,15 @@ async function refreshPdfProgress() {
 document.getElementById('btn-pdf-engine').addEventListener('click', async () => {
   const modal = document.getElementById('pdf-modal');
   modal.classList.add('open');
-  
+
   try {
     const cr = await apiFetch('/api/pdfs/config');
     const cd = await cr.json();
     renderPdfFocusBtns(cd.focus_max_tier || 4);
   } catch(e) {}
-  
+
   await refreshPdfProgress();
-  
+
   if (pdfPollTimer) clearInterval(pdfPollTimer);
   pdfPollTimer = setInterval(async () => {
     if (!document.getElementById('pdf-modal').classList.contains('open')) {
@@ -6268,7 +6295,7 @@ async function startPdfEngine() {
   document.getElementById('btn-pdf-stop').disabled = false;
   const logBox = document.getElementById('pdf-engine-log');
   logBox.textContent = 'Starting PDF fetch engine...\n';
-  
+
   try {
     await apiFetch('/api/pdfs/fetch-all', { method: 'POST' });
     logBox.textContent += 'Background task initiated.\nPolling for progress...\n';
@@ -6320,10 +6347,10 @@ async function handleAddModalPdfUpload(files) {
   const statusBox = document.getElementById('add-st');
   statusBox.className = "modal-status s-run";
   statusBox.textContent = `Processing ${files.length} PDF(s)...`;
-  
+
   let successCount = 0;
   let failCount = 0;
-  
+
   for (const file of files) {
     if (!file.name.toLowerCase().endsWith('.pdf')) continue;
     statusBox.textContent = `Uploading & parsing: ${file.name}...`;
@@ -6344,7 +6371,7 @@ async function handleAddModalPdfUpload(files) {
       showToast('Error ingesting PDF: ' + e.message);
     }
   }
-  
+
   if (failCount === 0) {
     statusBox.className = "modal-status s-ok";
     statusBox.textContent = `Successfully ingested ${successCount} PDF(s).`;
@@ -6352,7 +6379,7 @@ async function handleAddModalPdfUpload(files) {
     statusBox.className = "modal-status s-err";
     statusBox.textContent = `Ingested ${successCount} PDF(s), failed ${failCount}.`;
   }
-  
+
   loadRefs();
 }
 
@@ -8453,7 +8480,7 @@ async function delRef(refId) {
   const ref = refs.find(r => r.id === refId);
   const title = ref?.title || 'reference';
   if (!confirm(`Delete reference "${title.length > 50 ? title.slice(0,47)+'…' : title}"? This cannot be undone.`)) return;
-  
+
   // Remove from local cache immediately
   refs = refs.filter(r => r.id !== refId);
   if (selId === refId) {
@@ -8461,7 +8488,7 @@ async function delRef(refId) {
     $detail.innerHTML = '<div class="detail-ph">Select a reference to see details</div>';
   }
   renderList(); renderStatus();
-  
+
   try {
     const r = await apiFetch(`/api/refs/${refId}`, { method: 'DELETE' });
     if (!r.ok) throw new Error('Server delete failed');

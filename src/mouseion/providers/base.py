@@ -266,7 +266,7 @@ class BaseProvider(ABC):
         try:
             from ..quota import get_default_quota_manager, ProviderLimits
             qm = get_default_quota_manager()
-            
+
             # Keep the persisted quota manager conservative. Provider
             # _min_interval handles short spacing, but the sliding windows are
             # what keep long daemon runs from turning a large batch into a 429
@@ -276,7 +276,7 @@ class BaseProvider(ABC):
             req_per_min = 60
             req_per_hour = 2_000
             req_per_day = 20_000
-            
+
             # Specific daily limit tuning based on provider credentials/tier
             if self.name == "crossref":
                 if self._min_interval <= 0.05:  # polite pool
@@ -322,7 +322,7 @@ class BaseProvider(ABC):
                     req_per_day = 20_000
             elif self.name in ("arxiv_api", "arxiv"):
                 req_per_day = 20_000
-            
+
             qm.update_limits(self.name, ProviderLimits(
                 requests_per_minute=req_per_min,
                 requests_per_hour=req_per_hour,
