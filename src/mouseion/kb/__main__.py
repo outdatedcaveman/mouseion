@@ -1,4 +1,10 @@
-"""python -m mouseion.kb {stats|build-fulltext|build-citations|frontier|search|serve} [--library refs.db] [--kb kb.db]"""
+"""python -m mouseion.kb {stats|build-fulltext|ocr-empty|build-citations|frontier|search|serve|daemon|backfill-notes|eval}
+[--library refs.db] [--kb kb.db]
+
+  backfill-notes --bib references.bib --project synesism     (BibTeX `note` fields)
+  backfill-notes --refs-table REFERENCES.md --project semplex (Key | Reference | Level | Used in | Used for)
+  eval questions.jsonl                                        (see mouseion.kb.evaluate)
+"""
 
 import argparse
 import json
@@ -15,11 +21,14 @@ def main(argv=None):
         choices=[
             "stats",
             "build-fulltext",
+            "ocr-empty",
             "build-citations",
             "frontier",
             "search",
             "serve",
             "daemon",
+            "backfill-notes",
+            "eval",
         ],
     )
     ap.add_argument("query", nargs="?")
@@ -32,6 +41,10 @@ def main(argv=None):
     ap.add_argument(
         "--interval", type=float, default=6.0, help="daemon: hours between cycles"
     )
+    ap.add_argument("--bib", help="backfill-notes: BibTeX file")
+    ap.add_argument("--refs-table", help="backfill-notes: Markdown reference table")
+    ap.add_argument("--project", help="backfill-notes: project name for the notes")
+    ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "daemon":
         from mouseion.kb.daemon import run_forever
@@ -51,6 +64,26 @@ def main(argv=None):
 
     if a.cmd == "build-fulltext":
         out = fulltext.build(lib, kb, a.pdf_root, a.limit, prog)
+    elif a.cmd == "ocr-empty":
+        out = fulltext.ocr_empty(lib, kb, a.pdf_root, a.limit, progress=prog)
+    elif a.cmd == "backfill-notes":
+        from pathlib import Path
+
+        from mouseion.kb import backfill
+
+        if not a.project or not (a.bib or a.refs_table):
+            ap.error("backfill-notes needs --project and --bib or --refs-table")
+        if a.bib:
+            recs = backfill.parse_bibtex(Path(a.bib).read_text(encoding="utf-8"))
+        else:
+            recs = backfill.parse_reference_table(Path(a.refs_table).read_text(encoding="utf-8"))
+        out = backfill.backfill(lib, kb, a.project, recs, a.dry_run)
+    elif a.cmd == "eval":
+        from mouseion.kb import evaluate
+
+        if not a.query:
+            ap.error("eval needs a questions file")
+        out = evaluate.run(lib, kb, evaluate.load(a.query), a.n)
     elif a.cmd == "build-citations":
         out = citations.build(lib, kb, a.limit, a.rate, progress=prog)
     elif a.cmd == "frontier":
