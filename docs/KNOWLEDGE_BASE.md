@@ -25,21 +25,40 @@ This mirrors the semplex claim register: provenance-first, auditable, append-onl
 | Citation graph | `works`, `cites` | `build-citations` (cached: each DOI is fetched once) | OpenAlex `referenced_works` (no contact details sent) |
 | Notes | `notes` + `notes_fts` | `add_note` (MCP tool or Python) | people and agents, with provenance |
 
-PDFs without a text layer are recorded as `empty`. Those are the scans that need OCR, and `ocr.py` already exists
-for them. Broken PDFs are recorded as `error:<type>`. Nothing is silently skipped.
+PDFs without a text layer are recorded as `empty`. `ocr-empty` reads them with Windows' built-in OCR engine
+(`ocr.py`, every page) and indexes the text with its page numbers; the file is then recorded as `ocr`. A scan that
+OCR cannot read stays `empty`. On a system without the engine, `ocr-empty` reports `unavailable` and changes nothing.
+An unchanged `empty` file is not re-extracted at every build. Broken PDFs are recorded as `error:<type>`. Nothing is silently skipped.
 
 ## Use
 
 ```bash
 python -m mouseion.kb build-fulltext            # all local PDFs -> passages
+python -m mouseion.kb ocr-empty                 # scans without a text layer -> OCR -> passages (Windows)
 python -m mouseion.kb build-citations           # all DOIs -> OpenAlex reference lists (~8 requests/s)
 python -m mouseion.kb stats                     # coverage
 python -m mouseion.kb search "strong lumpability causal states"
 python -m mouseion.kb frontier -n 50            # most-cited works the library does not have: what to acquire next
+python -m mouseion.kb backfill-notes --bib <synesism>/bibliography/references.bib --project synesism
+python -m mouseion.kb backfill-notes --refs-table <semplex>/charter/REFERENCES.md --project semplex
+python -m mouseion.kb eval docs/kb_eval/questions.jsonl -n 10
 ```
 
+**Backfilled notes** (`backfill-notes`, add `--dry-run` to preview). Each source a project's bibliography records,
+with a stated use, becomes one note "<project> uses this source for: ...", matched to the library by DOI, then arXiv
+id, then exact title (case, punctuation and accents ignored). They carry no quote, so they have kind `project-use`
+and author `backfill` and are never textual support. Rows at level MEMORY are skipped (semplex's own rule). Records
+that match nothing are listed under `unmatched`: those are sources the library lacks. Running it again adds only
+what is new.
+
+**Retrieval evaluation** (`eval`). `docs/kb_eval/questions.jsonl` holds 28 real questions from semplex and
+Synesism, paraphrased rather than copied from titles, each with the sources a good answer must surface. The report
+gives hit@1/5/10 and MRR for passages and references and classifies every miss: `not_in_library`, `not_indexed` (in
+the library, no text), or `retrieval_miss` (indexed text that BM25 did not rank). Only the last is evidence for
+dense retrieval, and the verdict line says whether it dominates.
+
 Always on (PC): run `python -m mouseion.kb daemon` (or `pythonw` for no window) at login. Every 6 h it indexes new
-or changed PDFs, fetches reference lists for new DOIs, and writes `kb_status.json` next to `refs.db`. The health
+or changed PDFs, OCRs up to 50 scans, fetches reference lists for new DOIs, and writes `kb_status.json` next to `refs.db`. The health
 report (`mouseion health`, `health.json`) then has a `knowledge_base` check, and `scripts/status_report.py` lists the
 daemon among the always-on jobs.
 
@@ -75,11 +94,10 @@ claude mcp add mouseion -- python -m mouseion.kb serve
 
 ## Not yet done (next steps, in order)
 
-- **Run it on the real library** (build-fulltext, build-citations, then the daemon): nothing has been indexed yet.
+All of these run on the PC, where the library is.
 
-- **Measure before adding dense retrieval.** Run 20–30 real questions from semplex and Synesism against BM25
-  passages and record which ones fail. Add the dense chunk index (the existing MiniLM + Chroma stack) only if
-  paraphrase misses are the dominant failure. The fusion hook is in `search_passages(dense=...)`.
-- **Backfill notes** from semplex `charter/LITERATURE_REVIEW.md` and Synesism `BIBLIOGRAPHY.md`, matching sources
-  to library references by DOI or arXiv id.
-- **OCR the `empty` PDFs** with `ocr.py`, then re-run `build-fulltext`.
+- **Run it on the real library**: `build-fulltext`, `ocr-empty`, `build-citations`, then the daemon at login.
+- **Backfill the notes** from both bibliographies (commands above). Review `unmatched`: those sources should be
+  added to the library, then backfill again.
+- **Measure**: run `eval`. Add the dense chunk index (the existing MiniLM + Chroma stack, hook in
+  `search_passages(dense=...)`) only if the verdict says retrieval misses dominate.

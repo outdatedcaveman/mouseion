@@ -66,3 +66,31 @@ def ocr_pdf_pages(path: str, pages: int = 1, dpi: int = 200, data: bytes | None 
     finally:
         doc.close()
     return "\n".join(out)
+
+
+def ocr_pdf_page_texts(path: str, dpi: int = 200, lang: Optional[str] = None,
+                       max_pages: Optional[int] = None) -> list:
+    """OCR text of every page (or the first `max_pages`), one string per page, in page order.
+
+    Used by the knowledge base for scanned PDFs, where every page matters, not just the first. Returns [] if
+    OCR is unavailable or the file cannot be opened; a page that fails gives ''."""
+    if not available():
+        return []
+    import pymupdf
+    try:
+        doc = pymupdf.open(path)
+    except Exception:
+        return []
+    out = []
+    try:
+        n = doc.page_count if max_pages is None else min(max_pages, doc.page_count)
+        for i in range(n):
+            try:
+                png = doc[i].get_pixmap(dpi=dpi).tobytes("png")
+                out.append(asyncio.run(_ocr_png(png, lang)))
+            except Exception as e:
+                logger.debug("OCR failed on %s p%d: %s", path, i, e)
+                out.append("")
+    finally:
+        doc.close()
+    return out

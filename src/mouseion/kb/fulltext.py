@@ -71,8 +71,8 @@ def index_ref(kb, ref_id: str, path: Path) -> str:
         row
         and row["size"] == st.st_size
         and abs((row["mtime"] or 0) - st.st_mtime) < 1e-6
-        and row["status"] == "ok"
-    ):
+        and row["status"] in ("ok", "ocr", "empty")
+    ):  # 'empty' stays until ocr_empty() runs; re-extracting a file without a text layer gains nothing
         return "unchanged"
     kb.execute("DELETE FROM chunks WHERE ref_id=?", (ref_id,))
     try:
@@ -141,4 +141,61 @@ def build(
         if progress:
             progress(i + 1, len(rows), s)
     kb.commit()
+    return counts
+
+
+def ocr_empty(
+    lib,
+    kb,
+    pdf_root: Optional[str] = None,
+    limit: Optional[int] = None,
+    ocr: Optional[Callable[[str], List[str]]] = None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+) -> dict:
+    """OCR the PDFs that build() found without a text layer (status 'empty') and index their pages.
+
+    `ocr(path)` returns one string per page; the default is Windows' built-in engine (mouseion.ocr), which
+    yields nothing elsewhere, so on other systems this reports 'unavailable' and changes nothing. A file that
+    OCR turns into text gets status 'ocr' (its passages are then searchable like any other); one that stays
+    blank keeps 'empty'."""
+    if ocr is None:
+        from mouseion import ocr as _ocr
+
+        if not _ocr.available():
+            n = kb.execute("SELECT count(*) FROM pdf_files WHERE status='empty'").fetchone()[0]
+            return {"unavailable": n} if n else {}
+        ocr = _ocr.ocr_pdf_page_texts
+    rows = kb.execute(
+        "SELECT ref_id, path FROM pdf_files WHERE status='empty' ORDER BY ref_id"
+    ).fetchall()
+    if limit:
+        rows = rows[:limit]
+    counts: dict = {}
+    for i, r in enumerate(rows):
+        path = Path(r["path"])
+        if not path.exists():
+            s = "missing"
+        else:
+            try:
+                texts = ocr(str(path))
+            except Exception:
+                texts = []
+            kb.execute("DELETE FROM chunks WHERE ref_id=?", (r["ref_id"],))
+            n = 0
+            for page, text in enumerate(texts, 1):
+                for ch in split_page(text or ""):
+                    kb.execute(
+                        "INSERT INTO chunks(ref_id,page,ord,text) VALUES (?,?,?,?)",
+                        (r["ref_id"], page, n, ch),
+                    )
+                    n += 1
+            s = "ocr" if n else "empty"
+            kb.execute(
+                "UPDATE pdf_files SET n_chunks=?, status=?, indexed_at=datetime('now') WHERE ref_id=?",
+                (n, s, r["ref_id"]),
+            )
+        counts[s] = counts.get(s, 0) + 1
+        kb.commit()
+        if progress:
+            progress(i + 1, len(rows), s)
     return counts

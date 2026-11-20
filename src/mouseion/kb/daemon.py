@@ -30,6 +30,7 @@ def cycle(
     max_dois: Optional[int] = 5000,
     rate: float = 8.0,
     fetcher=None,
+    max_ocr: Optional[int] = 50,
 ) -> dict:
     t0 = time.time()
     rep = {
@@ -42,6 +43,10 @@ def cycle(
         rep["fulltext"] = fulltext.build(lib, kb, pdf_root, max_pdfs)
     except Exception as e:
         rep["errors"].append(f"fulltext: {type(e).__name__}: {e}")
+    try:
+        rep["ocr"] = fulltext.ocr_empty(lib, kb, pdf_root, max_ocr)
+    except Exception as e:
+        rep["errors"].append(f"ocr: {type(e).__name__}: {e}")
     try:
         kw = {"fetcher": fetcher} if fetcher else {}
         rep["citations"] = citations.build(lib, kb, max_dois, rate, **kw)
