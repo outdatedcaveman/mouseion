@@ -1,7 +1,7 @@
 """Always-on knowledge-base maintenance: `python -m mouseion.kb daemon` (or `pythonw` for no console window).
 
 Every cycle (default 6 h): incremental full-text pass (new or changed PDFs only), incremental citation pass (DOIs never
-fetched), then write `kb_status.json` next to refs.db. That file is the hand-off to Egon and to the health report:
+fetched), then write `kb_status.json` next to refs.db. That file feeds the health report:
 coverage, last cycle, errors. A cycle that fails is recorded, not fatal; the loop continues.
 """
 
