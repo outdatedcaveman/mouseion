@@ -216,3 +216,64 @@ def test_library_is_read_only(env):
     tmp, ids, lib, kb = env
     with pytest.raises(Exception):
         lib.execute("DELETE FROM refs")
+
+
+def test_daemon_cycle_writes_status(env, monkeypatch):
+    tmp, ids, lib, kb = env
+    from mouseion.kb import daemon
+
+    monkeypatch.setenv("MOUSEION_DB_PATH", str(tmp / "refs.db"))
+    rep = daemon.cycle(
+        str(tmp / "refs.db"), str(tmp / "kb.db"), rate=1e6, fetcher=lambda doi: None
+    )
+    assert (
+        rep["fulltext"] == {"ok": 2, "missing": 1}
+        and rep["citations"] == {"not_found": 3}
+        and not rep["errors"]
+    )
+    st = daemon.read_status(str(tmp / "refs.db"))
+    assert st and st["stats"]["chunks"] >= 2
+
+
+def test_web_kb_requires_key_and_searches(env, monkeypatch):
+    tmp, ids, lib, kb = env
+    fulltext.build(lib, kb)
+    monkeypatch.setenv("MOUSEION_DB_PATH", str(tmp / "refs.db"))
+    monkeypatch.setenv("MOUSEION_KB_PATH", str(tmp / "kb.db"))
+    monkeypatch.setenv("MOUSEION_API_KEY", "k" * 32)
+    from mouseion import web
+
+    monkeypatch.setattr(web, "_api_key_cache", None)
+    c = web.app.test_client()
+    assert c.get("/kb?q=lumpable").status_code == 401
+    assert c.get("/api/kb/search?q=lumpable").status_code == 401
+    r = c.get("/kb?q=lumpable&api_key=" + "k" * 32)
+    assert r.status_code == 200 and b"strongly lumpable" in r.data and b"p. 1" in r.data
+    j = c.get(
+        "/api/kb/search?q=lottery", headers={"Authorization": "Bearer " + "k" * 32}
+    ).get_json()
+    assert j["passages"][0]["ref_id"] == ids["b"]
+    bad = c.post(
+        "/api/kb/notes",
+        json={
+            "project": "semplex",
+            "claim": "x",
+            "ref_id": ids["b"],
+            "quote": "absent text",
+        },
+        headers={"X-API-Key": "k" * 32},
+    )
+    assert bad.status_code == 400
+
+
+def test_health_reports_knowledge_base(env, monkeypatch):
+    tmp, ids, lib, kb = env
+    from mouseion import health
+    from mouseion.kb import daemon
+
+    daemon.cycle(
+        str(tmp / "refs.db"), str(tmp / "kb.db"), rate=1e6, fetcher=lambda doi: None
+    )
+    rep = health.run(str(tmp / "refs.db"))
+    kbc = [x for x in rep["checks"] if x["check"] == "knowledge_base"][0]
+    assert kbc["ok"] and kbc["value"]["passages"] >= 2

@@ -97,6 +97,17 @@ def run(db_path: str | Path | None = None, sample: int = 400) -> Dict[str, Any]:
     out.append(_check("pdf_finder", tries == 0 or new_files > 0, {"new_pdfs_7d": new_files, "attempts_7d": tries},
                       "PDFs saved to the storage folder in the last 7 days"))
 
+    try:                                   # knowledge base (mouseion.kb daemon writes kb_status.json)
+        kb = json.loads((db_path.parent / "kb_status.json").read_text(encoding="utf-8"))
+        kb_age = (datetime.now(timezone.utc) - datetime.fromisoformat(kb["at"])).total_seconds() / 3600
+        st = kb.get("stats") or {}
+        out.append(_check("knowledge_base", kb_age <= 24 and not kb.get("errors"),
+                          {"hours_since_cycle": round(kb_age, 1), "passages": st.get("chunks"),
+                           "citation_edges": st.get("citation_edges"), "errors": kb.get("errors")},
+                          "full-text passages and citation graph (python -m mouseion.kb daemon)"))
+    except Exception:
+        out.append(_check("knowledge_base", False, None, "no kb_status.json: start python -m mouseion.kb daemon"))
+
     complete = c.execute("SELECT COUNT(*) FROM refs WHERE " + _complete_sql()).fetchone()[0]
     c.close()
     report = {"refs": n, "complete_pct": round(100 * complete / max(1, n), 2),

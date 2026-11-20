@@ -38,6 +38,15 @@ python -m mouseion.kb search "strong lumpability causal states"
 python -m mouseion.kb frontier -n 50            # most-cited works the library does not have: what to acquire next
 ```
 
+Always on (PC): run `python -m mouseion.kb daemon` (or `pythonw` for no window) at login. Every 6 h it indexes new
+or changed PDFs, fetches reference lists for new DOIs, and writes `kb_status.json` next to `refs.db`. The health
+report (`mouseion health`, `health.json`) then has a `knowledge_base` check, and `scripts/status_report.py` lists the
+daemon among the always-on jobs.
+
+Browse and check: open `http://<mouseion host>:7274/kb?api_key=<API key>` in the Mouseion web app. It searches
+passages, notes and references; every hit shows its citation and page, and notes show their verbatim quote. The same
+data is served as JSON under `/api/kb/` (search, stats, frontier, notes), behind the usual API key.
+
 Agents, from any project:
 
 ```bash
@@ -65,6 +74,8 @@ claude mcp add mouseion -- python -m mouseion.kb serve
    and the library lacks, is the most likely gap.
 
 ## Not yet done (next steps, in order)
+
+- **Run it on the real library** (build-fulltext, build-citations, then the daemon): nothing has been indexed yet.
 
 - **Measure before adding dense retrieval.** Run 20–30 real questions from semplex and Synesism against BM25
   passages and record which ones fail. Add the dense chunk index (the existing MiniLM + Chroma stack) only if

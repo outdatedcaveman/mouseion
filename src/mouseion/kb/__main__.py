@@ -19,6 +19,7 @@ def main(argv=None):
             "frontier",
             "search",
             "serve",
+            "daemon",
         ],
     )
     ap.add_argument("query", nargs="?")
@@ -28,7 +29,16 @@ def main(argv=None):
     ap.add_argument("--limit", type=int)
     ap.add_argument("--rate", type=float, default=8.0)
     ap.add_argument("-n", type=int, default=10)
+    ap.add_argument(
+        "--interval", type=float, default=6.0, help="daemon: hours between cycles"
+    )
     a = ap.parse_args(argv)
+    if a.cmd == "daemon":
+        from mouseion.kb.daemon import run_forever
+
+        return run_forever(
+            a.interval, lib_p=a.library, kb_p=a.kb, pdf_root=a.pdf_root, rate=a.rate
+        )
     if a.cmd == "serve":
         from mouseion.kb.mcp_server import serve
 

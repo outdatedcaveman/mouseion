@@ -4,6 +4,7 @@ Every cycle (default 6 h): incremental full-text pass (new or changed PDFs only)
 fetched), then write `kb_status.json` next to refs.db. That file is the hand-off to Egon and to the health report:
 coverage, last cycle, errors. A cycle that fails is recorded, not fatal; the loop continues.
 """
+
 from __future__ import annotations
 
 import json
@@ -21,10 +22,21 @@ def status_path(lib: Optional[str] = None) -> Path:
     return library_path(lib).with_name("kb_status.json")
 
 
-def cycle(lib_p: Optional[str] = None, kb_p: Optional[str] = None, pdf_root: Optional[str] = None,
-          max_pdfs: Optional[int] = None, max_dois: Optional[int] = 5000, rate: float = 8.0, fetcher=None) -> dict:
+def cycle(
+    lib_p: Optional[str] = None,
+    kb_p: Optional[str] = None,
+    pdf_root: Optional[str] = None,
+    max_pdfs: Optional[int] = None,
+    max_dois: Optional[int] = 5000,
+    rate: float = 8.0,
+    fetcher=None,
+) -> dict:
     t0 = time.time()
-    rep = {"at": datetime.now(timezone.utc).isoformat(), "kb": str(kb_path(kb_p)), "errors": []}
+    rep = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "kb": str(kb_path(kb_p)),
+        "errors": [],
+    }
     lib, kb = open_library(lib_p), open_kb(kb_p)
     try:
         rep["fulltext"] = fulltext.build(lib, kb, pdf_root, max_pdfs)
@@ -41,10 +53,13 @@ def cycle(lib_p: Optional[str] = None, kb_p: Optional[str] = None, pdf_root: Opt
         rep["errors"].append(f"stats: {type(e).__name__}: {e}")
     rep["seconds"] = round(time.time() - t0, 1)
     try:
-        status_path(lib_p).write_text(json.dumps(rep, indent=1, default=str), encoding="utf-8")
+        status_path(lib_p).write_text(
+            json.dumps(rep, indent=1, default=str), encoding="utf-8"
+        )
     except OSError:
         pass
-    lib.close(); kb.close()
+    lib.close()
+    kb.close()
     return rep
 
 

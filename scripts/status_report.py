@@ -85,7 +85,8 @@ def measure() -> dict:
                              creationflags=0x08000000).stdout
         jobs = {"Mouseion app": any(s in out for s in ("Mouseion.exe", "-m mouseion", "mouseion_launch"))}  # exe or source launcher
         for name in ("resolve_lossy", "recover_isbn", "recover_ids_from_pdfs", "pdf_sweep", "ingest_folder",
-                     "complete_from_pdfs", "judge_lossy", "web_trail", "google_books_pass", "egon_core"):
+                     "complete_from_pdfs", "judge_lossy", "web_trail", "google_books_pass", "egon_core",
+                     "mouseion.kb daemon"):
             jobs[name] = name in out
         m["jobs"] = jobs
     except Exception:
@@ -142,7 +143,7 @@ def report(now: dict, prev: dict) -> str:
     L += rows
     L.append(f"VPN: {now['vpn']} | health: " + (", ".join(now['health_failed']) + " failing" if now['health_failed'] else "all OK"))
     jobs = now.get("jobs") or {}
-    must = ("Mouseion app", "egon_core")      # always-on; the rest are rotation / on-demand jobs
+    must = ("Mouseion app", "egon_core", "mouseion.kb daemon")      # always-on; the rest are rotation / on-demand jobs
     down = [k for k in must if not jobs.get(k)]
     L.append("Running: " + (", ".join(k for k, v in jobs.items() if v) or "nothing") +
              (" | DOWN: " + ", ".join(down) if down else ""))
@@ -156,7 +157,7 @@ def summary_line(now: dict, prev: dict) -> str:
     warn = []
     if now.get("vpn") != "connected (USP)":
         warn.append("VPN " + str(now.get("vpn")))
-    down = [k for k in ("Mouseion app", "egon_core") if not (now.get("jobs") or {}).get(k)]
+    down = [k for k in ("Mouseion app", "egon_core", "mouseion.kb daemon") if not (now.get("jobs") or {}).get(k)]
     if down:
         warn.append("DOWN: " + ", ".join(down))
     parts = [f"{pct:.2f}% complete", f"PDFs {ppct:.1f}%"]

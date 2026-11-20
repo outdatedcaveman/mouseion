@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.json.sort_keys = False
 
+try:                                   # knowledge base: /kb page and /api/kb/* (mouseion.kb)
+    from .kb.web import bp as _kb_bp
+    app.register_blueprint(_kb_bp)
+except Exception as _kb_err:            # never take the app down for the KB
+    print(f"[kb] not mounted: {_kb_err}", file=sys.stderr)
+
 # In-memory job store for background enrichment
 _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
