@@ -2042,7 +2042,7 @@ class RefDatabase:
                 ).fetchone()[0]
             except Exception:
                 touched_10min = enriched_1h = 0
-            
+
             # Average completeness of done items vs pending (cached for 5 minutes)
             now = time.time()
             import threading

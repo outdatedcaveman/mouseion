@@ -55,6 +55,7 @@ dev = [
     "pytest-httpx>=0.30",
     "respx>=0.21",
     "pyinstaller>=6.0",
+    "pymupdf>=1.24",   # tests/test_ingest_api.py and the lazy imports in ocr.py / pdf_ingest.py
 ]
 drive = [
     "google-api-python-client>=2.100",

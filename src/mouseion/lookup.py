@@ -58,7 +58,6 @@ def _select_providers(
 
     Unpaywall is appended for any ref that has a DOI (to find OA URLs).
     """
-    by_name = {p.name: p for p in providers}
 
     # METADATA-ONLY hot path. Unpaywall / doi_org were removed: they do slow
     # OA-PDF discovery (unpaywall → core.ac.uk, whose 429 backoff is up to 900s)

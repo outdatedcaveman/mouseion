@@ -17,6 +17,9 @@ Priority order (highest reliability first):
  10. Google Books    — books via ISBN (broader coverage)
  11. Unpaywall       — open access PDF URLs via DOI
 
+Opt-in: alphaXiv (alphaxiv) — full-text title search that locates arXiv ids;
+appended to _make_providers() only when ``alphaxiv_enabled`` is set.
+
 Opt-in, outside the default set: BASE (base_search) — repository copies from
 11k+ OAI-PMH repositories for the PDF chain; needs registered access, 1 QPS.
 """
@@ -33,6 +36,8 @@ from .unpaywall        import UnpaywallProvider
 from .arxiv_api        import ArXivAPIProvider
 from .google_books     import GoogleBooksProvider
 from .base_search      import BaseSearchProvider
+from .alphaxiv         import AlphaXivProvider
+from . import alphaxiv as _alphaxiv
 
 def _make_providers():
     """Create fresh provider instances.
@@ -44,7 +49,7 @@ def _make_providers():
     "is bound to a different event loop".  Always call this factory to get
     fresh providers for each enrichment cycle.
     """
-    return [
+    providers = [
         CrossRefProvider(),
         DOIOrgProvider(),
         OpenAlexProvider(),
@@ -57,6 +62,12 @@ def _make_providers():
         GoogleBooksProvider(),
         UnpaywallProvider(),
     ]
+    try:
+        if _alphaxiv.enabled():
+            providers.append(AlphaXivProvider())
+    except Exception:                       # config unreadable: keep the default set
+        pass
+    return providers
 
 
 # Kept for backwards compatibility but callers should prefer _make_providers()
@@ -75,6 +86,7 @@ __all__ = [
     "GoogleBooksProvider",
     "UnpaywallProvider",
     "BaseSearchProvider",
+    "AlphaXivProvider",
     "DEFAULT_PROVIDERS",
     "_make_providers",
 ]

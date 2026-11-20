@@ -58,7 +58,8 @@ def _focus_config_path() -> str:
 def _load_focus() -> None:
     """Load persisted focus setting from disk (called once at import time)."""
     global _focus_min_tier
-    import json, os
+    import json
+    import os
     path = _focus_config_path()
     if os.path.exists(path):
         try:
@@ -429,7 +430,7 @@ def _process_tier(db, tier_num: int, extra_where: str, handler, batch_size: int)
             else:
                 # Legacy single-ref handler (shouldn't happen with new code)
                 logger.warning("Tier %d: handler returned non-dict", tier_num)
-        except Exception as e:
+        except Exception:
             logger.exception("Tier %d: batch handler error", tier_num)
             # Requeue on error
             _requeue_batch(db, batch)
@@ -452,7 +453,7 @@ def _dequeue_tier(db, extra_where: str, limit: int):
             WHERE eq.status = 'pending'
               AND (eq.last_attempt IS NULL OR eq.last_attempt < datetime('now', '-90 seconds'))
               AND ({extra_where})
-            ORDER BY 
+            ORDER BY
               CASE WHEN r.completeness >= 0.6 AND r.completeness < 0.8 THEN 1 ELSE 2 END ASC,
               eq.priority DESC
             LIMIT ?
@@ -1432,7 +1433,7 @@ def _handle_tier5_batch(refs: List[Reference], rows: List[dict]) -> dict:
             from .llm import parse_citation_to_ref
             from .merge import merge as _merge
             loop = _get_loop()
-            
+
             async def _llm_rescue_all(refs_to_rescue):
                 sem = SafeSemaphore(5)
                 async def _rescue_one(r):
@@ -1467,7 +1468,7 @@ def _handle_tier5_batch(refs: List[Reference], rows: List[dict]) -> dict:
                                 return llm_ref
                         return r
                 return await asyncio.gather(*[_rescue_one(r) for r in refs_to_rescue])
-            
+
             llm_results = loop.run_until_complete(_llm_rescue_all(still_unresolved))
             for original_r, rescued_r in zip(still_unresolved, llm_results):
                 if rescued_r is not original_r:
@@ -1716,7 +1717,8 @@ async def _repair_from_urls(refs) -> dict:
     """Scrape landing pages for citation metadata before giving up."""
     if not refs:
         return {}
-    import httpx, asyncio
+    import httpx
+    import asyncio
     from .web_search import _scrape_page_metadata
     from .merge import merge as _merge
 

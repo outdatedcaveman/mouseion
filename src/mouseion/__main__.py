@@ -141,7 +141,8 @@ def _setup_crash_logging():
     for h in list(root.handlers):
         if isinstance(h, RotatingFileHandler):
             try:
-                root.removeHandler(h); h.close()
+                root.removeHandler(h)
+                h.close()
             except Exception:
                 pass
     root.addHandler(handler)
@@ -296,11 +297,11 @@ def main():
         window_exists = False
         if sys.platform == "win32":
             window_exists = bool(ctypes.windll.user32.FindWindowW(None, "Mouseion"))
-        
+
         if window_exists:
             _focus_existing_window()
             sys.exit(0)
-            
+
         # No window exists, but server is running -> open a native webview window pointing to it
         url = f"http://127.0.0.1:{existing_port}"
         try:
@@ -366,7 +367,7 @@ def main():
         logging.error("Server startup aborted: port %d already in use", port)
         sys.exit(1)
 
-    _safe_print(f"\n  Mouseion is starting...")
+    _safe_print("\n  Mouseion is starting...")
     _safe_print(f"  Port     ->  {port}")
     _safe_print(f"  API Key  ->  {api_key}")
     _safe_print(f"  Log file ->  {log_file}")
@@ -415,7 +416,9 @@ def main():
     try:
         from mouseion.config import get_config as _get_cfg_pdf
         if _get_cfg_pdf().auto_fetch_pdfs:
-            import threading as _th, time as _tm, urllib.request as _ur
+            import threading as _th
+            import time as _tm
+            import urllib.request as _ur
             def _autostart_pdf():
                 _tm.sleep(20)
                 try:

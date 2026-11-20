@@ -279,10 +279,14 @@ class Reference:
         has_id = bool(self.doi or self.arxiv_id or self.pmid or self.isbn)
 
         score = 0.0
-        if self.title:   score += 0.22
-        if self.authors: score += 0.15
-        if self.year:    score += 0.10
-        if has_id:       score += 0.15
+        if self.title:
+            score += 0.22
+        if self.authors:
+            score += 0.15
+        if self.year:
+            score += 0.10
+        if has_id:
+            score += 0.15
         if self.journal or self.container_title or self.publisher:
             score += 0.08
         # Abstract is NEVER a penalty. Its weight is granted whether or not an

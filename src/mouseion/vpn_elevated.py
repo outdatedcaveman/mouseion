@@ -331,7 +331,7 @@ def pick_adapter() -> str:
             text=True, errors="ignore", timeout=15, creationflags=_NO_WINDOW)
         import csv
         import io
-        rows = csv.DictReader(io.StringIO("\n".join(l for l in out.splitlines() if l.strip())))
+        rows = csv.DictReader(io.StringIO("\n".join(ln for ln in out.splitlines() if ln.strip())))
         for r in rows:
             desc = (r.get("Description") or "").lower()
             name = r.get("NetConnectionID") or ""
@@ -438,7 +438,7 @@ def tunnel_output(n: int = 8) -> str:
             lines += (RUN_DIR / name).read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
             pass
-    return "\n".join(l for l in lines if l.strip())[-1500:] if lines else ""
+    return "\n".join(ln for ln in lines if ln.strip())[-1500:] if lines else ""
 
 
 def _parse_auth(out: str) -> Dict[str, str]:

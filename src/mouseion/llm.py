@@ -226,7 +226,7 @@ def _json_to_ref(json_str: str) -> Optional[Reference]:
         ref = Reference()
         ref.title = data.get("title")
         ref.doi = data.get("doi")
-        
+
         # Handle year - enforce integer
         year_val = data.get("year")
         if year_val:
@@ -234,17 +234,17 @@ def _json_to_ref(json_str: str) -> Optional[Reference]:
                 ref.year = int(str(year_val)[:4])
             except ValueError:
                 pass
-                
+
         ref.journal = data.get("journal")
         ref.volume = str(data.get("volume")) if data.get("volume") else None
         ref.issue = str(data.get("issue")) if data.get("issue") else None
         ref.pages = str(data.get("pages")) if data.get("pages") else None
-        
+
         # Parse ref type
         rt = data.get("ref_type")
         if rt:
             ref.ref_type = RefType.from_crossref(rt)
-            
+
         # Parse authors
         authors = data.get("authors", [])
         if isinstance(authors, list):
@@ -254,7 +254,7 @@ def _json_to_ref(json_str: str) -> Optional[Reference]:
                     giv = a.get("given") or a.get("first") or ""
                     if fam or giv:
                         ref.authors.append(Author(family=fam, given=giv))
-        
+
         if ref.title or ref.doi:
             ref.sources["llm"] = 0.95
             ref.normalize()
@@ -263,5 +263,5 @@ def _json_to_ref(json_str: str) -> Optional[Reference]:
         logger.error(f"Failed to parse LLM JSON output: {json_str[:100]}")
     except Exception as e:
         logger.error(f"Error converting LLM output to Reference: {e}")
-    
+
     return None
