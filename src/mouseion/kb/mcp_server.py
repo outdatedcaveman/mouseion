@@ -191,7 +191,8 @@ def tools(lib, kb) -> Dict[str, tuple]:
         "evidence, and pass their chunk_ids as evidence: rare terms from them retrieve passages that share no "
         "word with the question (the next hop). Repeat with the new evidence for further hops. Without evidence, "
         "the top BM25 passages are used as seeds. Returns passages (each with the bridge term that reached it) "
-        "and the activated terms.",
+        "and the activated terms. Always pass evidence: without a judge, expansion ranked below plain BM25 once the "
+        "corpus had distractors (docs/KB_METHOD.md), so the no-evidence mode is for exploration only.",
         _schema(
             {"query": STR, "evidence": {"type": "array", "items": INT}, "rounds": INT, "n": INT},
             ["query"],

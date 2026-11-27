@@ -44,7 +44,7 @@ Metric: rank of the expected paper among retrieved references.
 | **BM25** | **.672** | .879 | .897 | **.766** |
 | dense (model2vec potion-base-8M) | .517 | .724 | .810 | .616 |
 | BM25 + dense (RRF) | .690 | .879 | .897 | .755 |
-| **BM25 + bridge expansion** (no judge) | .655 | .862 | **.948** | .746 |
+| BM25 + bridge expansion (no judge; see the scale table below) | .655 | .862 | .948 | .746 |
 | **BM25, function words dropped from the query** (2026-11-27) | **.690** | **.914** | .931 | **.779** |
 
 Dropping function words from queries ("of", "the", "in"...) also fixed speed on the real library. Each of those
@@ -62,6 +62,21 @@ Closed discovery, examples:
 Open discovery picks good intermediates (for "cohesion modality": crisp, codiscrete, comodality, parametricity,
 Lawvere, comonad). Its final candidates are still noisy on a corpus this small; treat them as prompts for a human or
 agent to check.
+
+**At 4.6× the corpus** (587 papers, 65,784 passages: the same 127 plus 460 recent arXiv papers from the same
+fields as distractors, 2026-11-27):
+
+| Method | hit@1 | hit@5 | hit@10 | MRR |
+|---|---|---|---|---|
+| **BM25** | **.672** | **.862** | **.914** | **.765** |
+| dense (model2vec) | .431 | .655 | .724 | .536 |
+| BM25 + dense (RRF) | .655 | .828 | .862 | .718 |
+| BM25 + bridge expansion, **no judge** | .655 | .828 | .879 | .737 |
+
+BM25 holds; dense collapses, and fusing it in now hurts. **Expansion without a judge falls below BM25 once
+distractors are present**, as SAG2's ablation predicts: the judging step is what makes expansion work. So use
+`kb_expand` with `evidence` (the chunk ids the agent judged relevant), not as a blind re-ranker. Its no-evidence
+mode is for exploration only.
 
 **Limits of this measurement.** 127 papers is small, and the published differences between methods grow with corpus
 size. A distractor corpus of ~2,000 recent arXiv papers in the same fields is being added. Run
