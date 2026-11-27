@@ -42,7 +42,30 @@ python -m mouseion.kb frontier -n 50            # most-cited works the library d
 python -m mouseion.kb backfill-notes --bib <synesism>/bibliography/references.bib --project synesism
 python -m mouseion.kb backfill-notes --refs-table <semplex>/charter/REFERENCES.md --project semplex
 python -m mouseion.kb eval docs/kb_eval/questions.jsonl -n 10
+python -m mouseion.kb build-statements          # typed definitions/theorems/lemmas (incremental)
+python -m mouseion.kb statements "univalent category" --kind definition
+python -m mouseion.kb expand "question" --evidence 1203,877   # next hop via bridge terms
+python -m mouseion.kb bridges "FI-modules" --with "univalent species"
 ```
+
+**Why lexical, and how multi-hop and discovery work:** see [`KB_METHOD.md`](KB_METHOD.md). It covers the
+evidence (BM25 beats dense and LLM-built graphs at scale), the measurements on 127 project papers, and how an agent
+should use `kb_expand`, `kb_statements` and `kb_bridges`.
+
+**Robust indexing (2026-11-27).** The first library run stalled at ~22.6k of 136k PDFs on one hung file, holding
+kb.db's write lock, and an earlier run under a Python without PyMuPDF marked 105,318 files as errors. Now:
+- each PDF is parsed in a child process with a timeout (`--timeout`, default 120 s);
+- the parse happens with no write transaction open, and the file's passages are then replaced in one short
+  transaction (if a parse fails, the passages already indexed are kept);
+- a file that failed for its own reasons is retried only when it changes (`--retry-errors` forces it), while
+  environment errors (`ModuleNotFoundError`) are always retried;
+- the build refuses to start, changing nothing, if PyMuPDF is not importable;
+- `busy_timeout` lets the citation builder and the full-text builder take turns.
+
+**Text normalisation (extraction version 2):** passages are NFKC-normalised, so LaTeX ligatures (ﬁ, ﬀ, ﬂ) match
+ordinary queries. That was 50% of passages in the test corpus. Files indexed by version 1 are re-extracted by the
+next `build-fulltext`, incrementally. Passages that notes cite are first copied to `chunks_archive`, and the notes
+are re-anchored by their quote.
 
 **Backfilled notes** (`backfill-notes`, add `--dry-run` to preview). Each source a project's bibliography records,
 with a stated use, becomes one note "<project> uses this source for: ...", matched to the library by DOI, then arXiv
@@ -58,7 +81,7 @@ the library, no text), or `retrieval_miss` (indexed text that BM25 did not rank)
 dense retrieval, and the verdict line says whether it dominates.
 
 Always on (PC): run `python -m mouseion.kb daemon` (or `pythonw` for no window) at login. Every 6 h it indexes new
-or changed PDFs, OCRs up to 50 scans, fetches reference lists for new DOIs, and writes `kb_status.json` next to `refs.db`. The health
+or changed PDFs, OCRs up to 50 scans, indexes typed statements, fetches reference lists for new DOIs, and writes `kb_status.json` next to `refs.db`. The health
 report (`mouseion health`, `health.json`) then has a `knowledge_base` check, and `scripts/status_report.py` lists the
 daemon among the always-on jobs.
 
