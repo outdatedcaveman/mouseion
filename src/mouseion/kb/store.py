@@ -121,6 +121,10 @@ def open_kb(path: Optional[str] = None) -> sqlite3.Connection:
     con = sqlite3.connect(str(p), check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=60000")  # the citation builder and the full-text builder take turns
+    # WAL + NORMAL: no corruption on power loss, at most the last commits roll back (kb.db is derived and rebuilds
+    # incrementally); without it the per-file commits of build-fulltext cost ~40% of the run in fsyncs
+    con.execute("PRAGMA synchronous=NORMAL")
     con.executescript(SCHEMA)
     return con
 

@@ -52,6 +52,8 @@ def main(argv=None):
     ap.add_argument("--refs-table", help="backfill-notes: Markdown reference table")
     ap.add_argument("--project", help="backfill-notes: project name for the notes")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--timeout", type=float, default=120.0, help="build-fulltext: seconds per PDF (0 = in-process)")
+    ap.add_argument("--retry-errors", action="store_true", help="build-fulltext: retry files that failed before")
     ap.add_argument("--kind", help="statements: definition | theorem | lemma | ...")
     ap.add_argument("--evidence", help="expand: comma-separated chunk ids judged to be evidence")
     ap.add_argument("--with", dest="with_", help="bridges: the C side (closed discovery)")
@@ -73,7 +75,7 @@ def main(argv=None):
             print(f"  {i}/{n} ({s})", file=sys.stderr, flush=True)
 
     if a.cmd == "build-fulltext":
-        out = fulltext.build(lib, kb, a.pdf_root, a.limit, prog)
+        out = fulltext.build(lib, kb, a.pdf_root, a.limit, prog, a.timeout or None, a.retry_errors)
     elif a.cmd == "ocr-empty":
         out = fulltext.ocr_empty(lib, kb, a.pdf_root, a.limit, progress=prog)
     elif a.cmd == "backfill-notes":

@@ -52,6 +52,16 @@ python -m mouseion.kb bridges "FI-modules" --with "univalent species"
 evidence (BM25 beats dense and LLM-built graphs at scale), the measurements on 127 project papers, and how an agent
 should use `kb_expand`, `kb_statements` and `kb_bridges`.
 
+**Robust indexing (2026-11-27).** The first library run stalled at ~22.6k of 136k PDFs on one hung file, holding
+kb.db's write lock, and an earlier run under a Python without PyMuPDF marked 105,318 files as errors. Now:
+- each PDF is parsed in a child process with a timeout (`--timeout`, default 120 s);
+- the parse happens with no write transaction open, and the file's passages are then replaced in one short
+  transaction (if a parse fails, the passages already indexed are kept);
+- a file that failed for its own reasons is retried only when it changes (`--retry-errors` forces it), while
+  environment errors (`ModuleNotFoundError`) are always retried;
+- the build refuses to start, changing nothing, if PyMuPDF is not importable;
+- `busy_timeout` lets the citation builder and the full-text builder take turns.
+
 **Text normalisation (extraction version 2):** passages are NFKC-normalised, so LaTeX ligatures (ﬁ, ﬀ, ﬂ) match
 ordinary queries. That was 50% of passages in the test corpus. Files indexed by version 1 are re-extracted by the
 next `build-fulltext`, incrementally. Passages that notes cite are first copied to `chunks_archive`, and the notes
