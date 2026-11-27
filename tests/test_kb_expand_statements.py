@@ -211,3 +211,12 @@ def test_environment_errors_are_retried(tmp_path, monkeypatch):
     kb.commit()
     monkeypatch.setattr(fulltext, "extract", lambda q: [(1, "Now the parser is installed and this long text is indexed fine.")])
     assert fulltext.build(lib, kb, timeout=None) == {"ok": 1}
+
+
+def test_fts_query_drops_function_words_but_never_empties():
+    from mouseion.kb.store import fts_query
+
+    assert fts_query("the definition of a finite set in univalent foundations") == (
+        '"definition" OR "finite" OR "set" OR "univalent" OR "foundations"')
+    assert fts_query("what is it") == '"what" OR "is" OR "it"'  # only function words: keep them
+    assert fts_query("set set Set") == '"set"'

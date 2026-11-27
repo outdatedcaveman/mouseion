@@ -45,6 +45,10 @@ Metric: rank of the expected paper among retrieved references.
 | dense (model2vec potion-base-8M) | .517 | .724 | .810 | .616 |
 | BM25 + dense (RRF) | .690 | .879 | .897 | .755 |
 | **BM25 + bridge expansion** (no judge) | .655 | .862 | **.948** | .746 |
+| **BM25, function words dropped from the query** (2026-11-27) | **.690** | **.914** | .931 | **.779** |
+
+Dropping function words from queries ("of", "the", "in"...) also fixed speed on the real library. Each of those
+words has millions of postings among 3.6M passages, and one query took 66 s.
 
 The ligature fix alone: a search for "definition" went from 1,638 to 4,598 matching passages. Statements found:
 8,664, e.g. *Definition 4.3: a wild category C is univalent if for all A, B : Ob(C), the canonical function

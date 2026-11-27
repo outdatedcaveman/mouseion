@@ -129,9 +129,24 @@ def open_kb(path: Optional[str] = None) -> sqlite3.Connection:
     return con
 
 
+# function words: near-zero BM25 weight, but each has millions of postings in a 3.6M-passage index, so OR-ing them
+# in made one query take 66 s on the real library (2026-11-27)
+_FTS_STOP = frozenset(
+    "a an and are as at be but by can do does for from had has have how i if in into is it its may might more "
+    "most no not of on or our so such than that the their then there these they this those through to too "
+    "under up was we were what when where which while who whom why will with within without would you your".split()
+)
+
+
 def fts_query(text: str) -> str:
-    """turn free text into a safe FTS5 query: quoted terms joined by OR (BM25 ranks documents matching more terms)"""
+    """turn free text into a safe FTS5 query: quoted content terms joined by OR (BM25 ranks documents matching
+    more terms). Function words are dropped unless nothing else is left."""
     import re
 
     terms = [t for t in re.findall(r"[\w\-]+", text.lower()) if len(t) > 1]
-    return " OR ".join(f'"{t}"' for t in terms[:32]) or '""'
+    content = [t for t in terms if t not in _FTS_STOP] or terms
+    seen = []
+    for t in content:
+        if t not in seen:
+            seen.append(t)
+    return " OR ".join(f'"{t}"' for t in seen[:32]) or '""'
