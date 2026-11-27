@@ -12,6 +12,62 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Tuple
 
 CHUNK_CHARS = 1200
+# 2: text is NFKC-normalised, so the ligatures LaTeX PDFs use ("ﬁ" in "deﬁnition", "ﬀ" in "diﬀerential") become
+#    plain letters and match ordinary queries. Measured on 127 arXiv papers: 50% of passages had ligatures, and
+#    a search for "definition" missed 2,745 passages while finding 1,638.
+EXTRACT_VERSION = 2
+
+_VERSION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pdf_versions (ref_id TEXT PRIMARY KEY, version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS chunks_archive (
+    id INTEGER PRIMARY KEY, ref_id TEXT NOT NULL, page INTEGER, ord INTEGER, text TEXT NOT NULL,
+    archived_at TEXT DEFAULT (datetime('now')), reason TEXT
+);
+"""
+
+
+def normalize(text: str) -> str:
+    import unicodedata
+
+    return unicodedata.normalize("NFKC", text or "")
+
+
+def _version(kb, ref_id: str) -> int:
+    kb.executescript(_VERSION_SCHEMA)
+    r = kb.execute("SELECT version FROM pdf_versions WHERE ref_id=?", (ref_id,)).fetchone()
+    return r[0] if r else 1
+
+
+def _archive_cited_chunks(kb, ref_id: str, reason: str) -> list:
+    """before a reference's passages are replaced, copy every passage a note points to into chunks_archive, so
+    nothing a note cites is ever lost; returns (note id, quote, old chunk id) for re-anchoring."""
+    kb.executescript(_VERSION_SCHEMA)
+    rows = kb.execute(
+        "SELECT n.id, n.quote, n.chunk_id FROM notes n JOIN chunks c ON c.id = n.chunk_id WHERE c.ref_id=?",
+        (ref_id,),
+    ).fetchall()
+    for _, _, cid in rows:
+        kb.execute(
+            "INSERT OR IGNORE INTO chunks_archive(id, ref_id, page, ord, text, reason) "
+            "SELECT id, ref_id, page, ord, text, ? FROM chunks WHERE id=?",
+            (reason, cid),
+        )
+    return [tuple(r) for r in rows]
+
+
+def _reanchor(kb, ref_id: str, cited: list) -> None:
+    """point notes at the new passage that contains their quote; a note whose quote is not found keeps its old
+    chunk_id, which still resolves through chunks_archive."""
+    import re as _re
+
+    norm = lambda t: _re.sub(r"\s+", " ", normalize(t)).strip().lower()  # noqa: E731
+    for nid, quote, _old in cited:
+        if not quote:
+            continue
+        for r in kb.execute("SELECT id, text FROM chunks WHERE ref_id=?", (ref_id,)):
+            if norm(quote) in norm(r["text"]):
+                kb.execute("UPDATE notes SET chunk_id=? WHERE id=?", (r["id"], nid))
+                break
 
 
 def pdf_column(lib) -> Optional[str]:
@@ -72,8 +128,10 @@ def index_ref(kb, ref_id: str, path: Path) -> str:
         and row["size"] == st.st_size
         and abs((row["mtime"] or 0) - st.st_mtime) < 1e-6
         and row["status"] in ("ok", "ocr", "empty")
+        and (row["status"] != "ok" or _version(kb, ref_id) >= EXTRACT_VERSION)
     ):  # 'empty' stays until ocr_empty() runs; re-extracting a file without a text layer gains nothing
         return "unchanged"
+    cited = _archive_cited_chunks(kb, ref_id, "re-extracted")
     kb.execute("DELETE FROM chunks WHERE ref_id=?", (ref_id,))
     try:
         pages = extract(path)
@@ -93,7 +151,7 @@ def index_ref(kb, ref_id: str, path: Path) -> str:
         return "error"
     n = 0
     for page, text in pages:
-        for ch in split_page(text):
+        for ch in split_page(normalize(text)):
             kb.execute(
                 "INSERT INTO chunks(ref_id,page,ord,text) VALUES (?,?,?,?)",
                 (ref_id, page, n, ch),
@@ -102,6 +160,8 @@ def index_ref(kb, ref_id: str, path: Path) -> str:
     status = (
         "ok" if n else "empty"
     )  # 'empty' = scanned PDF without a text layer (needs OCR)
+    _reanchor(kb, ref_id, cited)
+    kb.execute("INSERT OR REPLACE INTO pdf_versions VALUES (?,?)", (ref_id, EXTRACT_VERSION))
     kb.execute(
         "INSERT OR REPLACE INTO pdf_files(ref_id,path,size,mtime,n_pages,n_chunks,status) VALUES (?,?,?,?,?,?,?)",
         (ref_id, str(path), st.st_size, st.st_mtime, len(pages), n, status),
@@ -180,16 +240,18 @@ def ocr_empty(
                 texts = ocr(str(path))
             except Exception:
                 texts = []
+            cited = _archive_cited_chunks(kb, r["ref_id"], "ocr")
             kb.execute("DELETE FROM chunks WHERE ref_id=?", (r["ref_id"],))
             n = 0
             for page, text in enumerate(texts, 1):
-                for ch in split_page(text or ""):
+                for ch in split_page(normalize(text or "")):
                     kb.execute(
                         "INSERT INTO chunks(ref_id,page,ord,text) VALUES (?,?,?,?)",
                         (r["ref_id"], page, n, ch),
                     )
                     n += 1
             s = "ocr" if n else "empty"
+            _reanchor(kb, r["ref_id"], cited)
             kb.execute(
                 "UPDATE pdf_files SET n_chunks=?, status=?, indexed_at=datetime('now') WHERE ref_id=?",
                 (n, s, r["ref_id"]),

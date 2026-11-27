@@ -48,6 +48,12 @@ def cycle(
     except Exception as e:
         rep["errors"].append(f"ocr: {type(e).__name__}: {e}")
     try:
+        from mouseion.kb import statements as St
+
+        rep["statements"] = St.build(kb)
+    except Exception as e:
+        rep["errors"].append(f"statements: {type(e).__name__}: {e}")
+    try:
         kw = {"fetcher": fetcher} if fetcher else {}
         rep["citations"] = citations.build(lib, kb, max_dois, rate, **kw)
     except Exception as e:

@@ -186,6 +186,51 @@ def tools(lib, kb) -> Dict[str, tuple]:
         )
 
     @tool(
+        "expand",
+        "Multi-hop search by bridge terms (SAG2-style). Run search_fulltext first, judge which passages are real "
+        "evidence, and pass their chunk_ids as evidence: rare terms from them retrieve passages that share no "
+        "word with the question (the next hop). Repeat with the new evidence for further hops. Without evidence, "
+        "the top BM25 passages are used as seeds. Returns passages (each with the bridge term that reached it) "
+        "and the activated terms.",
+        _schema(
+            {"query": STR, "evidence": {"type": "array", "items": INT}, "rounds": INT, "n": INT},
+            ["query"],
+        ),
+    )
+    def _(a):
+        from mouseion.kb import expand as X
+
+        out = X.expand(kb, a["query"], a.get("evidence"), rounds=a.get("rounds", 2), n=a.get("n", 10))
+        for p in out["passages"]:
+            p["citation"] = S.cite(lib, p["ref_id"]) + f", p. {p['page']}"
+        return out
+
+    @tool(
+        "bridges",
+        "Literature-based discovery (Swanson ABC). With a and c: the intermediate terms that link the two "
+        "literatures, one example passage per side, and how many passages already discuss both (0 = an "
+        "unexplored connection). With only a: terms reached from A through rare intermediates that never "
+        "co-occur with A, each with the linking terms and passages. Candidates to check, not findings.",
+        _schema({"a": STR, "c": STR, "n": INT}, ["a"]),
+    )
+    def _(a):
+        from mouseion.kb import expand as X
+
+        return X.bridges(kb, a["a"], a.get("c"), a.get("n", 15))
+
+    @tool(
+        "statements",
+        "Search typed mathematical statements (definition, theorem, lemma, proposition, corollary, conjecture, "
+        "axiom, hypothesis, remark, example, construction, notation, problem, question) by text, a match in "
+        "the statement's name weighted higher. Use kind='definition' for 'where is X defined?'.",
+        _schema({"query": STR, "kind": STR, "n": INT}, ["query"]),
+    )
+    def _(a):
+        from mouseion.kb import statements as St
+
+        return St.search(lib, kb, a["query"], a.get("kind"), a.get("n", 10))
+
+    @tool(
         "kb_stats",
         "Coverage of the knowledge base: references, indexed PDFs by status, passages, citation edges, notes.",
         _schema({}),
